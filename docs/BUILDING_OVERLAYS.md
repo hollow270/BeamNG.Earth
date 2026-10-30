@@ -169,7 +169,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/test_building_over
 ```
 
 The execution policy option applies only to this PowerShell process; no machine
-or user execution policy is changed. This runs all Stage 1 and persistence tests
+or user execution policy is changed. This runs all Stage 1, persistence and OSM retrieval tests
 plus the existing `mapgeom` test.
 Fixtures, temporary directories and subprocess working directories stay inside
 the repository. Tests cover actual process interruption, cross-process/thread

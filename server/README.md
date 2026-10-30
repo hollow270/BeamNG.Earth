@@ -628,6 +628,8 @@ cell.provenance, cell.credit_line(), cell.digest()
 Offline building overlays: `buildingoverlay.py` provides the conservative merge prototype;
 `buildingoverlaystore.py` adds separate, reversible local persistence. Neither is connected to
 the live map pipeline yet. See [storage interfaces, revision design and tests](../docs/BUILDING_OVERLAYS.md).
+`osmbuildings.py` adds opt-in, manual retrieval from an explicitly configured source;
+see [retrieval configuration, controls and limitations](../docs/OSM_BUILDING_RETRIEVAL.md).
 
 Measured 2026-10-11 (this machine, home connection, one z14 cell, nothing cached, STAC included):
 

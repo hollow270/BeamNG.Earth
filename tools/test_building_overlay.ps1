@@ -57,6 +57,8 @@ Push-Location -LiteralPath $overlayRepo
 try {
     & (Join-Path $overlayPython 'python.exe') -B -m unittest discover -s server/tests -p 'test_buildingoverlay*.py' -v
     if ($LASTEXITCODE -ne 0) { throw "Overlay tests failed with exit code $LASTEXITCODE" }
+    & (Join-Path $overlayPython 'python.exe') -B -m unittest discover -s server/tests -p 'test_osmbuildings.py' -v
+    if ($LASTEXITCODE -ne 0) { throw "OSM retrieval tests failed with exit code $LASTEXITCODE" }
     & (Join-Path $overlayPython 'python.exe') -B -m unittest discover -s server/tests -p 'test_mapgeom.py' -v
     if ($LASTEXITCODE -ne 0) { throw "mapgeom tests failed with exit code $LASTEXITCODE" }
 } finally {

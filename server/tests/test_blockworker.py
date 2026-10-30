@@ -5,6 +5,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -37,8 +38,28 @@ class FakeMapData:
 def tmp_cache(test):
     """A revisit cache folder of the test's own (the tiles' keep-for-the-next-visit cache), removed after it."""
     d = tempfile.TemporaryDirectory()
-    test.addCleanup(d.cleanup)
+    def cleanup():
+        close_cache_sidecar(d.name)
+        d.cleanup()
+    test.addCleanup(cleanup)
     return d.name
+
+
+def close_cache_sidecar(directory):
+    """Windows cannot remove a fixture directory while revisit's append-only descriptor is open."""
+    import revisit
+    fd = revisit._where.pop(str(directory), None)
+    if fd is not None:
+        os.close(fd)
+
+
+@contextmanager
+def fixture_cache():
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            yield directory
+        finally:
+            close_cache_sidecar(directory)
 
 
 class FakeDem:
@@ -138,7 +159,7 @@ class FarTileTest(unittest.TestCase):
         layout = farfield.Layout(cells=64)
         tile = farfield.Tile(3, 1, -2)
         px = 128
-        with tempfile.TemporaryDirectory() as cache, tempfile.TemporaryDirectory() as out:
+        with fixture_cache() as cache, tempfile.TemporaryDirectory() as out:
             blockworker._s = SimpleNamespace(dem=FakeDem(), md=None, widths=None, surface=None, airports=None, sea=None,
                                              cache_dir=cache, imagery=None,
                                              anchor=lambda aid, lat, lon: (None, None))

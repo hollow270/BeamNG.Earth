@@ -888,6 +888,11 @@ Cross-component (server ↔ mod):
 
 ## Attribution
 
+The opt-in offline building overlay renderer, its baseline-only road/terrain boundary,
+configuration and dependency APIs are documented in
+[`BUILDING_RENDER_OVERLAYS.md`](../docs/BUILDING_RENDER_OVERLAYS.md). It uses saved
+overlays only; live tile invalidation and game refresh are not implemented.
+
 Show this in the mod UI (the server sends the line for the sources in use as `hello.attribution`):
 "Imagery: USGS The National Map (public domain); EOxCloudless https://cloudless.eox.at by EOX IT
 Services GmbH (Contains modified Copernicus Sentinel data 2023), CC BY-NC-SA 4.0; EOxCloudless

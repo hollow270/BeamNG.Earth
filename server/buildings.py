@@ -2882,19 +2882,20 @@ def _front_fence(spec, a, d, Le, f, A, D, L2, half, z, driveway, roads=None):
     return rows
 
 
-def road_tile_items(frame, tx, ty, md, ground, decks=None, skip=frozenset()):
+def road_tile_items(frame, tx, ty, md, ground, decks=None, skip=frozenset(), effective=True):
     """tile_buildings of road tile (tx, ty), from the map cells under it. decks: the bridge decks near it
     [(xy (k, 2), z (k,))] in the anchor frame (roads.BridgeProfiles.parts): buildings they run through get a way.
     skip: building ids left out (gas station canopies)."""
     import roads
     box = roads.tile_bbox(tx, ty)
     x0, y0, x1, y1 = box
-    cds = [md.cell(k, layers=("buildings", "building_parts", "roads", "infrastructure", "water"), kind="demand")
+    cell = getattr(md, "building_cell", md.cell) if effective else md.cell
+    cds = [cell(k, layers=("buildings", "building_parts", "roads", "infrastructure", "water"), kind="demand")
            for k in roads.cells_of_tile(frame, tx, ty, margin=0.0)]
     return tile_buildings(frame, x0, y0, x1, y1, [c.layers.get("buildings") for c in cds], ground,
                           own=box if hasattr(box, "owns") else None,
                           part_layers=[c.layers.get("building_parts") for c in cds],
-                          west_town=district_town(frame, tx, ty, md),
+                          west_town=district_town(frame, tx, ty, md, effective=effective),
                           roads_xy=road_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                           ways_xy=way_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                           tunnels_xy=tunnel_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
@@ -2916,6 +2917,19 @@ WEST_TOWN_ONE_STOREY = 0.75     # share of predicted one-storey buildings there
 FALSE_FRONT_M = 1.2             # m of parapet over a one-storey shop there
 POLES_COVERAGE = 0.30       # ... and its streets get wired wooden poles (furniture; Ocean City's photos: poles
                             # everywhere; Fells Point's dense core ~0.45 keeps lamp posts)
+
+
+def road_context_items(frame, tx, ty, md, ground, **kw):
+    """(rendered buildings, baseline road context): overlays never change driveway/road inputs."""
+    rendered = road_tile_items(frame, tx, ty, md, ground, **kw)
+    active = getattr(md, "building_overlays_active", False)
+    if active:
+        import roads
+        keys = roads.cells_of_tile(frame, tx, ty, margin=DISTRICT_M)
+        active = md.building_dependencies(keys).revision is not None
+    baseline = road_tile_items(frame, tx, ty, md, ground, effective=False, **kw) \
+        if active else rendered
+    return rendered, baseline
 
 
 def coverage(items, tile=256.0):
@@ -2958,7 +2972,8 @@ def far_items(frame, tile, ty, md, ground, lamp_region=None):
     box = roads.tile_bbox(tile, ty)
     x0, y0, x1, y1 = box
     own = box if hasattr(box, "owns") else None
-    cds = [md.cell(k, layers=FAR_LAYERS, kind="demand") for k in roads.cells_of_tile(frame, tile, ty, margin=0.0)]
+    cell = getattr(md, "building_cell", md.cell)
+    cds = [cell(k, layers=FAR_LAYERS, kind="demand") for k in roads.cells_of_tile(frame, tile, ty, margin=0.0)]
     items = tile_buildings(frame, x0, y0, x1, y1, [c.layers.get("buildings") for c in cds], ground, own=own,
                            part_layers=[c.layers.get("building_parts") for c in cds],
                            west_town=district_town(frame, tile, ty, md),
@@ -3197,9 +3212,11 @@ def sky_items(frame, box, keys, md, ground, lamp_region=None, own=None):
         for k in keys:                      # (the background lane: never before what the player is near)
             md.prefetch(k, layers=("buildings", "roads"))
         return None
-    cds = [md.cell(k, layers=("buildings", "roads"), kind="background") for k in keys]
+    cell = getattr(md, "building_cell", md.cell)
+    cds = [cell(k, layers=("buildings", "roads"), kind="background") for k in keys]
     layers = [c.layers.get("buildings") for c in cds]
-    items = tile_buildings(frame, x0, y0, x1, y1, layers, ground, min_size=(1e9, SKY_MIN_AREA_M2), own=own)
+    items = tile_buildings(frame, x0, y0, x1, y1, layers, ground, min_size=(1e9, SKY_MIN_AREA_M2), own=own,
+                           part_layers=[c.layers.get("building_parts") for c in cds])
     size = max(x1 - x0, y1 - y0)
     lamps = far_lamps(frame, [c.layers.get("roads") for c in cds], x0, y0, size,
                       built_squares(items, 0.0, 0.0, size), ground, lamp_region, own=own)
@@ -3492,7 +3509,9 @@ def cell_footprints(key, layer):
         n = np.maximum(b - a, 1)
         last = np.maximum(b - 1, a)
         area = np.abs(C[last] - C[a] + x[last] * y[a] - x[a] * y[last]) / 2
-        got = ((CX[b] - CX[a]) / n, (CY[b] - CY[a]) / n, area)
+        mask = np.array([str(fid) not in f.__dict__.get("overlay_provenance", {}) or
+                         f.own is None or bool(f.own[i]) for i, fid in enumerate(f.ids)])
+        got = (((CX[b] - CX[a]) / n)[mask], ((CY[b] - CY[a]) / n)[mask], area[mask])
     with _cell_lock:
         if len(_cell_stats) > 64:
             _cell_stats.clear()
@@ -3513,7 +3532,7 @@ def district_coverage(lat, lon, cells):
     return seen / (math.pi * DISTRICT_M * DISTRICT_M)
 
 
-def district_town(frame, tx, ty, md):
+def district_town(frame, tx, ty, md, effective=True):
     """Is road tile (tx, ty) in a small town of the arid West (WEST_TOWN_COVERAGE)? The cells of the district
     are loaded like the tile's own (the far building tiles need them anyway); an unreadable one counts as
     empty."""
@@ -3529,13 +3548,19 @@ def district_town(frame, tx, ty, md):
     dlon = DISTRICT_M / (111320.0 * math.cos(math.radians(lat)))
     cells = []
     for key in mapcells.cells_for_bbox(lat - dlat, lon - dlon, lat + dlat, lon + dlon):
+        dependency = md.building_dependencies((key,)).revision if effective and \
+            getattr(md, "building_overlays_active", False) else None
+        stats_key = (key, "building-overlay", dependency) if dependency is not None else key
         with _cell_lock_get():
-            known = key in _cell_stats
+            known = stats_key in _cell_stats
         if known:
-            cells.append((key, None))
+            cells.append((stats_key, None))
             continue
         try:
-            cells.append((key, md.cell(key, layers=("buildings",), kind="demand").layers.get("buildings")))
+            cell = getattr(md, "building_cell", md.cell) if effective else md.cell
+            cells.append((stats_key, cell(key, layers=("buildings",), kind="demand").layers.get("buildings")))
         except Exception:           # not cached / unreadable: counts as empty
+            if dependency is not None:
+                raise
             continue
     return district_coverage(lat, lon, cells) < WEST_TOWN_COVERAGE

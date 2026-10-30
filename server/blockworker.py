@@ -513,7 +513,8 @@ def _roads_tile_cached(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks,
     import revisit
     k = revisit.key("roads", round(float(lat), 7), round(float(lon), 7), zoom, tx, ty, bool(sidewalks), float(lift),
                     bool(buildings), bool(left_hand), bool(mph), None if q is None else float(q), bool(gas_stations),
-                    _s.md.versions() if _s.md is not None else None, float(buried), lamp_region, country)
+                    building_versions(_s.md, geodesy.EnuFrame(lat, lon), roadsmod_tile_bbox(tx, ty), buildings),
+                    float(buried), lamp_region, country)
     wh = _where_enu(lat, lon, *roadsmod_tile_bbox(tx, ty),
                     sidewalks=bool(sidewalks), lift=float(lift), buildings=bool(buildings),
                     gas_stations=bool(gas_stations), md=_md_versions())
@@ -529,6 +530,28 @@ def _roads_tile_cached(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks,
 
 def _md_versions():
     return _s.md.versions() if _s.md is not None else None
+
+
+def building_versions(md, frame, box, enabled=True):
+    """Offline cache identity for building-bearing output; baseline versions never change.
+
+    Include the density neighbourhood, but no unrelated world-wide overlay revision.
+    This selects immutable cached artifacts; it never invalidates or schedules tiles.
+    """
+    versions = md.versions() if md is not None else None
+    if not enabled or not getattr(md, "building_overlays_active", False):
+        return versions
+    import buildings
+    import mapcells
+    x0, y0, x1, y1 = box
+    margin = buildings.DISTRICT_M
+    la, lo, _ = frame.enu_to_geodetic(np.array([x0-margin, x1+margin, x0-margin, x1+margin]),
+                                     np.array([y0-margin, y0-margin, y1+margin, y1+margin]), 0.0)
+    if float(np.max(lo) - np.min(lo)) > 180:
+        return versions  # overlay storage does not support antimeridian selections
+    keys = mapcells.cells_for_bbox(float(np.min(la)), float(np.min(lo)), float(np.max(la)), float(np.max(lo)))
+    dependency = md.building_dependencies(keys)
+    return dict(versions, building_overlay=dependency.revision) if dependency.revision is not None else versions
 
 
 def roadsmod_tile_bbox(tx, ty):
@@ -666,15 +689,15 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
     lines = [] if buildings else None
     wires = [] if buildings else None
     park = [] if buildings else None
-    items = town = None
+    items = render_items = town = None
     box = roadsmod.tile_bbox(tx, ty)
     side = roadsmod.tile_side(tx, ty)
     if buildings:
         import buildings as buildingsmod
         # (on the graded ground, the one the terrain is drawn with: on the raw elevation a building beside a road's
         # cutting stood over the cut; hashk014's PR #69)
-        items = buildingsmod.road_tile_items(frame, tx, ty, _s.md, elev, decks=_tile_decks(bridges, cells, tx, ty),
-                                             skip=skip)
+        render_items, items = buildingsmod.road_context_items(frame, tx, ty, _s.md, elev,
+                                             decks=_tile_decks(bridges, cells, tx, ty), skip=skip)
         town = buildingsmod.coverage(items, side) < buildingsmod.POLES_COVERAGE
     mark("items")
     rwalls = []
@@ -783,7 +806,7 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
     if buildings:
         import buildings as buildingsmod
         import oilwells
-        bld = buildingsmod.road_tile(frame, tx, ty, _s.md, elev, None, None, items)
+        bld = buildingsmod.road_tile(frame, tx, ty, _s.md, elev, None, None, render_items)
         mark("bld")
         garage_sound = buildingsmod.garage_sound_boxes(items, *box[:2], roadsmod.SOUND_GARAGE)
         oil_wells = oilwells.tile_wells(frame, tx, ty, elev)     # (the mod's pump jacks)
@@ -970,8 +993,18 @@ def _geo_content_key(key, zoom, buildings, left_hand, mph, gas_stations, buried,
     """The revisit key of a geotile's content (md: the map data's versions, when not this worker's: the server's own
     check, earthd.Server.geo_prebuilt)."""
     import revisit
+    data = _s.md if md is None else md
+    if hasattr(data, "versions"):
+        versions = data.versions()
+        if buildings and getattr(data, "building_overlays_active", False):
+            import geotiles
+            z, gx, gy = geotiles.parse(key)
+            tile = geotiles.geobox(gx, gy, z)
+            versions = building_versions(data, tile.frame, tile.box)
+    else:
+        versions = data  # existing tools/tests may pass an already prepared versions dict
     return revisit.key("roadsg", str(key), int(zoom), bool(buildings), bool(left_hand), bool(mph), bool(gas_stations),
-                       _md_versions() if md is None else md, float(buried), lamp_region, country, GEO_SKIN_MARGIN_M)
+                       versions, float(buried), lamp_region, country, GEO_SKIN_MARGIN_M)
 
 
 def prebuild_geo(gx, gy, zoom, scratch, buildings, left_hand, mph, gas_stations, buried=0.0, lamp_region=None,
@@ -1450,7 +1483,7 @@ def far_buildings_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, lamp_regio
     import revisit
     frame = geodesy.EnuFrame(lat, lon)
     k = revisit.key("bldfar", round(float(lat), 7), round(float(lon), 7), zoom, tx, ty,
-                    _s.md.versions() if _s.md is not None else None, lamp_region)
+                    building_versions(_s.md, frame, roadsmod_tile_bbox(tx, ty)), lamp_region)
     return _revisit_tile("bldfar", k, aid, tx, ty, out_dir, vfs_dir, f"bldfar_{aid}_{tx}_{ty}.json",
                          lambda: buildingsmod.far_tile(frame, tx, ty, _s.md,
                                                        lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, zoom)),
@@ -1466,11 +1499,11 @@ def skyline_tile(aid, lat, lon, zoom, ux, uy, out_dir, vfs_dir, lamp_region=None
     import buildings as buildingsmod
     import revisit
     frame = geodesy.EnuFrame(lat, lon)
-    k = revisit.key("bldsky", round(float(lat), 7), round(float(lon), 7), zoom, ux, uy,
-                    _s.md.versions() if _s.md is not None else None, lamp_region)
     u = buildingsmod.SKY_UNIT
     sx0, sy0, _, _ = roadsmod_tile_bbox(ux * u, uy * u)
     _, _, sx1, sy1 = roadsmod_tile_bbox(ux * u + u - 1, uy * u + u - 1)
+    k = revisit.key("bldsky", round(float(lat), 7), round(float(lon), 7), zoom, ux, uy,
+                    building_versions(_s.md, frame, (sx0, sy0, sx1, sy1)), lamp_region)
     return _revisit_tile("bldsky", k, aid, ux, uy, out_dir, vfs_dir, f"bldsky_{aid}_{ux}_{uy}.json",
                          lambda: buildingsmod.skyline_tile(frame, ux, uy, _s.md,
                                                            lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, zoom)),
@@ -1637,7 +1670,8 @@ def far_geo(kind, gx, gy, gzoom, out_dir, vfs_dir, lamp_region=None):
     z = far_geo_zoom(kind)
     tile = geotiles.geobox(gx, gy, z)
     names = far_geo_names(kind, tile.key)
-    k = revisit.key(kind, "g", tile.key, int(gzoom), _md_versions(), lamp_region)
+    k = revisit.key(kind, "g", tile.key, int(gzoom),
+                    building_versions(_s.md, tile.frame, tile.box, kind != "brfar"), lamp_region)
     frame_ll = (float(tile.frame.lat0), float(tile.frame.lon0))
     got = revisit.load(_s.cache_dir, kind, k)
     if got is not None:

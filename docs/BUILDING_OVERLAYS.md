@@ -149,7 +149,8 @@ object; a damaged historical target causes rollback to fail without publishing i
 
 Stage 1 limitations remain: simple polygons only, conservative spatial matching,
 no automatic deletion/split/merge resolution, complete part sets for parent
-changes, and no live rendering or cache invalidation. Storage scans snapshots
+changes, and no live regeneration or cache invalidation. The opt-in offline renderer integration
+is documented in [BUILDING_RENDER_OVERLAYS.md](BUILDING_RENDER_OVERLAYS.md). Storage scans snapshots
 rather than maintaining a spatial index. Large-area workloads are unsupported.
 
 ## Reproducible tests
@@ -160,7 +161,7 @@ On Windows x64, bootstrap once from the repository:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/test_building_overlay.ps1 -Bootstrap
 ```
 
-The script pins CPython 3.12.10 and NumPy 2.2.6 by SHA-256, downloads/extracts only
+The script pins CPython 3.12.10, NumPy 2.2.6 and Pillow 11.3.0 by SHA-256, downloads/extracts only
 under the git-ignored `.venv/overlay-tests/`, and uses no pip or system Python.
 Subsequent runs require no network:
 
@@ -169,8 +170,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/test_building_over
 ```
 
 The execution policy option applies only to this PowerShell process; no machine
-or user execution policy is changed. This runs all Stage 1, persistence and OSM retrieval tests
-plus the existing `mapgeom` test.
+or user execution policy is changed. This runs all Stage 1, persistence, OSM retrieval and offline
+rendering tests, plus the existing buildings, worker, roads, road-width and `mapgeom` tests.
+The rendering tests use the repository's existing Windows native binary; they do not build Rust.
 Fixtures, temporary directories and subprocess working directories stay inside
 the repository. Tests cover actual process interruption, cross-process/thread
 writes, corruption/recovery, rollback, enable/disable, overlapping selections,

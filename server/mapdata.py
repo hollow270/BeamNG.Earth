@@ -132,6 +132,7 @@ LIDAR_CANOPY = {
 }
 # Short overlay wordings per provenance id (credits.py can take them when the map data is shown)
 CREDIT_LINES = {
+    "osm-building-overlay": "© OpenStreetMap contributors (building overlay)",
     "overture": overture.ATTRIBUTION,
     "esa-worldcover": "© ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) "
                       "processed by ESA WorldCover consortium",
@@ -245,10 +246,16 @@ class MapData:
     release: the Overture release (overture.RELEASE)."""
 
     def __init__(self, cache_dir=DEFAULT_CACHE, fetcher=None, release=overture.RELEASE,
-                 threads=overture.DUCKDB_THREADS):
+                 threads=overture.DUCKDB_THREADS, building_overlays=None):
         self.cache_dir = cache_dir
         self.fetcher = fetcher if fetcher is not None else netfetch.Fetcher()
         self.release = release
+        self._building_view = None
+        overlay = os.environ.get("BNGE_BUILDING_OVERLAY_DIR") if building_overlays is None else building_overlays
+        if overlay:
+            from buildingoverlaystore import OverlayStore
+            from buildingrender import BuildingView
+            self._building_view = BuildingView(overlay if isinstance(overlay, OverlayStore) else OverlayStore(overlay), release)
         self.raw_dir = os.path.join(cache_dir, "mapdata", "raw")
         self.overture = overture.Reader(self.raw_dir, self.fetcher, release, threads)
         self.rasters = maprasters.Rasters(self.raw_dir, self.fetcher, os.path.join(cache_dir, "dem", "lidarbc"))
@@ -274,6 +281,24 @@ class MapData:
         if self._warm_ex is not None:
             self._warm_ex.shutdown(wait=False, cancel_futures=True)
         self.overture.close()
+
+    @property
+    def building_overlays_active(self):
+        return self._building_view is not None and self._building_view.active
+
+    def building_cell(self, key, layers=("buildings", "building_parts"), kind="demand"):
+        """Rendering-only cell; cell() and versions() always retain their original baseline contracts.
+
+        The overlay snapshot is pinned at construction, including in spawned workers.
+        Recreate MapData after an offline storage enable/disable/rollback operation.
+        """
+        base = self.cell(key, layers=layers, kind=kind)
+        return self._building_view.cell(self, base, kind) if self.building_overlays_active else base
+
+    def building_dependencies(self, keys):
+        """Local effective-building tokens; not a global pipeline version or invalidation operation."""
+        from buildingrender import Dependency
+        return self._building_view.dependency(keys) if self.building_overlays_active else Dependency()
 
     def _rails(self, key, layer, feats):
         """The roads layer's rail segments with OSM's railway tags (railtags.py), once per build of them."""

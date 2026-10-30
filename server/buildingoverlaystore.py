@@ -511,6 +511,23 @@ class OverlayStore:
                               for c in snapshot.conflicts if _intersects(c["bounds"], scope))
             return bo.MergeResult(buildings, parts, decisions)
 
+    @staticmethod
+    def compose(snapshot, baseline, *, baseline_release, bounds, baseline_parts=()):
+        """Compose an already loaded snapshot without rereading disk (offline render jobs).
+
+        Callers may select entries with dataclasses.replace; validation of each
+        original fingerprint still uses exactly the same implementation as apply().
+        """
+        baseline, baseline_parts = tuple(baseline), tuple(baseline_parts)
+        bo._unique(baseline, "snapshot baseline")
+        bo._unique(baseline_parts, "snapshot baseline parts")
+        scope = _bounds(bounds)
+        buildings, parts = OverlayStore._apply(snapshot, baseline, baseline_parts, baseline_release,
+                                               scope, snapshot.enabled)
+        decisions = tuple(bo.Decision(**dict(c["decision"], baseline_ids=tuple(c["decision"]["baseline_ids"])))
+                          for c in snapshot.conflicts if _intersects(c["bounds"], scope))
+        return bo.MergeResult(buildings, parts, decisions)
+
     def _inputs(self, values):
         out = []
         for value in values:

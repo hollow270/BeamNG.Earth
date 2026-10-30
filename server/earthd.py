@@ -1424,7 +1424,7 @@ class Server:
         import geotiles
         lh, mph, buried, lamps, country, gzoom = self.geo_rules(gx, gy)
         return blockworker._geo_content_key(geotiles.geobox(gx, gy).key, gzoom, self.buildings, lh, mph,
-                                            self.gas_stations, buried, lamps, country, md=self.mapdata.versions())
+                                            self.gas_stations, buried, lamps, country, md=self.mapdata)
 
     def geo_prebuilt(self, gx, gy):
         """Is geotile (gx, gy)'s road content in the revisit cache (no worker, no network)? -> its key or None."""
@@ -1494,10 +1494,10 @@ class Server:
         lines = [] if self.buildings else None
         wires = [] if self.buildings else None
         park = [] if self.buildings else None
-        items = town = None
+        items = render_items = town = None
         if self.buildings:
             # (on the graded ground, as blockworker.roads_tile)
-            items = buildingsmod.road_tile_items(anchor.frame, tx, ty, self.mapdata, elev,
+            render_items, items = buildingsmod.road_context_items(anchor.frame, tx, ty, self.mapdata, elev,
                                                  decks=blockworker._tile_decks(anchor.bridges, cells, tx, ty), skip=skip)
             town = buildingsmod.coverage(items) < buildingsmod.POLES_COVERAGE
         rwalls = []
@@ -1598,7 +1598,7 @@ class Server:
         oil_wells = []
         if self.buildings:
             import oilwells
-            bld = buildingsmod.road_tile(anchor.frame, tx, ty, self.mapdata, elev, None, None, items)
+            bld = buildingsmod.road_tile(anchor.frame, tx, ty, self.mapdata, elev, None, None, render_items)
             garage_sound = buildingsmod.garage_sound_boxes(items, *roadsmod.tile_bbox(tx, ty)[:2],
                                                            roadsmod.SOUND_GARAGE)
             oil_wells = oilwells.tile_wells(anchor.frame, tx, ty, elev)     # (the mod's pump jacks)

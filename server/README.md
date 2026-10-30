@@ -625,6 +625,10 @@ cell.provenance, cell.credit_line(), cell.digest()
 - **CLI** (development): `python3 server/mapdata.py --cell 39.2834,-76.5934 --dump --png out.png`
   (`--key 14/x/y`, `--around N` for a block of cells, `--layers`, `--offline`, `--cache-dir`).
 
+Offline building overlays: `buildingoverlay.py` provides the conservative merge prototype;
+`buildingoverlaystore.py` adds separate, reversible local persistence. Neither is connected to
+the live map pipeline yet. See [storage interfaces, revision design and tests](../docs/BUILDING_OVERLAYS.md).
+
 Measured 2026-10-11 (this machine, home connection, one z14 cell, nothing cached, STAC included):
 
 | place | cold | warm | downloaded | cell files | contents |

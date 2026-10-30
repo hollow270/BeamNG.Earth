@@ -541,6 +541,12 @@ def building_versions(md, frame, box, enabled=True):
     versions = md.versions() if md is not None else None
     if not enabled or not getattr(md, "building_overlays_active", False):
         return versions
+    dependency = md.building_dependencies(building_cells(frame, box))
+    return dict(versions, building_overlay=dependency.revision) if dependency.revision is not None else versions
+
+
+def building_cells(frame, box):
+    """The shared cell footprint of rendering/cache dependencies, including density neighbours."""
     import buildings
     import mapcells
     x0, y0, x1, y1 = box
@@ -548,10 +554,8 @@ def building_versions(md, frame, box, enabled=True):
     la, lo, _ = frame.enu_to_geodetic(np.array([x0-margin, x1+margin, x0-margin, x1+margin]),
                                      np.array([y0-margin, y0-margin, y1+margin, y1+margin]), 0.0)
     if float(np.max(lo) - np.min(lo)) > 180:
-        return versions  # overlay storage does not support antimeridian selections
-    keys = mapcells.cells_for_bbox(float(np.min(la)), float(np.min(lo)), float(np.max(la)), float(np.max(lo)))
-    dependency = md.building_dependencies(keys)
-    return dict(versions, building_overlay=dependency.revision) if dependency.revision is not None else versions
+        return ()  # overlay storage does not support antimeridian selections
+    return mapcells.cells_for_bbox(float(np.min(la)), float(np.min(lo)), float(np.max(la)), float(np.max(lo)))
 
 
 def roadsmod_tile_bbox(tx, ty):
@@ -922,6 +926,26 @@ def _content_hash(text, vfs_dir):
     return hashlib.sha1(text.replace(f"{vfs_dir}/", "@V@/").encode("utf-8")).hexdigest()[:16]
 
 
+def _building_content_hash(text, vfs_dir, out_dir, names, frame, box):
+    """Overlay content identity includes mesh bytes, even if all JSON bounds/counts stay the same."""
+    if not (building_versions(getattr(_s, "md", None), frame, box) or {}).get("building_overlay"):
+        return _content_hash(text, vfs_dir)
+    import hashlib
+    h = hashlib.sha1(text.replace(f"{vfs_dir}/", "@V@/").encode("utf-8"))
+    for name in sorted(set(names)):
+        if name.endswith(".cdae") and os.path.isfile(os.path.join(out_dir, name)):
+            h.update(name.encode() + b"\0")
+            with open(os.path.join(out_dir, name), "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def _geo_input_key(key, out_dir):
+    context = getattr(getattr(_s, "md", None), "_building_context", None)
+    return (key, os.path.abspath(out_dir)) if context is not None and context.get() is not None else key
+
+
 def _write_geo_content(out_dir, vfs_dir, tile, P):
     """A geotile's content written to the session folder: its shapes (rg_<key>_<what>.cdae, each with its pivot and
     relief), its rows (props, guard rails, parking, stations, wells, sound) and colliders in its own frame, and the
@@ -973,14 +997,14 @@ def _write_geo_content(out_dir, vfs_dir, tile, P):
         data["frame"] = [float(tile.frame.lat0), float(tile.frame.lon0)]
         data["box"] = [round(float(v), 4) for v in tile.box]
         text = json.dumps(data, separators=(",", ":"), sort_keys=True)
-        h = _content_hash(text, vfs_dir)
+        h = _building_content_hash(text, vfs_dir, out_dir, names.values(), tile.frame, tile.box)
         data["h"] = h
         text = json.dumps(data, separators=(",", ":"), sort_keys=True)
         _write_bytes(os.path.join(out_dir, names["json"]), text.encode("utf-8"))
         inputs = {"chunks": P.chunks, "ctx": P.ctx, "walks": P.walks_raw, "h": h}
         _write_bytes(os.path.join(out_dir, names["inputs"]), pickle.dumps(inputs, protocol=4))
         with _geo_lock:
-            _geo_inputs[tile.key] = inputs
+            _geo_inputs[_geo_input_key(tile.key, out_dir)] = inputs
             while len(_geo_inputs) > GEO_INPUTS_KEPT:
                 _geo_inputs.pop(next(iter(_geo_inputs)))
         return f"{vfs_dir}/{names['json']}", n, {"h": h, "parts": parts}
@@ -1030,7 +1054,7 @@ def prebuild_geo(gx, gy, zoom, scratch, buildings, left_hand, mph, gas_stations,
                 except OSError:
                     pass
             with _geo_lock:
-                _geo_inputs.pop(tile_key, None)
+                _geo_inputs.pop(_geo_input_key(tile_key, scratch), None)
     return k if os.path.exists(path) else None
 
 
@@ -1092,7 +1116,7 @@ def _skin_inputs(key, out_dir, content):
     (its content built or loaded again, which writes the file). None when there are none."""
     import pickle
     with _geo_lock:
-        got = _geo_inputs.get(key)
+        got = _geo_inputs.get(_geo_input_key(key, out_dir))
     if got is not None:
         return got
     p = os.path.join(out_dir, geo_names(key)["inputs"])
@@ -1104,7 +1128,7 @@ def _skin_inputs(key, out_dir, content):
     except (OSError, EOFError, pickle.UnpicklingError):
         return None
     with _geo_lock:
-        _geo_inputs[key] = got
+        _geo_inputs[_geo_input_key(key, out_dir)] = got
         while len(_geo_inputs) > GEO_INPUTS_KEPT:
             _geo_inputs.pop(next(iter(_geo_inputs)))
     return got
@@ -1689,7 +1713,8 @@ def far_geo(kind, gx, gy, gzoom, out_dir, vfs_dir, lamp_region=None):
         return None
     data, shapes, n = res
     text = json.dumps(data, separators=(",", ":"), sort_keys=True)
-    data["h"] = _content_hash(text, vfs_dir)
+    data["h"] = _building_content_hash(text, vfs_dir, out_dir, shapes.values(), tile.frame, tile.box) \
+        if kind != "brfar" else _content_hash(text, vfs_dir)
     text = json.dumps(data, separators=(",", ":"), sort_keys=True)
     _write_bytes(os.path.join(out_dir, names["json"]), text.encode("utf-8"))
     _far_geo_stats["built"] += 1

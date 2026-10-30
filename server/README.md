@@ -892,6 +892,9 @@ The opt-in offline building overlay renderer, its baseline-only road/terrain bou
 configuration and dependency APIs are documented in
 [`BUILDING_RENDER_OVERLAYS.md`](../docs/BUILDING_RENDER_OVERLAYS.md). It uses saved
 overlays only; live tile invalidation and game refresh are not implemented.
+The server-side selective generation catalog and explicit worker snapshots are described in
+[`BUILDING_REGENERATION.md`](../docs/BUILDING_REGENERATION.md). Activation of those
+prepared files and live collision replacement remain Stage 5 work.
 
 Show this in the mod UI (the server sends the line for the sources in use as `hello.attribution`):
 "Imagery: USGS The National Map (public domain); EOxCloudless https://cloudless.eox.at by EOX IT

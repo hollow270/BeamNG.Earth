@@ -2,7 +2,8 @@
 
 Only MapData.building_cell uses this adapter. Baseline cell(), versions(), road
 widths, grading, terrain and imagery remain unchanged. No fetching of OSM data,
-storage writes, tile invalidation or live refresh. Recreate MapData for a new view.
+storage writes, tile invalidation or live refresh. A caller may supply an explicit
+snapshot; MapData scopes that view to a single generation job.
 """
 from collections import OrderedDict
 from copy import deepcopy
@@ -128,8 +129,8 @@ def _combine(base, remove, records, key, frame, token, render_attrs):
 
 
 class BuildingView:
-    def __init__(self, store, release):
-        self.snapshot = store.load()
+    def __init__(self, store, release, *, snapshot=None):
+        self.snapshot = deepcopy(snapshot) if snapshot is not None else store.load()
         self.active = bool(self.snapshot.enabled and self.snapshot.entries)
         if self.active and self.snapshot.baseline_release != release:
             raise BaselineMismatch("render overlay uses a different Overture release")

@@ -171,7 +171,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/test_building_over
 
 The execution policy option applies only to this PowerShell process; no machine
 or user execution policy is changed. This runs all Stage 1, persistence, OSM retrieval and offline
-rendering tests, plus the existing buildings, worker, roads, road-width and `mapgeom` tests.
+rendering and [selective preparation](BUILDING_REGENERATION.md) tests, plus the existing
+buildings, worker, geotile, process-pool, roads, road-width and `mapgeom` tests.
 The rendering tests use the repository's existing Windows native binary; they do not build Rust.
 Fixtures, temporary directories and subprocess working directories stay inside
 the repository. Tests cover actual process interruption, cross-process/thread

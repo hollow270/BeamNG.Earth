@@ -795,6 +795,7 @@ class Server:
         if surface is not None and self.airports is not None:      # the runways painted in (GitHub #337)
             surface.extra_pads = self.airports.runway_pads
         self.mapdata = mapdata      # mapdata.MapData for the roads (--roads on), else None
+        self._building_refresh_lock = threading.Lock()
         if mapdata is not None and getattr(mapdata, "dem", 0) is None:
             mapdata.dem = self.dem  # (gradesep's ground)
         self.grading = bool(grading) and mapdata is not None   # ground graded under roads (grading.py)
@@ -1238,6 +1239,28 @@ class Server:
         return buildingsmod.far_tile(anchor.frame, tx, ty, self.mapdata,
                                      lambda la, lo: self.ground(anchor.frame, la, lo, self.dem.sample(la, lo, zoom)),
                                      self.out_dir, self.vfs_dir, aid, self.lamp_region(anchor))
+
+    def refresh_building_overlays(self, requests=(), *, cancel=None):
+        """Manual Stage 4B preparation; never writes/sends live session resources (Stage 5).
+
+        requests: bounded buildingrefresh.TileRequest objects, retained for later local refreshes.
+        Existing road/far pools do the work; no new compute pool or game message is introduced.
+        """
+        import buildingrefresh
+        if self.mapdata is None or self.mapdata._building_store is None or not self.buildings:
+            raise ValueError("building overlays must be explicitly configured")
+        with self._building_refresh_lock:
+            coordinator = self.__dict__.get("_building_refresh")
+            if coordinator is None:
+                def submit(request, *args):
+                    pool = self.road_pool if request.kind in ("near", "near_geo") else self.far_bld_pool
+                    if pool is None:
+                        raise RuntimeError("building preparation requires the corresponding existing worker pool")
+                    return pool.submit(buildingrefresh.generate, request, *args)
+                coordinator = self._building_refresh = buildingrefresh.Coordinator(
+                    os.path.join(self.cache_dir, "building-generations"), self.mapdata,
+                    self.mapdata._building_store, submit)
+        return coordinator.refresh(requests, cancel=cancel)
 
     def build_signs_tile(self, aid, tx, ty):
         """signstream.build_tile: the highway signs of road tile (tx, ty) of anchor aid (its roads are with the mod

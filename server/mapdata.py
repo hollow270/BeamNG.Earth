@@ -250,12 +250,16 @@ class MapData:
         self.cache_dir = cache_dir
         self.fetcher = fetcher if fetcher is not None else netfetch.Fetcher()
         self.release = release
+        from contextvars import ContextVar
+        self._building_context = ContextVar("building_snapshot", default=None)
+        self._building_store = None
         self._building_view = None
         overlay = os.environ.get("BNGE_BUILDING_OVERLAY_DIR") if building_overlays is None else building_overlays
         if overlay:
             from buildingoverlaystore import OverlayStore
             from buildingrender import BuildingView
-            self._building_view = BuildingView(overlay if isinstance(overlay, OverlayStore) else OverlayStore(overlay), release)
+            self._building_store = overlay if isinstance(overlay, OverlayStore) else OverlayStore(overlay)
+            self._building_view = BuildingView(self._building_store, release)
         self.raw_dir = os.path.join(cache_dir, "mapdata", "raw")
         self.overture = overture.Reader(self.raw_dir, self.fetcher, release, threads)
         self.rasters = maprasters.Rasters(self.raw_dir, self.fetcher, os.path.join(cache_dir, "dem", "lidarbc"))
@@ -284,21 +288,39 @@ class MapData:
 
     @property
     def building_overlays_active(self):
-        return self._building_view is not None and self._building_view.active
+        view = self._building_context.get() or self._building_view
+        return view is not None and view.active
+
+    def building_snapshot(self, snapshot):
+        """Thread-local pinned view for one generation job; baseline and other jobs remain unchanged."""
+        from contextlib import contextmanager
+        from buildingrender import BuildingView
+
+        @contextmanager
+        def pinned():
+            view = BuildingView(None, self.release, snapshot=snapshot)
+            token = self._building_context.set(view)
+            try:
+                yield view
+            finally:
+                self._building_context.reset(token)
+        return pinned()
 
     def building_cell(self, key, layers=("buildings", "building_parts"), kind="demand"):
         """Rendering-only cell; cell() and versions() always retain their original baseline contracts.
 
-        The overlay snapshot is pinned at construction, including in spawned workers.
-        Recreate MapData after an offline storage enable/disable/rollback operation.
+        The default view is pinned at construction. building_snapshot() supplies an
+        explicit per-job revision without changing that default or other threads.
         """
         base = self.cell(key, layers=layers, kind=kind)
-        return self._building_view.cell(self, base, kind) if self.building_overlays_active else base
+        view = self._building_context.get() or self._building_view
+        return view.cell(self, base, kind) if view is not None and view.active else base
 
     def building_dependencies(self, keys):
         """Local effective-building tokens; not a global pipeline version or invalidation operation."""
         from buildingrender import Dependency
-        return self._building_view.dependency(keys) if self.building_overlays_active else Dependency()
+        view = self._building_context.get() or self._building_view
+        return view.dependency(keys) if view is not None and view.active else Dependency()
 
     def _rails(self, key, layer, feats):
         """The roads layer's rail segments with OSM's railway tags (railtags.py), once per build of them."""

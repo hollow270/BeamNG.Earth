@@ -1,5 +1,9 @@
 # Offline building renderer integration (Stage 4A)
 
+Stage 4B's explicit job snapshots and selective prepared-generation catalog are now
+documented in [BUILDING_REGENERATION.md](BUILDING_REGENERATION.md). The default
+startup view described here remains pinned; preparation does not activate game resources.
+
 Stage 4A connects accepted, enabled Stage 2 overlays to the existing server building
 planner and mesh writers. It performs no OSM requests, tile invalidation, scheduling,
 game installation, protocol changes or live game refresh. Stage 1 and Stage 2 retain
@@ -174,11 +178,8 @@ edge). The same test fails with unchanged HEAD Python sources under the same pin
 environment/native binary. It has not been weakened, skipped or fixed in Stage 4A;
 the runner continues through all suites and reports a nonzero result.
 
-Stage 4B must coordinate a common revision across processes and in-flight work,
-selectively invalidate/rebuild affected near/far/skyline outputs (including density
-neighbours), and update server trackers/content hashes safely. It must address
-existing cached geotile metadata hashes/shape slots before runtime replacement.
-This stage does not make the existing game trackers revision-aware. Runtime game
-refresh, collision swap ordering and user-facing attribution need their separately
-authorized integration work. Simple-polygon and manual conflict-resolution limits
-from Stage 1 remain in force.
+Stage 4B now supplies explicit worker snapshots, local regeneration, mesh-aware
+content hashes and an atomic prepared catalog. It retains active shape-slot and
+tracker lifetimes for Stage 5 activation. Runtime game refresh, collision swap ordering
+and user-facing attribution still need that integration work. Simple-polygon and
+manual conflict-resolution limits from Stage 1 remain in force.

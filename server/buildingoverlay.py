@@ -9,8 +9,10 @@ Attributes are *already normalized Overture-style values*, not raw OSM tags.
 Only simple, closed Polygon exteriors are accepted from OSM. Holes, multipolygons,
 antimeridian/polar geometry and invalid rings are conflicts, never repaired or
 flattened. Unsupported baseline geometry is retained and its bbox blocks additions.
-Exact identities take priority. Without one, only equivalent rings (same vertices,
-within 15 cm) count as spatial duplicates; other positive-area overlaps conflict.
+Exact identities take priority. Without one, equivalent rings within 15 cm count
+as spatial duplicates. A bounded exact convex-area comparison also handles different
+traces/vertex counts, with >=98% IoU/relative area and the same 15 cm distance bound.
+Spatial associations retain the baseline geometry; other overlaps conflict.
 All competing incoming candidates are considered together, never first-wins.
 
 Absence, deleted and retagged records never delete baseline data in this prototype.
@@ -251,15 +253,17 @@ def _bbox(geometry):
 
 
 def _equivalent(a, b):
-    if a is None or b is None or len(a) != len(b):
+    if a is None or b is None:
         return False
     aa, bb = _xy(a, a[0]), _xy(b, a[0])
-    for points in (bb, tuple(reversed(bb))):
-        for k in range(len(points)):
-            shifted = points[k:] + points[:k]
-            if all(math.dist(p, q) <= DUPLICATE_TOLERANCE_M for p, q in zip(aa, shifted)):
-                return True
-    return False
+    if len(a) == len(b):
+        for points in (bb, tuple(reversed(bb))):
+            for k in range(len(points)):
+                shifted = points[k:] + points[:k]
+                if all(math.dist(p, q) <= DUPLICATE_TOLERANCE_M for p, q in zip(aa, shifted)):
+                    return True
+    from buildingspatial import equivalent
+    return equivalent(a,b,DUPLICATE_TOLERANCE_M)
 
 
 def _overlap(ga, a, gb, b):

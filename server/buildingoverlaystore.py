@@ -13,7 +13,7 @@ or pruning: resource limits fail closed instead of deleting edits/history.
 """
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import errno
 import hashlib
@@ -50,6 +50,11 @@ class LockTimeout(StorageError):
 
 
 class BaselineMismatch(StorageError):
+    pass
+
+
+class StalePreview(StorageError):
+    """A reviewed state or decision set no longer matches; obtain a new preview."""
     pass
 
 
@@ -108,6 +113,7 @@ class Commit:
     merge_result: bo.MergeResult
     changed: bool
     affected_bounds: tuple | None
+    state_token: str | None = field(default=None,compare=False)
 
 
 @dataclass(frozen=True)
@@ -362,8 +368,12 @@ class OverlayStore:
 
     def _snapshot(self, manifest):
         try:
-            if set(manifest) != {"head", "enabled", "history", "affected_bounds"} or type(manifest["enabled"]) is not bool:
+            required = {"head", "enabled", "history", "affected_bounds"}
+            if set(manifest) not in (required,required|{"incarnation"}) or type(manifest["enabled"]) is not bool:
                 raise ValueError("invalid state manifest")
+            if "incarnation" in manifest and (not isinstance(manifest["incarnation"],str) or
+                                               not re.fullmatch("[0-9a-f]{32}",manifest["incarnation"])):
+                raise ValueError("invalid state incarnation")
             history, head = manifest["history"], manifest["head"]
             if not isinstance(history, list) or len(history) > self.limits.max_revisions or \
                     any(not isinstance(h, str) or not _HEX.fullmatch(h) for h in history) or len(set(history)) != len(history):
@@ -458,19 +468,37 @@ class OverlayStore:
         with self._locked():
             return self._load()
 
+    def _state_token(self):
+        path = self._safe(self.root / "state.json")
+        st = path.stat()
+        return _hash([self._read(path), st.st_mtime_ns, st.st_ctime_ns, st.st_ino])
+
+    def load_state(self):
+        """Snapshot and manifest incarnation, read under one lock (also fences enable/disable ABA)."""
+        with self._locked():
+            return self._load(), self._state_token()
+
     def _quota(self, extra_bytes, *, new_object=False):
-        total, count = 0, 0
+        total, count, visited = 0, 0, 0
         for directory in (self.root, self.objects):
             for path in directory.iterdir():
+                visited += 1
+                # Count zero-byte interrupted temporaries too; leave room for the
+                # object and atomic manifest temporaries without deleting anything.
+                if visited+int(new_object)+2 > 2*self.limits.max_revisions+16:
+                    raise ResourceLimit("overlay filesystem entry budget reached; explicit safe cleanup is required")
                 self._no_link(path)
                 if path.is_file():
                     total += path.stat().st_size
                     count += directory == self.objects and path.suffix == ".json"
+                    if total+extra_bytes > self.limits.max_total_bytes or count+int(new_object) > self.limits.max_revisions:
+                        raise ResourceLimit("overlay storage quota reached; no history or edits were removed")
         if total + extra_bytes > self.limits.max_total_bytes or count + int(new_object) > self.limits.max_revisions:
             raise ResourceLimit("overlay storage quota reached; no history or edits were removed")
 
     def _publish(self, snapshot, head, history, enabled, affected):
         payload = {"head": head, "enabled": enabled, "history": list(history), "affected_bounds": affected}
+        payload["incarnation"] = uuid.uuid4().hex
         data = self._document(payload)
         previous = self._document(self._read(self.root / "state.json"))
         self._quota(2 * (len(data) + len(previous)))
@@ -541,12 +569,15 @@ class OverlayStore:
             raise ResourceLimit("input exceeds document limit")
         return tuple(sorted(out, key=lambda f: f.feature_id))
 
-    def refresh(self, baseline, incoming, *, info, baseline_parts=(), incoming_parts=()):
+    def refresh(self, baseline, incoming, *, info, baseline_parts=(), incoming_parts=(),
+                dry_run=False, expected_state=None, expected_merge=None, validate=None, enable=False):
         """Persist accepted Stage 1 edits and unresolved conflicts, even while disabled.
 
         Supply the original baseline and sufficient surrounding context on every call.
         A later snapshot's omissions never remove previously accepted overlays.
         """
+        if type(dry_run) is not bool or type(enable) is not bool:
+            raise ValueError("dry_run/enable must be boolean")
         metadata = _metadata(info)
         baseline, incoming, baseline_parts, incoming_parts = [self._inputs(v) for v in
                                                               (baseline, incoming, baseline_parts, incoming_parts)]
@@ -559,6 +590,10 @@ class OverlayStore:
             raise ValueError("baseline part has no supplied parent")
         with self._locked():
             before = self._load()
+            if expected_state is not None and self._state_token() != expected_state:
+                raise StalePreview("overlay state changed; obtain a new preview")
+            if validate is not None:
+                validate()  # local validation only: callers must not acquire a catalog lock here
             identities = {identity for f in incoming for identity in bo._identities(f)}
             effective, parts = self._apply(before, baseline, baseline_parts, info.baseline_release, scope, True, identities)
             result = bo.merge(effective, incoming, baseline_parts=parts, incoming_parts=incoming_parts)
@@ -580,6 +615,8 @@ class OverlayStore:
                 buildings = tuple(retained.get(f.feature_id, f) for f in result.buildings)
                 kept_parts = tuple(p for p in result.parts if p.parent_id not in stale) + tuple(p for p in parts if p.parent_id in stale)
                 result = bo.MergeResult(buildings, tuple(sorted(kept_parts, key=lambda p: p.feature_id)), tuple(decisions))
+            if expected_merge is not None and expected_merge != (result.digest(), result.report_json()):
+                raise StalePreview("reviewed merge decisions changed; obtain a new preview")
             originals, merged = ({f.feature_id: f for f in fs} for fs in (baseline, result.buildings))
             incoming_by_id = {f.feature_id: f for f in incoming}
             for d in result.decisions:
@@ -617,27 +654,37 @@ class OverlayStore:
             if before.revision:
                 previous = self._object(before.revision)
                 if {k: v for k, v in previous.items() if k != "parent"} == core:
-                    return Commit(before.revision, result, False, None)
+                    if validate is not None:
+                        validate()
+                    if enable and not before.enabled and not dry_run:
+                        self._publish(before, before.revision, before.history, True, _union([e.bounds for e in before.entries]))
+                    return Commit(before.revision, result, False, None, None if dry_run else self._state_token())
             payload = dict(core, parent=before.revision)
             revision = _hash(payload)
             document = self._document(payload)
             path = self.objects / f"{revision}.json"
             # Validate exactly what will be loaded before publishing its manifest.
             self._quota(len(document) * 2 + 16384, new_object=not path.exists())
+            affected = _changed_bounds(before.entries, values)
+            history = before.history + (revision,)
+            if len(history) > self.limits.max_revisions:
+                raise ResourceLimit("revision history limit reached")
+            if dry_run:
+                if validate is not None:
+                    validate()
+                return Commit(revision, result, True, affected)
             if path.exists():
                 if self._object(revision) != payload:
                     raise CorruptStorage("immutable revision differs")
             else:
                 self._atomic_write(path, document)
-            affected = _changed_bounds(before.entries, values)
-            history = before.history + (revision,)
-            if len(history) > self.limits.max_revisions:
-                raise ResourceLimit("revision history limit reached")
-            manifest = {"head": revision, "history": list(history), "enabled": before.enabled,
+            manifest = {"head": revision, "history": list(history), "enabled": before.enabled or enable,
                         "affected_bounds": affected}
             self._snapshot(manifest)
-            self._publish(before, revision, history, before.enabled, affected)
-            return Commit(revision, result, True, affected)
+            if validate is not None:
+                validate()  # recheck after object I/O, immediately before manifest publication
+            self._publish(before, revision, history, before.enabled or enable, affected)
+            return Commit(revision, result, True, affected, self._state_token())
 
     def set_enabled(self, enabled):
         if type(enabled) is not bool:
@@ -682,6 +729,7 @@ class OverlayStore:
             except CorruptStorage:
                 previous = self._read(self.root / "previous.json")
                 self._snapshot(previous)
+                previous["incarnation"] = uuid.uuid4().hex
                 self._atomic_write(self.root / "state.json", self._document(previous))
                 return self._load()
             raise ValueError("current storage is valid; use rollback for a deliberate undo")

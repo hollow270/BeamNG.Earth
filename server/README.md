@@ -894,7 +894,11 @@ configuration and dependency APIs are documented in
 overlays only; live tile invalidation and game refresh are not implemented.
 The server-side selective generation catalog and explicit worker snapshots are described in
 [`BUILDING_REGENERATION.md`](../docs/BUILDING_REGENERATION.md). Activation of those
-prepared files and live collision replacement remain Stage 5 work.
+prepared files and live collision replacement remain Stage 5B work. The opt-in
+server-side fetch, preview, acceptance, automatic target discovery and network-free
+preparation retry API is documented in
+[`MANUAL_OSM_BUILDINGS.md`](../docs/MANUAL_OSM_BUILDINGS.md). Stage 5A prepares
+assets only and does not activate them in the game.
 
 Show this in the mod UI (the server sends the line for the sources in use as `hello.attribution`):
 "Imagery: USGS The National Map (public domain); EOxCloudless https://cloudless.eox.at by EOX IT

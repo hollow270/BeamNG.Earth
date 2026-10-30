@@ -138,8 +138,13 @@ class MergeTest(unittest.TestCase):
         outline = polygon([(0, 0), (5, 0), (10, 0), (10, 10), (0, 10), (0, 0)])
         old = baseline(osm=None)
         result = bo.merge([old], [incoming(geometry=outline)])
-        self.assertEqual(result.buildings, (old,))
-        self.assertEqual(outcomes(result, "conflict")[0].reason, "ambiguous_spatial_overlap")
+        # Stage 5A proves this unique convex retracing has exact IoU 1. The
+        # association may gain provenance, but keeps the original ID and geometry.
+        self.assertEqual(len(result.buildings), 1)
+        self.assertEqual(result.buildings[0].feature_id, old.feature_id)
+        self.assertEqual(result.buildings[0].geometry, old.geometry)
+        self.assertFalse(outcomes(result, "conflict"))
+        self.assertFalse(outcomes(result, "unchanged")[0].geometry_changed)
 
     def test_split_rejects_both_candidates_even_with_an_identity_match(self):
         old = baseline()

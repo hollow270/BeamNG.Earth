@@ -1240,7 +1240,7 @@ class Server:
                                      lambda la, lo: self.ground(anchor.frame, la, lo, self.dem.sample(la, lo, zoom)),
                                      self.out_dir, self.vfs_dir, aid, self.lamp_region(anchor))
 
-    def refresh_building_overlays(self, requests=(), *, cancel=None):
+    def refresh_building_overlays(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False):
         """Manual Stage 4B preparation; never writes/sends live session resources (Stage 5).
 
         requests: bounded buildingrefresh.TileRequest objects, retained for later local refreshes.
@@ -1260,7 +1260,50 @@ class Server:
                 coordinator = self._building_refresh = buildingrefresh.Coordinator(
                     os.path.join(self.cache_dir, "building-generations"), self.mapdata,
                     self.mapdata._building_store, submit)
-        return coordinator.refresh(requests, cancel=cancel)
+        return coordinator.refresh(requests, cancel=cancel, expected_state=expected_state, replace_requests=replace_requests)
+
+    def configure_osm_buildings(self, config, *, transport=None):
+        """Explicit runtime configuration only; endpoint/credentials are never source defaults."""
+        import buildingmanual
+        import osmbuildings
+        if not isinstance(config, osmbuildings.Config) or not config.enabled or config.endpoint is None:
+            raise osmbuildings.ConfigurationError("explicit enabled endpoint configuration is required")
+        if self.mapdata is None:
+            raise osmbuildings.ConfigurationError("map data is unavailable")
+        with self._building_refresh_lock:
+            old = self.__dict__.get("_building_manual")
+            if old is not None and not old.lock.acquire(blocking=False):
+                raise buildingmanual.Busy("manual building operation is in progress")
+            try:
+                replacement = buildingmanual.Workflow(self,osmbuildings.Client(
+                    config,fetcher=self.mapdata.fetcher,transport=transport))
+                if old is not None:
+                    old.retired = True
+                    old.previews.clear()
+                self._building_manual = replacement
+            finally:
+                if old is not None:
+                    old.lock.release()
+
+    def _manual_building_workflow(self, retry=False):
+        import buildingmanual
+        import osmbuildings
+        with self._building_refresh_lock:
+            workflow = self.__dict__.get("_building_manual")
+            if workflow is None:
+                if not retry:
+                    raise osmbuildings.ConfigurationError("configure_osm_buildings must be called first")
+                workflow = self._building_manual = buildingmanual.Workflow(self)
+        return workflow
+
+    def preview_osm_buildings(self, bounds, *, manual=False, enable=False):
+        return self._manual_building_workflow().preview(bounds,manual=manual,enable=enable)
+
+    def accept_osm_buildings(self, token, *, manual=False):
+        return self._manual_building_workflow().accept(token,manual=manual)
+
+    def retry_osm_buildings(self, token=None, *, manual=False):
+        return self._manual_building_workflow(retry=True).retry(token,manual=manual)
 
     def build_signs_tile(self, aid, tx, ty):
         """signstream.build_tile: the highway signs of road tile (tx, ty) of anchor aid (its roads are with the mod

@@ -8,7 +8,7 @@ road/terrain inputs retain the Stage 4A contracts.
 Prepared generations live in the server cache, separately from session files and
 pooled shapes held by the game. Publishing this catalog makes a batch ready for
 activation; it does not send messages, reset connection trackers, replace active
-collisions or change the game's installation. Those operations belong to Stage 5.
+collisions or change the game's installation. Those operations belong to Stage 5B.
 No protocol, Lua, Rust or OSM retrieval changes are needed in this stage.
 
 ## Actual pipeline and cache contracts
@@ -148,8 +148,12 @@ The first call requires at least one target. Register every relevant near/far/sk
 output, including density neighbours whose prepared replacements will be needed.
 The coordinator checks all retained targets, including those outside a newly edited
 area, and reuses the unchanged ones. It deliberately does not scan every cached
-world tile or automatically refresh while driving. Discovering active targets and
-translating a future in-game bbox selection into them is Stage 5 integration work.
+world tile or automatically refresh while driving. Stage 5A's
+[manual workflow](MANUAL_OSM_BUILDINGS.md) now discovers targets from active
+anchors, legacy/geotile trackers and this retained registry using actual settings.
+It forwards `expected_state` to fence the exact accepted store state at planning
+and publication. `replace_requests=True` retires obsolete registry descriptors
+only with a successful complete catalog publication; their files are retained.
 
 For tests/tools, `Coordinator(directory, md, store, submit)` accepts a submitter
 returning a `Future`; it uses no executor of its own. `Server` routes near tasks to
@@ -196,8 +200,10 @@ they are retained and counted against quotas. Published files are never deleted 
 overwritten here. Missing/changed prepared files cause a rebuild; malformed catalog
 metadata fails closed. Missing metadata alongside retained generations requires
 explicit recovery rather than guessing. Automatic orphan/history collection and
-unregistering retired view targets require a lifecycle policy before long-running
-Stage 5 use. Capacity exhaustion rejects work while preserving existing output.
+physical collection of retired view targets require a lifecycle policy before
+long-running Stage 5B use. Stage 5A can retire registry descriptors without deleting
+files; the temporary old/new registry union must still fit the existing quota.
+Capacity exhaustion rejects work while preserving existing output.
 
 ## Verification and Stage 5 prerequisites
 
@@ -237,8 +243,8 @@ Stage 5 must validate the chosen prepared catalog against current local dependen
 resolve `@BUILDING_OVERLAY@/<uuid>` paths into immutable session/pool resources,
 coordinate visual and collision activation, fence tracker callbacks by generation,
 update active far/near/skyline memo entries selectively, and manage acknowledgements,
-held slots and retirement. It must also register all active dependent targets with
-the actual server settings, provide the manual geographic UI/action and carry source
+held slots and retirement. Stage 5A discovers active dependent targets with actual
+server settings; Stage 5B must provide the manual geographic UI/action and carry source
 attribution into the active experience. Prepared collision meshes are coherent with
 their visual generation, but no live collision swap is attempted in Stage 4B.
 

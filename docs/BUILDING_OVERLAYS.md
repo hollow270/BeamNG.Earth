@@ -153,6 +153,27 @@ changes, and no live regeneration or cache invalidation. The opt-in offline rend
 is documented in [BUILDING_RENDER_OVERLAYS.md](BUILDING_RENDER_OVERLAYS.md). Storage scans snapshots
 rather than maintaining a spatial index. Large-area workloads are unsupported.
 
+## Stage 5A storage extensions
+
+[MANUAL_OSM_BUILDINGS.md](MANUAL_OSM_BUILDINGS.md) documents the manual
+fetch/review/accept/prepare workflow. `refresh(..., dry_run=True)` validates the
+same merge, decisions and quotas without writing objects or manifests.
+`load_state()` returns a snapshot and an exact state token; `expected_state`,
+`expected_merge` and a local-only validation callback fence acceptance. Validation
+runs again before publication. `enable=True` explicitly enables on that accepted
+operation; the default retains the current enabled flag. `Commit.state_token` is
+a transient publication receipt, not part of the content revision.
+
+New publications/recovery add an optional random `incarnation` to the control
+manifest, detecting enable/disable/rollback ABA independently of filesystem clock
+resolution. Immutable revision schemas/hashes and local dependency digests are
+unchanged. New readers accept old manifests; older readers reject the additional
+manifest field, so writer downgrade needs explicit compatibility handling.
+No suppression/removal operation or automatic history collector is added.
+Quota scans now also count direct filesystem entries, including zero-byte crash
+temporaries, with an allowance of `2 * max_revisions + 16` and reserved atomic-write
+slots. Exhaustion rejects work without deleting uncertain or referenced files.
+
 ## Reproducible tests
 
 On Windows x64, bootstrap once from the repository:
@@ -171,7 +192,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/test_building_over
 
 The execution policy option applies only to this PowerShell process; no machine
 or user execution policy is changed. This runs all Stage 1, persistence, OSM retrieval and offline
-rendering and [selective preparation](BUILDING_REGENERATION.md) tests, plus the existing
+rendering, [selective preparation](BUILDING_REGENERATION.md) and
+[manual workflow](MANUAL_OSM_BUILDINGS.md) tests, plus the existing
 buildings, worker, geotile, process-pool, roads, road-width and `mapgeom` tests.
 The rendering tests use the repository's existing Windows native binary; they do not build Rust.
 Fixtures, temporary directories and subprocess working directories stay inside

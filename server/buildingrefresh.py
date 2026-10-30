@@ -235,7 +235,7 @@ def generate(request, snapshot, out_dir, vfs_dir, expected, limits=Limits()):
 
 class _CatalogFiles(OverlayStore):
     """Reuse Stage 2's file lock, checked JSON and atomic-write primitives, without overlay manifests."""
-    def __init__(self, directory):
+    def __init__(self, directory, *, create=True):
         self.directory = self.root = Path(directory).absolute()
         if ".." in self.root.parts:
             raise ValueError("catalog path cannot contain '..'")
@@ -243,7 +243,26 @@ class _CatalogFiles(OverlayStore):
         self.limits, self.lock_timeout = StoreLimits(max_file_bytes=4*1024*1024), 5.0
         for path in (self.root, self.objects, self.root / "work"):
             self._no_link(path)
-            path.mkdir(parents=True, exist_ok=True)
+            if create:
+                path.mkdir(parents=True, exist_ok=True)
+            elif not path.is_dir():
+                raise CorruptStorage("prepared catalog directories are incomplete")
+
+
+def registered_requests(directory, *, limit=128):
+    """Read a retained registry without creating catalogs/directories (manual preview/discovery)."""
+    path = Path(directory).absolute() / "catalog.json"
+    if not path.exists():
+        return ()
+    io = _CatalogFiles(directory, create=False)
+    state = io._read(path)
+    rows = state.get("requests")
+    if not isinstance(rows, dict) or len(rows) > limit:
+        raise ResourceLimit("invalid/oversized retained target registry")
+    requests = tuple(TileRequest(**row) for _,row in sorted(rows.items()))
+    if any(r.slot != key for r,(key,_) in zip(requests,sorted(rows.items()))):
+        raise CorruptStorage("invalid retained target slots")
+    return requests
 
 
 def _index(snapshot, feature_ids=None):
@@ -458,7 +477,7 @@ class Coordinator:
             # A running cancelled/timed-out job owns its private directory until it exits.
             raise
 
-    def refresh(self, requests=(), *, cancel=None):
+    def refresh(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False):
         if not self._requests.acquire(blocking=False):
             raise ResourceLimit("too many simultaneous building refreshes")
         work = []
@@ -476,14 +495,17 @@ class Coordinator:
                     raise ResourceLimit("building catalog sequence exhausted")
                 registered = dict(state["requests"])
                 registered.update({r.slot: r.wire() for r in requests})
-                if not registered:
+                target_registry = {r.slot:r.wire() for r in requests} if replace_requests else registered
+                if not target_registry:
                     raise ValueError("register at least one building tile before requesting regeneration")
                 if len(registered) > self.limits.requests:
                     raise ResourceLimit("registered building tile budget exhausted")
-                snapshot = self.store.load()
+                snapshot, state_token = self.store.load_state()
+                if expected_state is not None and state_token != expected_state:
+                    raise StaleGeneration("accepted workflow state changed before preparation")
                 desired, feature_ids = {}, set()
                 with self.md.building_snapshot(snapshot):
-                    for key, row in sorted(registered.items()):
+                    for key, row in sorted(target_registry.items()):
                         req = TileRequest(**row)
                         identity, dependency = req.inputs(self.md)
                         desired[key] = (req, identity, dependency)
@@ -495,7 +517,7 @@ class Coordinator:
                 ticket = state["sequence"]
                 self._usage()
                 self._save(state)
-            entries, rebuilt, reused = dict(state["entries"]), [], []
+            entries, rebuilt, reused = {k:v for k,v in state["entries"].items() if k in target_registry}, [], []
             for key, (req, identity, dependency) in desired.items():
                 self._cancel(cancel)
                 old = entries.get(key)
@@ -523,6 +545,8 @@ class Coordinator:
                 if current["sequence"] != ticket:
                     raise StaleGeneration("a newer refresh superseded this batch")
                 latest = self.store._load()  # hold the overlay writer lock through catalog publication
+                if expected_state is not None and self.store._state_token() != expected_state:
+                    raise StaleGeneration("accepted workflow state changed during preparation")
                 with self.md.building_snapshot(latest):
                     if any(req.inputs(self.md)[0] != identity for req, identity, _ in desired.values()):
                         raise StaleGeneration("accepted local overlay data changed during generation")
@@ -541,7 +565,7 @@ class Coordinator:
                 _sync_directory(self.io.objects)
                 # After this point retain all moved directories even on an uncertain fsync/rename failure.
                 # They are either referenced by the new atomic catalog or harmless bounded orphans.
-                current.update(entries=entries, publication=uuid.uuid4().hex,
+                current.update(entries=entries, requests=target_registry, publication=uuid.uuid4().hex,
                                snapshot=snapshot.revision, overlay=overlay)
                 self._cancel(cancel)
                 self._save(current)

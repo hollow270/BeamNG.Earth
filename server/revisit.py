@@ -225,6 +225,13 @@ def load(cache_dir, kind, k):
         with zipfile.ZipFile(path) as z:
             meta = json.loads(z.read("meta.json"))
             blobs = {name: z.read(name) for name in meta["names"]}
+        if kind in ("bldfar", "bldsky"):
+            # Older legacy building entries could keep spaced JSON but omit its
+            # meshes. Treat that entry as a miss; retain it until a complete build
+            # replaces it. Never return references to absent cache members.
+            for name, data in blobs.items():
+                if name.endswith(".json") and any(shape not in blobs for shape in shapes_in(data.decode("utf-8"), "@V@")):
+                    return None
         try:
             os.utime(path, None)            # (used: kept longest when cut back)
         except OSError:
@@ -241,7 +248,7 @@ def swap(text, tokens):
     return text
 
 
-SHAPE_RE = re.compile(r'"shape":"([^"]+)"')
+SHAPE_RE = re.compile(r'"shape"\s*:\s*"([^"]+)"')
 
 
 def shapes_in(text, vfs_dir):

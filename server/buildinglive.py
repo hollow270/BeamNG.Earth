@@ -87,6 +87,10 @@ def _public_error(error):
         "Rejected": "Activation could not establish current targets, assets or world safety. Retry local preparation.",
     }
     result = dict(type=kind, message=messages.get(kind,"The operation failed. No automatic network retry will be made."))
+    if isinstance(error,activation.Rejected):
+        result['validation_code']=error.code
+        if str(error) in activation.VALIDATION_CODES:
+            result['message']=str(error) # fixed validation text only, never paths/credentials
     if kind=="HTTPFailure" and type(getattr(error,"code",None)) is int:
         result["message"]=f"The configured OSM endpoint returned HTTP {error.code}. No data was accepted."
     wait = getattr(error,"retry_after",None)
@@ -143,13 +147,27 @@ def _stream_signature(conn):
     tables=[]
     for name in TRACKERS:
         tracker=getattr(conn,name,None)
-        keys=set()
+        fields=[]; total=0
         if tracker is not None:
-            for field in ("sent","empty","building","car","shown"):
-                keys.update(getattr(tracker,field,()))
-        if len(keys)>16384: raise ResourceLimit("streaming inspection exceeds quota")
-        tables.append((name,tuple(sorted(keys))))
+            for field in ("sent","empty","building","car","futs","retry","shown"):
+                keys=tuple(sorted(getattr(tracker,field,())))
+                total+=len(keys)
+                if total>16384: raise ResourceLimit("streaming inspection exceeds quota")
+                fields.append((field,keys))
+        tables.append((name,id(tracker),getattr(tracker,'aid',None),getattr(tracker,'geo',False),tuple(fields)))
     return tuple(tables)
+
+
+class _BaselineView:
+    """Read-only rendering lens. Durable accepted data and its ABA token are untouched."""
+    def __init__(self,store): self.store=store; self.limits=store.limits
+    def _locked(self): return self.store._locked()
+    def _load(self): return replace(self.store._load(),enabled=False)
+    def _state_token(self): return self.store._state_token()
+    def load_state(self):
+        snapshot,state=self.store.load_state()
+        return replace(snapshot,enabled=False),state
+    def compose(self,*args,**kwargs): return self.store.compose(*args,**kwargs)
 
 
 def _pending_live(conn,row):
@@ -180,6 +198,13 @@ class Service:
         self.snapshot = None
         self.state_token = None
         self.failed_signature = None
+        self.restore_signature=None
+        self.restore_attempts=0
+        self.restore_retry_at=0
+        self.restore_transient=False
+        self.fallback_frame=None
+        self.scan_failures=0
+        self.scan_retry_at=0
         self.applied = {}
         self.current = dict(state="idle",game_activated=False,accepted_revision=None,activated_revision=None)
         self.runner = None
@@ -357,6 +382,8 @@ class Service:
             workflow.discovery_context.reset(token)
 
     async def call(self,conn,fn):
+        if self.context_task is not None and not self.context_task.done():
+            await asyncio.shield(self.context_task)
         previous_state=self.state_token
         frozen,world,frame=self._capture(conn)
         rendering=_render_signature(world,frozen)
@@ -515,6 +542,8 @@ class Service:
                 _,current=await self.call(conn,lambda w,c:self.server.retry_osm_buildings(manual=True,prepare=False))
                 if not current: self._set("superseded"); return
             self.failed_signature=None
+            self.fallback_frame=None
+            self.scan_failures=0; self.scan_retry_at=0
             if conn is self.owner:
                 await self.prepare(conn,explicit=True)
         except Exception as e:
@@ -552,14 +581,27 @@ class Service:
             regions.extend(clipped or [changed])
         return regions
 
-    async def prepare(self,conn,*,explicit=False):
+    def _restoration(self,conn,code,message,*,mode='waiting'):
+        trackers={}
+        for name in TRACKERS:
+            tracker=getattr(conn,name,None)
+            if tracker is not None:
+                trackers[name]=dict(anchor=getattr(tracker,'aid',None),
+                    **{key:len(getattr(tracker,key,())) for key in ('sent','empty','building','car','futs')})
+        return dict(mode=mode,code=code,message=message,anchor=getattr(conn,'active',None),
+                    attempts=self.restore_attempts,trackers=trackers)
+
+    async def prepare(self,conn,*,explicit=False,baseline=False):
         if self.mirror is not None:
             pending=next((t for t in self.mirror.transactions.values() if t["state"] in ("scheduled","deferred","installing")),None)
             if pending:
                 def resume(w,c):
                     transaction=next(t for t in self.authority.transactions.values() if t["conn"] is c and t["state"] in ("scheduled","deferred","installing"))
                     if transaction["state_token"]==self.state_token:
-                        return self.authority.activate(c,transaction["publication"],manual=True)
+                        original=self.authority.store
+                        if not transaction['overlay_enabled']: self.authority.store=_BaselineView(original)
+                        try: return self.authority.activate(c,transaction["publication"],manual=True)
+                        finally: self.authority.store=original
                     self.authority.cancel_if_stale(c)
                     return self.authority.status(transaction["transaction"])
                 state,current=await self.call(conn,resume)
@@ -569,6 +611,18 @@ class Service:
         if not regions:
             self.completed_state=self.state_token
             self._set("accepted",detail="No currently visible targets. Accepted data will be prepared when visited.")
+            return
+        for name in TRACKERS:
+            tracker=getattr(conn,name,None)
+            if tracker is not None and getattr(tracker,'aid',None) not in (None,conn.active):
+                self._set('activation_deferred',error=None,restoration=self._restoration(conn,'trackers_settling',
+                    'Waiting for the new anchor and building trackers to agree.'))
+                return
+        near=getattr(conn,'roads',None)
+        if near is not None and (getattr(near,'building',()) or getattr(near,'futs',()) or
+                set(getattr(near,'car',()))-set(getattr(near,'sent',()))-set(getattr(near,'empty',()))):
+            self._set('activation_deferred',error=None,restoration=self._restoration(conn,'near_streaming',
+                'Waiting for ordinary road streaming before restoring buildings.'))
             return
         self._set("preparing",error=None)
         def prepare(world,c):
@@ -592,7 +646,18 @@ class Service:
                 return (0 if req.kind.startswith("near") and (req.x,req.y) in getattr(tracker,"car",()) else
                         1 if req.kind.startswith("near") else 2 if req.kind.startswith("far") else 3,req.slot)
             order=tuple(r.slot for r in sorted(requests.values(),key=priority))
-            return dict(self.server.refresh_building_overlays(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order),
+            if baseline:
+                coordinator=self.server.__dict__.get('_building_refresh')
+                if coordinator is None: raise activation.Rejected('no validated catalog is available for baseline recovery')
+                with self.server._building_refresh_lock:
+                    original=coordinator.store
+                    coordinator.store=_BaselineView(original)
+                    try:
+                        prepared=coordinator.refresh(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order)
+                    finally: coordinator.store=original
+            else:
+                prepared=self.server.refresh_building_overlays(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order)
+            return dict(prepared,
                         live_requests=[r.wire() for r in requests.values()])
         result,current=await self.call(conn,prepare)
         if not current: self._set("superseded"); return
@@ -603,15 +668,19 @@ class Service:
         self._set("prepared",publication=result["publication"])
         if any(req["kind"].startswith("near") and not any((req["x"],req["y"]) in getattr(getattr(conn,"roads",None),name,())
                 for name in ("sent","empty")) for req in result["live_requests"]):
-            self.failed_signature=(self.state_token,_frame(conn),tuple(sorted(self.pending)),_stream_signature(conn))
+            self.failed_signature=(self.state_token,_frame(conn),tuple(sorted(self.pending)),_stream_signature(conn),_render_signature(self.server,conn))
             self._set("activation_deferred",detail="Prepared locally; waiting for ordinary near-road streaming to complete.")
             return
         # One logical handoff can span four bounded messages, but only one game commit.
         def activate(world,c):
-            world._building_activation=self._manager(world)
-            state=world.activate_building_overlays(c,result["publication"],manual=True)
-            if state["state"]=="rejected": raise activation.Rejected("current generation could not be activated")
-            return state
+            manager=self._manager(world)
+            original=manager.store
+            if baseline: manager.store=_BaselineView(original)
+            try:
+                # Same Manager validation; preserve the precise exception instead of
+                # replacing the legacy API's error envelope with a generic Rejected.
+                return manager.activate(c,result["publication"],manual=True)
+            finally: manager.store=original
         state,current=await self.call(conn,activate)
         if current:
             self.current.update(transaction=state["transaction"])
@@ -631,6 +700,22 @@ class Service:
             values.update(activated_revision=result["revision"],activated_enabled=result["overlay_enabled"])
             self.completed_state=self.state_token
             self.failed_signature=None
+            if not result['overlay_enabled'] and self.snapshot and self.snapshot.enabled:
+                cause=(self.current.get('restoration') or {}).get('code')
+                self.current['restoration']=self._restoration(self.owner,'baseline_active',
+                    'Original building baseline is active. Saved overlays remain enabled; retry locally to restore them.',mode='baseline')
+                self.current['restoration']['cause_code']=cause
+            else: self.current.pop('restoration',None)
+        elif state=='failed':
+            frame=(self.state_token,_frame(self.owner))
+            blocked=self.fallback_frame==frame
+            if not blocked:
+                self.fallback_frame=frame
+                self.failed_signature=None
+            self.current['restoration']=self._restoration(self.owner,'engine_failed',
+                'Building restoration is blocked and no safe baseline could be activated. Stop and inspect local diagnostics before driving.' if blocked else
+                'The engine could not restore accepted buildings. Preparing the original building baseline safely.',mode='blocked' if blocked else 'baseline')
+        elif state=='superseded': self.failed_signature=None
         self._set(state,**values)
 
     def queue_ack(self,conn,msg):
@@ -669,7 +754,15 @@ class Service:
                 (msg.get("sessionId"),msg.get("epoch"),msg.get("anchorId"))!=(self.server.sid,self.epoch,conn.active): return
         self.inflight_ack+=1
         try:
-            state,current=await self.call(conn,lambda w,c:self.authority.acknowledge(c,msg))
+            def acknowledge(world,c):
+                manager=self.authority
+                transaction=manager.transactions.get(msg['transaction'])
+                original=manager.store
+                if transaction is not None and not transaction['overlay_enabled']:
+                    manager.store=_BaselineView(original)
+                try: return manager.acknowledge(c,msg)
+                finally: manager.store=original
+            state,current=await self.call(conn,acknowledge)
             if current: self._activation_state(state)
         except activation.Rejected:
             return
@@ -693,11 +786,32 @@ class Service:
         self.initialized=False
         self.last_scan=float('-inf')
         self.completed_state=None
+        self.current.pop('restoration',None)
+        self.failed_signature=None
+        self.restore_signature=None
+        self.restore_attempts=0
+        self.restore_retry_at=0
+        self.restore_transient=False
+        self.fallback_frame=None
+        self.scan_failures=0; self.scan_retry_at=0
         old=self.facade
         self.mirror=None
         if old is not None and self.authority is not None:
+            previous=self.context_task
             async def invalidate():
-                await self._work(self.authority.context_changed,old)
+                if previous is not None and not previous.done(): await previous
+                def cancel_old():
+                    # The facade's prior send closure belonged to an already-returned
+                    # worker call. Export only fenced cancels back to the socket owner.
+                    output=[]; send=old.send
+                    old.send=lambda m:output.append(deepcopy(m))
+                    try: self.authority.context_changed(old)
+                    finally: old.send=send
+                    return output
+                output=await self._work(cancel_old)
+                if not disconnect and conn is self.owner and conn in self.server.connections:
+                    for message in output:
+                        if message.get('type')=='building_cancel': conn.send(message)
             self.context_task=asyncio.create_task(invalidate())
         for status in self.activation_states.values():
             status.update(state='orphaned',game_activated=False,detail='Connection or anchor changed; current activation is unconfirmed.')
@@ -710,30 +824,65 @@ class Service:
         while not self.closed:
             try:
                 conn=self.owner
-                if not self.revoked and conn is not None and conn in self.server.connections and not self.busy and conn.active in self.server.anchors:
+                if not self.revoked and conn is not None and conn in self.server.connections and not self.busy and conn.active in self.server.anchors and time.monotonic()>=self.scan_retry_at:
                     for name,row in list(self.pending.items()):
                         if not _pending_live(conn,row): self.pending.pop(name,None)
                     if self.snapshot is None or self.clock()-self.last_scan>=1:
                         await self.call(conn,lambda w,c:None)
                         self.last_scan=self.clock()
-                    signature=(self.state_token,_frame(conn),tuple(sorted(self.pending)),_stream_signature(conn))
+                        self.scan_failures=0; self.scan_retry_at=0
+                    signature=(self.state_token,_frame(conn),tuple(sorted(self.pending)),_stream_signature(conn),_render_signature(self.server,conn))
+                    if signature!=self.restore_signature:
+                        self.restore_signature=signature
+                        self.restore_attempts=0
+                        self.restore_retry_at=0
+                        self.restore_transient=False
                     active=self.mirror and any(t["state"] in ("scheduled","deferred","installing") for t in self.mirror.transactions.values())
                     if active and any(t["state"] in ("scheduled","deferred","installing") and (t["state_token"]!=self.state_token or
                                       any(not activation._live(conn,regeneration.TileRequest(**r)) for r in t["requests"].values()))
                                       for t in self.mirror.transactions.values()):
                         await self.call(conn,lambda w,c:self.authority.cancel_if_stale(c))
                         self._set("superseded",detail="Accepted data changed; the older handoff is being cancelled or retired safely.")
-                    if (self.pending or self.completed_state!=self.state_token and self._regions()) and not active and not self.inflight_ack and signature!=self.failed_signature:
+                    retry=self.restore_transient and self.restore_attempts<3 and time.monotonic()>=self.restore_retry_at
+                    if (self.pending or self.completed_state!=self.state_token and self._regions()) and not active and not self.inflight_ack and (signature!=self.failed_signature or retry):
                         self.busy=True
                         self.failed_signature=signature
                         try:
-                            await self.prepare(conn)
+                            await self.prepare(conn,baseline=self.fallback_frame==(self.state_token,_frame(conn)))
+                            self.restore_transient=False
                         except Exception as e:
+                            if conn is not self.owner or _frame(conn)!=signature[1] or self.state_token!=signature[0]:
+                                self.failed_signature=None
+                                continue  # obsolete failure cannot select recovery for a new context
                             self.failed_signature=signature
-                            self._set("failed",error=_public_error(e))
+                            self.restore_attempts+=1
+                            code=getattr(e,'code',type(e).__name__)
+                            transient=code in ('targets_changed','catalog_changed','revision_changed','inputs_changed','near_streaming',
+                                              'transaction_pending','DiscoveryError','StaleGeneration','StalePreview','IncompleteGeneration')
+                            if transient and self.restore_attempts<3:
+                                self.restore_transient=True
+                                self.restore_retry_at=time.monotonic()+2**(self.restore_attempts-1)
+                                self._set('activation_deferred',error=_public_error(e),restoration=self._restoration(conn,str(code),
+                                    'Building restoration is waiting for a consistent current world; local retry is scheduled.'))
+                            elif self.fallback_frame!=(self.state_token,_frame(conn)):
+                                self.restore_transient=False
+                                self.fallback_frame=(self.state_token,_frame(conn))
+                                self._set('activation_deferred',error=_public_error(e),restoration=self._restoration(conn,str(code),
+                                    'Accepted buildings could not be restored. Preparing the original building baseline safely.',mode='baseline'))
+                                try: await self.prepare(conn,baseline=True)
+                                except Exception as fallback:
+                                    self._set('failed',error=_public_error(fallback),restoration=self._restoration(conn,getattr(fallback,'code',type(fallback).__name__),
+                                        'Building restoration is blocked and no safe baseline could be activated. Stop and inspect local diagnostics before driving.',mode='blocked'))
+                            else:
+                                self.restore_transient=False
+                                self._set('failed',error=_public_error(e),restoration=self._restoration(conn,str(code),
+                                    'Building restoration is blocked and no safe baseline could be activated. Stop and inspect local diagnostics before driving.',mode='blocked'))
                         finally: self.busy=False
             except Exception as e:
-                self._set("failed",error=_public_error(e))
+                self.scan_failures+=1
+                self.scan_retry_at=float('inf') if self.scan_failures>=3 else time.monotonic()+2**self.scan_failures
+                self._set("failed",error=_public_error(e),restoration=self._restoration(conn,'storage_or_context_failed',
+                    'Building recovery cannot validate local storage or world context. Stop and inspect diagnostics; retry locally after correcting the error.',mode='blocked'))
             await asyncio.sleep(0.5)
 
     async def cleanup(self,conn):

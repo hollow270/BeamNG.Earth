@@ -79,11 +79,12 @@ export function normalizeBuildingStatus(value) {
     accepted_state: text(raw.accepted_state), activated_enabled: raw.activated_enabled,
     held_slots: count(raw.held_slots), operation_pending: raw.operation_pending === true,
     command_pending: raw.command_pending === true, command_id: raw.command_id,
-    preview: null, error: null, resources: null,
+    preview: null, error: null, resources: null, restoration: null,
     deferred: rows(raw.deferred, r => ({ kind: text(r.kind), key: text(r.key), reason: text(r.reason) })),
   }
   if (raw.error != null) out.error = { message: text(object(raw.error) ? raw.error.message : raw.error, "Invalid error response"),
     retry_after: object(raw.error) && typeof raw.error.retry_after === "number" && Number.isFinite(raw.error.retry_after) ? Math.max(0, Math.min(86400, raw.error.retry_after)) : 0 }
+  if (object(raw.restoration)) out.restoration = { mode: text(raw.restoration.mode), code: text(raw.restoration.code), message: text(raw.restoration.message) }
   if (raw.preview != null) {
     const p = object(raw.preview) ? raw.preview : {}
     if (!object(raw.preview)) malformed = true

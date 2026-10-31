@@ -3,6 +3,7 @@ local M={}
 local secret,session,epoch=nil,nil,nil
 local id=0
 local pending=nil
+local restorationNotice=nil
 local state={available=false,state='unavailable',reason='Companion app not connected'}
 local client=nil
 pcall(function() client=settings.getValue('beamngEarth_buildingClient') end)
@@ -10,6 +11,7 @@ function M.client() return client end
 local allowed={status=true,preview=true,accept=true,retry=true,disable=true,enable=true,rollback=true,cleanup=true}
 function M.hello(m)
   pending=nil
+  restorationNotice=nil
   require('beamngEarth/buildinginventory').reset()
   secret,session,epoch=m.buildingControlToken,m.sessionId,m.buildingEpoch
   if type(m.buildingClient)=='string' and #m.buildingClient==64 then
@@ -20,6 +22,7 @@ function M.hello(m)
 end
 function M.disconnect()
   pending=nil
+  restorationNotice=nil
   require('beamngEarth/buildinginventory').reset()
   secret,session,epoch=nil,nil,nil
   state={available=false,state='unavailable',reason='Companion app disconnected; accepted local data is retained'}
@@ -27,6 +30,19 @@ end
 function M.message(m)
   if type(m)~='table' or m.type~='building_status' or #jsonEncode(m)>262144 then return false end
   if m.available~=true or (m.command_id==pending and m.command_pending==false) then pending=nil end
+  local r=m.restoration
+  if type(r)=='table' and type(r.code)=='string' and #r.code<=64
+    and (r.mode=='waiting' or r.mode=='baseline' or r.mode=='blocked') and type(r.anchor)=='number' then
+    local key=r.mode..':'..r.code..':'..tostring(r.anchor)
+    if key~=restorationNotice then
+      restorationNotice=key
+      local text=r.mode=='blocked' and 'Building restoration is blocked. Stop and inspect the OSM building panel before driving.'
+        or r.mode=='baseline' and 'Original building baseline recovery is active. Saved overlays remain enabled; inspect the OSM building panel.'
+        or 'Restoring local buildings after a world change. Keep the vehicle parked until activation is confirmed.'
+      if guihooks and guihooks.trigger then pcall(guihooks.trigger,'toastrMsg',
+        {type=r.mode=='waiting' and 'info' or 'warning',title='BeamNG.Earth buildings',msg=text}) end
+    end
+  elseif r==nil then restorationNotice=nil end
   state=m; state.operation_pending=pending~=nil; return true
 end
 function M.state() return state end

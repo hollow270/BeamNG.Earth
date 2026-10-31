@@ -112,4 +112,20 @@ await renderCheck(async () => {
     assert.equal(panel.button('Accept and apply').props.disabled, true)
   } finally { panel.close() }
 })
+for (const restoration of [{ mode: 'waiting', code: 'trackers_settling', message: 'Waiting for the new anchor.' },
+  { mode: 'baseline', code: 'baseline_active', message: 'Original building baseline is active.' },
+  { mode: 'blocked', code: 'artifacts_invalid', message: 'Stop and inspect local diagnostics before driving.' }]) {
+  await renderCheck(async () => {
+    const panel = await mountBuildingPanel({ ...review, restoration }, box)
+    try {
+      assert.deepEqual(panel.errors, [])
+      assert.ok(panel.text().includes(restoration.message)); assert.ok(panel.text().includes(restoration.code))
+      assert.equal(panel.commands.length, 0, 'restoration status must never trigger a command or acceptance')
+    } finally { panel.close() }
+  })
+}
+await renderCheck(async () => {
+  const panel = await mountBuildingPanel({ ...review, restoration: { mode: {}, code: [], message: {} } }, box)
+  try { assert.deepEqual(panel.errors, []); assert.equal(panel.commands.length, 0) } finally { panel.close() }
+})
 console.log(`${checks} UI checks passed (bridge validation, four Vue compilations and real Vue runtime rendering/events).`)

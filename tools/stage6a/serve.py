@@ -120,7 +120,7 @@ async def run(args):
     live=server._building_live=buildinglive.Service(server,local_control=True)
     base_error=buildinglive._public_error
     def development_error(error):
-        event('development_error',type=type(error).__name__,reason=str(error))
+        event('development_error',type=type(error).__name__,reason=str(error),validation_code=getattr(error,'code',None))
         logging.getLogger('stage6a').error('%s: %s',type(error).__name__,error)
         return base_error(error)
     buildinglive._public_error=development_error
@@ -144,7 +144,8 @@ async def run(args):
                   seq=msg.get('seq'),targets=len(msg.get('targets',())),part=msg.get('part'))
         elif msg.get('type')=='building_status':
             event('building_status',state=msg.get('state'),accepted_revision=msg.get('accepted_revision'),
-                  activated_revision=msg.get('activated_revision'),error=(msg.get('error') or {}).get('type'))
+                  activated_revision=msg.get('activated_revision'),error=(msg.get('error') or {}).get('type'),
+                  validation_code=(msg.get('error') or {}).get('validation_code'),restoration=msg.get('restoration'))
         return base_send(conn,msg)
     earthd.Connection.send=send
     class DevelopmentConnection(earthd.Connection):
@@ -170,7 +171,10 @@ async def run(args):
     print('No public HTTP/DNS permitted; no actual BeamNG test is claimed.',flush=True)
     try:
         if args.smoke:
-            await smoke(server,port,transport,scenario,protocol,root)
+            if getattr(args,'restoration_smoke',False):
+                from restoration_smoke import smoke as restore
+                await restore(server,port,transport,scenario,protocol,root)
+            else: await smoke(server,port,transport,scenario,protocol,root)
         else:
             async with listener: await listener.serve_forever()
     finally:
@@ -258,8 +262,10 @@ def main():
     parser.add_argument('--synthetic-only',action='store_true',required=True)
     parser.add_argument('--port',type=int,default=47623)
     parser.add_argument('--smoke',action='store_true')
+    parser.add_argument('--restoration-smoke',action='store_true',help='Real socket anchor replay with SIMULATED acknowledgements, no game')
     parser.add_argument('--default-ranges',action='store_true',help='Reproduce the known unmodified production-distance discovery quota blocker')
     args=parser.parse_args()
+    args.smoke=args.smoke or args.restoration_smoke
     if not 1024<=args.port<=65535: parser.error('Choose a non-privileged loopback port')
     logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(name)s: %(message)s')
     try: asyncio.run(run(args))

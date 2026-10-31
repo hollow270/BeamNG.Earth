@@ -402,6 +402,12 @@ Coverage includes all requested scenario groups:
 
 ## Stage 6 handoff — instructions only
 
+The user confirmed Stage 6C live activation and collision in BeamNG.drive 0.40.1,
+then found automatic restoration failed after teleport. The Stage 6D recovery
+fix, evidence limits, baseline fallback and separate port/profile continuation
+are in [STAGE6D_RESTORATION_FIX.md](STAGE6D_RESTORATION_FIX.md).
+Actual engine teleport restoration with that fix remains pending.
+
 The user-operated Stage 6B test also exposed governor starvation during building
 staging. [The Stage 6C fix and isolated continuation procedure](STAGE6C_SCHEDULER_FIX.md)
 document the confirmed mechanism and simulated regression evidence. Actual engine

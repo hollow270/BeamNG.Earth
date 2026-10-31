@@ -57,8 +57,38 @@ def defer_message(server,conn,msg):
     return None if near and out.get("type")=="roads_tile" and out.get("data") is None else out
 
 
+VALIDATION_CODES = {
+    "building overlays must be configured":"not_configured",
+    "building activation requires the existing cdae shape-slot format":"format_unsupported",
+    "prepare a catalog before activation":"catalog_missing",
+    "activation journal already exists for this session; retain its original manager":"journal_exists",
+    "invoke activation on its owning authority thread":"wrong_thread",
+    "current connection must negotiate buildingActivation=1":"capability_missing",
+    "current session/anchor is unavailable":"session_unavailable",
+    "catalog publication is stale or incomplete":"catalog_changed",
+    "prepare the current accepted revision first":"revision_changed",
+    "prepared inputs no longer match":"inputs_changed",
+    "prepared inputs or artifact checksums no longer match":"artifacts_invalid",
+    "selected activation targets are no longer current":"targets_changed",
+    "no prepared target corresponds to this connection's current world":"targets_changed",
+    "prepared targets/settings do not match the current world":"targets_changed",
+    "near target must finish normal world streaming before activation":"near_streaming",
+    "finish/cancel the outstanding activation before scheduling a new one":"transaction_pending",
+    "invalid activation target selection":"target_selection_invalid",
+    "prepared receipt has no checked tile JSON":"receipt_invalid",
+    "invalid prepared tile JSON":"receipt_invalid",
+    "mesh is not in the checked generation manifest":"mesh_unlisted",
+    "copied mesh checksum differs from prepared data":"copy_invalid",
+    "manual=True is required; activation does not fetch or accept data":"manual_required",
+    "malformed activation acknowledgment":"ack_invalid",
+    "unexpected/stale activation acknowledgment":"ack_stale",
+}
+
+
 class Rejected(ValueError):
-    pass
+    def __init__(self,message):
+        super().__init__(message)
+        self.code=VALIDATION_CODES.get(message,"activation_rejected")
 
 
 def _key(req):

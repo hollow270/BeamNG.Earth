@@ -12,6 +12,7 @@
     <p v-if="area.error" class="building-warning">{{ area.error }}</p>
     <p v-if="status.fetch_reason" class="building-warning">{{ status.fetch_reason }}</p>
     <p v-if="status.data_warning" class="building-warning" role="alert">{{ status.data_warning }}</p>
+    <p v-if="status.restoration" class="building-warning" role="alert">{{ status.restoration.message }} ({{ status.restoration.code }})</p>
     <button class="map-btn primary" :disabled="!status.fetch_available || !!area.error || busy" @click="request('preview', { bounds: area.bounds })">Fetch and preview buildings</button>
     <p class="building-state" role="status">{{ buildingStates[status.state] || status.state || "Waiting for companion app" }}</p>
     <p v-if="status.detail">{{ status.detail }}</p>

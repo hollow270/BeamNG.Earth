@@ -1,6 +1,7 @@
 """The revisit cache (revisit.py): a tile's files kept and written back under another session's names; builds that
 read something missing are not kept."""
 import json
+from contextlib import contextmanager
 import os
 import sys
 import tempfile
@@ -11,9 +12,38 @@ import netfetch  # noqa: E402
 import revisit  # noqa: E402
 
 
+@contextmanager
+def cache_directory():
+    with tempfile.TemporaryDirectory() as directory:
+        try: yield directory
+        finally:
+            # Windows cannot clean a temporary cache with its append-only sidecar open.
+            descriptor=revisit._where.pop(directory,None)
+            if descriptor is not None: os.close(descriptor)
+
+
 class RevisitTest(unittest.TestCase):
+    def test_shapes_in_accepts_native_compact_and_python_spaced_building_json(self):
+        for separators in ((",",":"),(" , "," : "),(",\n",":\t")):
+            text=json.dumps({'shape':'@V@/bldfar_@A@_-2_1.cdae'},separators=separators)
+            self.assertEqual(revisit.shapes_in(text,'@V@'),['bldfar_@A@_-2_1.cdae'])
+
+    def test_legacy_building_cache_with_missing_mesh_is_a_miss_and_is_retained(self):
+        with cache_directory() as directory:
+            for kind in ('bldfar','bldsky'):
+                key=revisit.key(kind,'test')
+                blobs={'tile.json':json.dumps({'shape':'@V@/mesh.cdae'}).encode()}
+                self.assertTrue(revisit.store(directory,kind,key,blobs,{'n':1}))
+                path=revisit._path(directory,kind,key)
+                with open(path,'rb') as file: before=file.read()
+                self.assertIsNone(revisit.load(directory,kind,key))
+                with open(path,'rb') as file: self.assertEqual(before,file.read())
+                blobs['mesh.cdae']=b'synthetic mesh'
+                self.assertTrue(revisit.store(directory,kind,key,blobs,{'n':1}))
+                self.assertEqual(revisit.load(directory,kind,key)[0],blobs)
+
     def test_an_item_comes_back_and_names_swap(self):
-        with tempfile.TemporaryDirectory() as d:
+        with cache_directory() as d:
             text = json.dumps({"road": {"shape": "/temp/s1/road_3_1_-2.cdae"},
                                "bld": {"shape": "/temp/s1/bld_3_1_-2.cdae"}}, separators=(",", ":"))
             self.assertEqual(revisit.shapes_in(text, "/temp/s1"), ["bld_3_1_-2.cdae", "road_3_1_-2.cdae"])
@@ -43,7 +73,7 @@ class RevisitTest(unittest.TestCase):
     def test_a_cells_road_facts_are_shared(self):
         import roads
         from test_roads import features
-        with tempfile.TemporaryDirectory() as d:
+        with cache_directory() as d:
             old = revisit.CACHE_DIR
             revisit.CACHE_DIR = d
             try:
@@ -69,7 +99,7 @@ class RevisitTest(unittest.TestCase):
         """store(where=...) appends one line to this process's sidecar; compact() folds older files into one, the
         last line per item, without the items whose zip is gone; a file written after `before` stays as it is."""
         import time
-        with tempfile.TemporaryDirectory() as d:
+        with cache_directory() as d:
             sig = revisit.sig(sidewalks=True, md={"overture": "2026-09-23.1"})
             ks = [revisit.key("roads", 39.28, -76.56, i) for i in range(3)]
             for i, k in enumerate(ks):

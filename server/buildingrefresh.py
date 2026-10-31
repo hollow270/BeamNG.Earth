@@ -163,6 +163,7 @@ def _plain(value):
 def scan(directory, vfs, limits):
     """Bounded, flat artifact manifest, exact file hashes and path-independent content hashes."""
     files, semantic, meshes, total = {}, [], [], 0
+    references=set()
     paths = list(islice(Path(directory).iterdir(), limits.files+1))
     if len(paths) > limits.files:
         raise ResourceLimit("generation contains too many files")
@@ -188,12 +189,18 @@ def scan(directory, vfs, limits):
                 body = f.read(limits.file_bytes+1)
             if len(body) > limits.file_bytes:
                 raise ResourceLimit("JSON artifact exceeds size budget")
+            import revisit
+            references.update(revisit.shapes_in(body.decode('utf-8'),vfs))
+            if len(references)>limits.files:
+                raise ResourceLimit('generation references too many meshes')
             normal = hashlib.sha256(body.replace((vfs + "/").encode(), b"@V@/")).hexdigest()
         semantic.append((path.name, normal))
         if path.suffix == ".cdae":
             meshes.append((path.name, digest))
     if not files:
         raise IncompleteGeneration("worker produced no artifact files")
+    if references-set(files):
+        raise IncompleteGeneration('generated tile references a missing mesh')
     return files, _hash(semantic), _hash(meshes)
 
 
@@ -378,7 +385,10 @@ class Coordinator:
         if not directory.exists():
             return False
         OverlayStore._no_link(directory)
-        files, content, meshes = scan(directory, "@BUILDING_OVERLAY@/" + entry["generation"], self.limits)
+        try:
+            files, content, meshes = scan(directory, "@BUILDING_OVERLAY@/" + entry["generation"], self.limits)
+        except IncompleteGeneration:
+            return False  # intact listed JSON is insufficient when its referenced mesh was never cached
         return files == entry["files"] and content == entry["content_digest"] and meshes == entry["mesh_digest"]
 
     def _usage(self):

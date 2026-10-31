@@ -402,7 +402,12 @@ Coverage includes all requested scenario groups:
 
 ## Stage 6 handoff — instructions only
 
-Stage 6 has **not** started. Do not install, launch a game, fetch live OSM, commit
+Stage 6A preparation is now documented in [the isolated development test procedure](STAGE6A_MANUAL_TEST.md).
+It provides repository-local artifacts and synthetic backend checks; no game has
+been installed into or launched. The original Stage 5B2 handoff below remains the
+engine-verification checklist. Actual in-game Stage 6 has not passed.
+
+At the Stage 5B2 checkpoint, Stage 6 had **not** started. Do not install, launch a game, fetch live OSM, commit
 or push as part of this stage. After separate authorization:
 
 1. Review this diff and the two established unrelated test failures. Re-run the

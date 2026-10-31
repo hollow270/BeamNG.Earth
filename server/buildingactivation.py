@@ -1,10 +1,12 @@
 """Development-only activation of a checked prepared catalog, through existing shape slots.
 
 This is not retrieval, acceptance, a second mesher or a game-object resource pool.
-Run on the server event-loop thread. Game completion requires an explicit fenced ack;
+Run on one owning thread (the event loop for the legacy API, the bounded authority
+worker for manual controls). Game completion requires an explicit fenced ack;
 slot owners survive disconnect until an exact slot/serial release is observed.
 """
 from copy import deepcopy
+from dataclasses import replace
 import hashlib
 import os
 from itertools import islice
@@ -76,7 +78,7 @@ def _live(conn,req):
     if tracker is None or bool(getattr(tracker,"geo",False))!=req.kind.endswith("_geo"):
         return False
     return any((req.x,req.y) in getattr(tracker,n,()) for n in
-               ("sent","empty","building","car","futs","retry","info","skins","shown"))
+               ("sent","empty","building","car","futs","retry","shown"))
 
 
 def _matches(path,info):
@@ -120,6 +122,7 @@ class Manager:
         self.store = server.mapdata._building_store
         self.sequence, self.transactions, self.bindings, self.holds = 0,{}, {},{}
         self.guards,self.pending_targets=set(),{}
+        self.released_slots={}
         suffix = hashlib.sha256(server.sid.encode()).hexdigest()[:16]
         self.path = self.c.io.root/f"activation-{suffix}.json"
         if self.path.exists():
@@ -144,7 +147,7 @@ class Manager:
 
     def _thread(self):
         if threading.get_ident()!=self.thread:
-            raise Rejected("invoke activation on the server event-loop thread")
+            raise Rejected("invoke activation on its owning authority thread")
 
     def _save(self):
         if sum(1 for _ in islice(self.c.io.root.iterdir(),255))>=254:
@@ -152,7 +155,7 @@ class Manager:
         rows = []
         for t in self.transactions.values():
             rows.append({k:deepcopy(t[k]) for k in ("transaction","seq","state","publication","revision","overlay_enabled","acknowledged","anchor","epoch","state_token","generations")})
-        body = self.c.io._document(dict(session=self.s.sid,transactions=rows,guards=sorted(self.guards),
+        body = self.c.io._document(dict(session=self.s.sid,client=getattr(self,"client_id",None),transactions=rows,guards=sorted(self.guards),
             holds={str(n):dict(serial=h[0],transaction=h[1]) for n,h in self.holds.items()}))
         if len(body)>MAX_MESSAGE:
             raise ResourceLimit("activation ownership journal exceeds budget")
@@ -167,17 +170,41 @@ class Manager:
         if h is None or type(n) is not int or type(serial) is not int or h[0]!=serial:
             return False
         del self.holds[n]
+        t=self.transactions[h[1]]
+        if t["conn"].slot_holds.get(n)==serial: t["conn"].slot_holds.pop(n,None)
+        try:
+            path=Path(self.s.out_dir)/matslots.MatSlots.file(self.s.matslots.name(n))
+            from buildingoverlaystore import OverlayStore
+            OverlayStore._no_link(path)
+            st=path.stat()
+            self.released_slots[n]=(st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns)
+            while len(self.released_slots)>256: self.released_slots.pop(next(iter(self.released_slots)))
+        except OSError:
+            pass
+        # A tile that has actually released a slot is no longer an installed
+        # binding. Retaining it would replay an eventually reused pooled file.
+        self.bindings={k:b for k,b in self.bindings.items() if not any(
+            int(sl[0].rsplit("slot_",1)[-1].split(".")[0])==n and sl[1]==serial for sl in b["slots"].values())}
         self.s.matslots.unheld(n)
         for t in self.transactions.values():
-            if t["state"] in ("failed","superseded","retiring","orphaned") and \
+            if t["state"] in ("failed","superseded","retiring","orphaned","activated") and \
                     not any(b["transaction"]==t["transaction"] for b in self.bindings.values()) and \
                     not any(v[1]==t["transaction"] for v in self.holds.values()):
                 t["state"]="retired"
+                for owner in t["owners"]: self.s.matslots.release(owner)
         if persist:
             self._save()
         return True
 
-    def _validate(self, conn, publication):
+    def compact(self):
+        """Forget only terminal, fully released history. Active bindings remain roots."""
+        referenced={b["transaction"] for b in self.bindings.values()}|{v[1] for v in self.holds.values()}
+        removed=[k for k,t in self.transactions.items() if k not in referenced and t["state"] in ("retired","failed")]
+        for k in removed: del self.transactions[k]
+        if removed: self._save()
+        return len(removed)
+
+    def _validate(self, conn, publication, slots=None):
         if conn not in self.s.connections or getattr(conn,"building_activation",0)!=VERSION:
             raise Rejected("current connection must negotiate buildingActivation=1")
         if getattr(conn,"building_epoch",None) is None or conn.active not in self.s.anchors:
@@ -188,33 +215,53 @@ class Manager:
         snapshot = self.store._load()
         if catalog["snapshot"]!=snapshot.revision:
             raise Rejected("prepare the current accepted revision first")
-        if not 0<len(catalog["entries"])<=MAX_TARGETS:
-            raise ResourceLimit("activation supports 1..32 catalog targets")
+        if not 0<len(catalog["entries"])<=self.c.limits.requests:
+            raise ResourceLimit("activation catalog exceeds preparation limits")
+        if slots is not None and (not isinstance(slots,(set,frozenset,tuple,list)) or
+                not slots or len(slots)>128 or set(slots)-set(catalog["entries"])):
+            raise Rejected("invalid activation target selection")
         anchor = self.s.anchors[conn.active]
         boxes,selected = [],set()
         for slot,row in catalog["entries"].items():
             req = br.TileRequest(**row["request"])
-            if not req.kind.endswith("_geo") or req.kind=="near_geo":
-                if (req.aid,req.lat,req.lon)!=(anchor.id,float(anchor.lat),float(anchor.lon)):
-                    raise Rejected("prepared target belongs to a different anchor/frame")
+            current_frame = req.kind in ("far_geo","skyline_geo") or \
+                (req.aid,req.lat,req.lon)==(anchor.id,float(anchor.lat),float(anchor.lon))
             frame,box = req.geometry()
             import numpy as np
             x0,y0,x1,y1 = box
             la,lo,_ = frame.enu_to_geodetic(np.array([x0,x1,x0,x1]),np.array([y0,y0,y1,y1]),0)
-            if _live(conn,req):
+            chosen = current_frame and _live(conn,req) and (slots is None or slot in slots)
+            if chosen:
                 selected.add(slot)
                 boxes.append((float(lo.min()),float(la.min()),float(lo.max()),float(la.max())))
-            with self.s.mapdata.building_snapshot(snapshot):
-                inputs = req.inputs(self.s.mapdata)
-            if inputs!=(row["identity"],row["dependency"]) or not self.c._valid(row):
+                with self.s.mapdata.building_snapshot(snapshot):
+                    inputs = req.inputs(self.s.mapdata)
+                if inputs!=(row["identity"],row["dependency"]):
+                    raise Rejected("prepared inputs no longer match")
+            if not self.c._valid(row):
                 raise Rejected("prepared inputs or artifact checksums no longer match")
+        if slots is not None and selected!=set(slots):
+            raise Rejected("selected activation targets are no longer current")
+        limit = 128 if getattr(conn,"building_batches",0)==1 else MAX_TARGETS
+        if len(selected)>limit:
+            raise ResourceLimit("current activation requires negotiated bounded batches")
         from buildingoverlaystore import _union
         if not selected:
             raise Rejected("no prepared target corresponds to this connection's current world")
         import buildingbaseline
-        context = buildingbaseline.collect(self.s.mapdata,_union(boxes),snapshot)
-        self.store.compose(snapshot,context.buildings,baseline_parts=context.parts,
-            baseline_release=self.s.mapdata.release,bounds=context.bounds)
+        from buildingoverlaystore import _intersects
+        scopes={tuple(r["info"]["bounds"]) for r in snapshot.refreshes
+                if any(_intersects(r["info"]["bounds"],box) for box in boxes)}
+        if not scopes:
+            scopes={tuple(e.bounds) for e in snapshot.entries if any(_intersects(e.bounds,box) for box in boxes)}
+        if not scopes and snapshot.affected_bounds is not None:
+            scopes={tuple(snapshot.affected_bounds)}
+        # Validate the saved source context, not every untouched baseline building
+        # inside a large skyline tile. Disabling still validates original records.
+        for scope in scopes:
+            context = buildingbaseline.collect(self.s.mapdata,scope,snapshot)
+            self.store.compose(replace(snapshot,enabled=bool(snapshot.entries)),context.buildings,baseline_parts=context.parts,
+                baseline_release=self.s.mapdata.release,bounds=context.bounds)
         import buildingtargets
         discovered = buildingtargets.discover(_OneConnection(self.s,conn),_union(boxes))
         current = {r.slot:r.wire() for r in discovered.requests}
@@ -269,7 +316,7 @@ class Manager:
         t["bytes"]+=size
         return [f"{self.s.vfs_dir}/{destination.name}",serial]
 
-    def activate(self,conn,publication,*,manual=False):
+    def activate(self,conn,publication,*,manual=False,slots=None):
         self._thread()
         if manual is not True:
             raise Rejected("manual=True is required; activation does not fetch or accept data")
@@ -281,12 +328,13 @@ class Manager:
             self.cancel_if_stale(conn)
             if t["state"] not in ("scheduled","deferred","installing"):
                 return self.status(t["transaction"])
-            conn.send(deepcopy(t["message"]))
+            for message in t.get("messages",[t["message"]]):
+                conn.send(deepcopy(message))
             return self.status(t["transaction"])
         if len(self.transactions)>=MAX_TRANSACTIONS:
             raise ResourceLimit("activation transaction history is full; explicit retirement is required")
         with self.c.io._locked(),self.store._locked():
-            catalog,snapshot,state,selected = self._validate(conn,publication)
+            catalog,snapshot,state,selected = self._validate(conn,publication,slots)
             guard=set(self.guards)
             for k in selected:
                 req=br.TileRequest(**catalog["requests"][k])
@@ -350,6 +398,10 @@ class Manager:
                 if len(br._json(m).encode())>MAX_MESSAGE:
                     raise ResourceLimit("activation message exceeds 1 MiB")
                 t["message"] = m
+                t["messages"] = [m] if len(t["targets"])<=MAX_TARGETS else [dict(m,
+                    type="building_activate_batch",part=i//MAX_TARGETS+1,
+                    parts=(len(t["targets"])+MAX_TARGETS-1)//MAX_TARGETS,total=len(t["targets"]),
+                    targets=t["targets"][i:i+MAX_TARGETS]) for i in range(0,len(t["targets"]),MAX_TARGETS)]
                 self.guards.update(t["guard"])  # a lost ack cannot prove nothing was installed
                 from earthd import BUILDING_SESSION_HOLD
                 try:
@@ -379,7 +431,8 @@ class Manager:
                         future.cancel()
                     tracker.building.discard((req.x,req.y))
                     getattr(tracker,"started",{}).pop((req.x,req.y),None)
-        conn.send(deepcopy(m))
+        for message in t["messages"]:
+            conn.send(deepcopy(message))
         return self.status(tx)
 
     def status(self,transaction):
@@ -394,7 +447,8 @@ class Manager:
         for t in self.transactions.values():
             if t["conn"] is conn and t["state"] in ("scheduled","deferred","installing"):
                 _,state = self.store.load_state()
-                if state!=t["state_token"] or conn.active!=t["anchor"] or conn.building_epoch!=t["epoch"]:
+                if state!=t["state_token"] or conn.active!=t["anchor"] or conn.building_epoch!=t["epoch"] or \
+                        any(not _live(conn,br.TileRequest(**r)) for r in t["requests"].values()):
                     conn.send(dict(type="building_cancel",sessionId=self.s.sid,epoch=t["epoch"],anchorId=t["anchor"],
                         seq=t["seq"],transaction=t["transaction"]))
 
@@ -420,7 +474,7 @@ class Manager:
         if msg["status"]=="activated":
             with self.c.io._locked(),self.store._locked():
                 try:
-                    _,_,state,_ = self._validate(conn,t["publication"])
+                    _,_,state,_ = self._validate(conn,t["publication"],set(t["requests"]))
                 except (ValueError,OSError,RuntimeError):
                     state = None
                 t["state"] = "activated" if state==t["state_token"] else "superseded"
@@ -494,7 +548,7 @@ class Manager:
                     name=route[1]+":"+key
                     if name not in self.pending_targets and len(self.pending_targets)>=128:
                         raise ResourceLimit("unprepared activation target budget exceeded")
-                    self.pending_targets[name]=dict(kind=route[1],key=key,status="deferred",reason="prepare and explicitly activate this newly streamed dependent target")
+                    self.pending_targets[name]=dict(kind=route[1],key=key,status="deferred",reason="Waiting for local preparation and revision-safe activation of accepted data")
                     return defer_message(self.s,conn,msg)
             return msg
         # Drop allocations that have never reached the game; the retained activation

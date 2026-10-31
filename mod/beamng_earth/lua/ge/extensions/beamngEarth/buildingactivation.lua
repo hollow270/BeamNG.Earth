@@ -1,8 +1,10 @@
 -- Explicit, bounded prepared-building transaction. Objects, slots, deletion and
 -- collision reloads belong to roads.lua; this module only sequences that adapter.
+if rawget(_G,'beamngEarthBuildingController') then return rawget(_G,'beamngEarthBuildingController') end
 local M = { VERSION = 1 }
 local session, epoch, high = nil, nil, 0
 local pending, last = nil, nil
+local assembly = nil
 local frame = 0
 local kinds = { near=true, near_geo=true, far=true, far_geo=true, skyline=true, skyline_geo=true }
 local whats = { bld=true,bld2=true,bld3=true,bld4=true,bldcol=true,shape=true }
@@ -15,10 +17,10 @@ local function ack(p,status,detail,send)
   send({type='building_ack',sessionId=p.msg.sessionId,epoch=p.msg.epoch,anchorId=p.msg.anchorId,
     seq=p.msg.seq,transaction=p.msg.transaction,status=status,detail=detail})
 end
-local function valid(m)
+local function valid(m,limit)
   if type(m)~='table' or m.type~='building_activate' or m.version~=1 or m.sessionId~=session or m.epoch~=epoch
       or not integer(m.anchorId) or not integer(m.seq) or not hex(m.transaction,32) or not hex(m.publication,32)
-      or (m.revision~=nil and not hex(m.revision,64)) or type(m.osm)~='boolean' or type(m.targets)~='table' or #m.targets<1 or #m.targets>32 then return false end
+      or (m.revision~=nil and not hex(m.revision,64)) or type(m.osm)~='boolean' or type(m.targets)~='table' or #m.targets<1 or #m.targets>(limit or 32) then return false end
   local top={type=true,version=true,sessionId=true,epoch=true,anchorId=true,seq=true,transaction=true,publication=true,revision=true,osm=true,targets=true}
   for k in pairs(m) do if not top[k] then return false end end
   local seen,routes,slots,total = {},{},{},0
@@ -52,14 +54,15 @@ end
 
 function M.hello(s,e)
   if pending then pending.host.abort(pending.plans or {},pending.msg); pending=nil end
-  session,epoch,high,last = s,e,0,nil
+  session,epoch,high,last,assembly = s,e,0,nil,nil
 end
 function M.disconnect()
   if pending then pending.host.abort(pending.plans or {},pending.msg); pending=nil end
   epoch=nil
+  assembly=nil
 end
-function M.receive(m,aid,host,send)
-  if not valid(m) or m.anchorId~=aid then return false end
+local function receive(m,aid,host,send,limit)
+  if not valid(m,limit) or m.anchorId~=aid then return false end
   if m.seq<=high then
     local p = pending or last
     if p and m.seq==p.msg.seq and m.transaction==p.msg.transaction then
@@ -79,8 +82,46 @@ function M.receive(m,aid,host,send)
   ack(pending,'deferred','waiting for complete targets and a safe collision region',send)
   return true
 end
+function M.receive(m,aid,host,send) return receive(m,aid,host,send,32) end
+function M.receiveBatch(m,aid,host,send)
+  if type(m)~='table' or m.type~='building_activate_batch' or not integer(m.part) or not integer(m.parts)
+      or m.parts<2 or m.parts>4 or m.part<1 or m.part>m.parts or not integer(m.total)
+      or m.total<33 or m.total>128 or m.parts~=math.ceil(m.total/32) then return false end
+  local packet={} for k,v in pairs(m) do if k~='part' and k~='parts' and k~='total' then packet[k]=v end end
+  packet.type='building_activate'
+  if not valid(packet,32) or packet.anchorId~=aid then return false end
+  if m.seq<=high then
+    local previous=pending or last
+    if previous and previous.msg.seq==m.seq and previous.msg.transaction==m.transaction then return receive(previous.msg,aid,host,send,128) end
+    return false
+  end
+  if not assembly then assembly={transaction=m.transaction,seq=m.seq,parts=m.parts,total=m.total,rows={}} end
+  local a=assembly
+  if a.transaction~=m.transaction or a.seq~=m.seq or a.parts~=m.parts or a.total~=m.total then return false end
+  if a.rows[m.part] and jsonEncode(a.rows[m.part])~=jsonEncode(packet) then return false end
+  a.rows[m.part]=packet
+  local count=0 for _ in pairs(a.rows) do count=count+1 end
+  if count<a.parts then return true end
+  local whole={} for k,v in pairs(a.rows[1]) do whole[k]=v end
+  whole.targets={}
+  for i=1,a.parts do
+    local row=a.rows[i]
+    for _,k in ipairs({'sessionId','epoch','anchorId','seq','transaction','publication','revision','osm'}) do
+      if row[k]~=whole[k] then assembly=nil; return false end
+    end
+    for _,t in ipairs(row.targets) do whole.targets[#whole.targets+1]=t end
+  end
+  assembly=nil
+  if #whole.targets~=m.total then return false end
+  return receive(whole,aid,host,send,128)
+end
 function M.cancel(m,send)
   local p=pending
+  if not p and assembly and m.sessionId==session and m.epoch==epoch and m.transaction==assembly.transaction and m.seq==assembly.seq then
+    high=math.max(high,m.seq); assembly=nil
+    ack({msg=m},'failed','incomplete batch cancelled before any staging',send)
+    return true
+  end
   if not p or m.sessionId~=session or m.epoch~=epoch or m.seq~=p.msg.seq or m.transaction~=p.msg.transaction
       or m.anchorId~=p.msg.anchorId then return false end
   if p.phase=='retiring' then return false end -- complete observable retirement; never roll back an installed world
@@ -110,6 +151,7 @@ function M.update(gov,aid,a,send,dtSim)
     local ok,err=pcall(p.host.hold,p.msg,plans)
     if not ok then return fail(p,tostring(err),send) end
     p.plans,p.phase=plans,'staging'
+    ack(p,'deferred','staging building objects under the existing governor',send)
   end
   if p.phase=='staging' or p.phase=='ready' then
     local checked,safe,why=pcall(p.host.safe,p.plans)
@@ -149,6 +191,10 @@ function M.update(gov,aid,a,send,dtSim)
     ack(p,'installing','building objects handed off; waiting for old collision retirement',send)
   end
   if p.phase=='retiring' then
+    -- Finish collision retirement even if a vehicle approaches after commit. Do
+    -- not tear out new colliders or recreate old invisible obstacles in its path.
+    local checked,safe=pcall(p.host.safe,p.plans)
+    p.safetyChanged=not checked or not safe
     if not p.host.retired(p.plans) then return end
     if not p.requested then
       p.requested=true
@@ -161,9 +207,18 @@ function M.update(gov,aid,a,send,dtSim)
       if frame<p.retireAfter+2 then return end
     elseif frame<p.at+2 then return end
     if not p.host.exists(p.plans) then return fail(p,'installed building object was removed before acknowledgment',send) end
-    ack(p,'activated','objects present; old objects gone; collision reload observed plus two update frames',send)
+    ack(p,'activated',p.safetyChanged and 'retired old collision; new building retained as a vehicle approached; engine readiness remains observational'
+      or 'objects present; old objects gone; collision reload observed plus two update frames',send)
     last,pending=p,nil
   end
 end
 function M.status() return pending and {phase=pending.phase,status=pending.status,seq=pending.msg.seq} or last and {status=last.status,seq=last.msg.seq} or {} end
+function M.inventoryFence(seq)
+  if not integer(seq) then return false end
+  high=math.max(high,seq)
+  assembly=nil -- never staged; later unseen packets at/below this fence are rejected
+  return true
+end
+function M.references() return pending and {pending.msg.transaction} or {} end
+rawset(_G,'beamngEarthBuildingController',M)
 return M

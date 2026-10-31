@@ -1,5 +1,9 @@
 # Manual OSM building refresh (Stage 5A)
 
+For the current opt-in World Map workflow, permissions, future streamed tiles and
+cleanup, see [Stage 5B2: Live OSM buildings](LIVE_OSM_BUILDINGS.md). This document
+describes the original Stage 5A API boundary; the defaults remain compatible.
+
 Stage 5A provides a server-side fetch, review, accept and prepare workflow. It uses
 the immutable Overture baseline and the Stage 1–4B overlay/mesh architecture.
 Prepared files are never activated in the game. No road source, Lua, protocol,
@@ -8,8 +12,8 @@ Rust, installed-game file or global cache version changes are involved.
 That boundary describes Stage 5A alone. [Stage 5B1](BUILDING_ACTIVATION.md) now
 provides a separate development-only activation call with revision fences,
 building-only handoff and conservative collision/resource retirement. The full
-manual refresh UI and automatic preparation of future streamed targets remain
-Stage 5B2 work.
+manual refresh UI and automatic preparation of future streamed targets are
+described in the Stage 5B2 guide linked above.
 
 ## Configuration and invocation
 

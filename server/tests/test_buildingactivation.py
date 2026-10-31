@@ -341,14 +341,16 @@ class ActivationTest(unittest.TestCase):
         game.packet(self.messages[-1]); game.tick(25)
         self.assertEqual(game.last()['status'],'activated',game.last())
 
-    def test_lua_reload_sweeps_objects_and_retains_slot_release_receipts(self):
+    def test_lua_extension_reload_retains_objects_then_releases_after_safe_retirement(self):
         self.prepared(); self.activate(); packet=self.messages[-1]
         game=LuaGame(); game.packet(packet); game.tick(25)
         path=packet['targets'][0]['slots']['bld'][0]
         self.assertEqual(game.lua.globals().shapeCount(path),1)
         game.lua.globals().reloadRoads()
-        self.assertEqual(game.lua.globals().shapeCount(path),0)
-        game.tick(10)
+        self.assertEqual(game.lua.globals().shapeCount(path),1)
+        game.lua.globals().roads.onDrop(game.table(dict(anchorId=1,key='0_0')))
+        game.lua.execute('vehicles[1]:setPosition(vec3(5000,5000,0))')
+        game.tick(40)
         gone=game.python(game.lua.globals().roads.takeSlotsGone('activation-test'))
         expected=packet['targets'][0]['slots']['bldcol'][1]
         self.assertTrue(any(x[1]==expected for x in gone),gone)

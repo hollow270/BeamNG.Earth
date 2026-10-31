@@ -625,9 +625,10 @@ cell.provenance, cell.credit_line(), cell.digest()
 - **CLI** (development): `python3 server/mapdata.py --cell 39.2834,-76.5934 --dump --png out.png`
   (`--key 14/x/y`, `--around N` for a block of cells, `--layers`, `--offline`, `--cache-dir`).
 
-Offline building overlays: `buildingoverlay.py` provides the conservative merge prototype;
-`buildingoverlaystore.py` adds separate, reversible local persistence. Neither is connected to
-the live map pipeline yet. See [storage interfaces, revision design and tests](../docs/BUILDING_OVERLAYS.md).
+Building overlays: `buildingoverlay.py` provides the conservative merge and
+`buildingoverlaystore.py` adds separate, reversible local persistence. The opt-in
+building renderer preserves baseline-only roads and terrain. See
+[storage interfaces, revision design and tests](../docs/BUILDING_OVERLAYS.md).
 `osmbuildings.py` adds opt-in, manual retrieval from an explicitly configured source;
 see [retrieval configuration, controls and limitations](../docs/OSM_BUILDING_RETRIEVAL.md).
 
@@ -890,11 +891,11 @@ Cross-component (server ↔ mod):
 
 The opt-in offline building overlay renderer, its baseline-only road/terrain boundary,
 configuration and dependency APIs are documented in
-[`BUILDING_RENDER_OVERLAYS.md`](../docs/BUILDING_RENDER_OVERLAYS.md). It uses saved
-overlays only; live tile invalidation and game refresh are not implemented.
+[`BUILDING_RENDER_OVERLAYS.md`](../docs/BUILDING_RENDER_OVERLAYS.md). That rendering
+layer consumes saved overlays only.
 The server-side selective generation catalog and explicit worker snapshots are described in
 [`BUILDING_REGENERATION.md`](../docs/BUILDING_REGENERATION.md). Activation of those
-prepared files and live collision replacement remain Stage 5B work. The opt-in
+prepared files and live collision replacement use the Stage 5B controller below. The opt-in
 server-side fetch, preview, acceptance, automatic target discovery and network-free
 preparation retry API is documented in
 [`MANUAL_OSM_BUILDINGS.md`](../docs/MANUAL_OSM_BUILDINGS.md). Stage 5A prepares
@@ -903,7 +904,10 @@ assets only and does not activate them in the game.
 The separate development-only activation API and its revision, collision and
 resource-ownership rules are documented in
 [`BUILDING_ACTIVATION.md`](../docs/BUILDING_ACTIVATION.md) (Stage 5B1). This adds no
-refresh UI and does not automatically prepare future streamed building targets.
+refresh UI by itself. [Stage 5B2](../docs/LIVE_OSM_BUILDINGS.md) now connects the
+opt-in World Map controls, authorization, bounded activation batches, future streamed
+targets and proof-based cleanup. That guide includes local configuration, exact
+test results, recovery limitations and the separately authorized Stage 6 handoff.
 
 Show this in the mod UI (the server sends the line for the sources in use as `hello.attribution`):
 "Imagery: USGS The National Map (public domain); EOxCloudless https://cloudless.eox.at by EOX IT

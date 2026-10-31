@@ -19,9 +19,17 @@
 -- Storm drains are DecalRoad chunks like the rest (Driver Training's m_metal_grid_drain).
 -- Console: beamngEarth_roads.status(), .setEnabled(bool)
 
+-- Extension reloads share _G. Keep the actual existing renderer/queues, rather
+-- than deleting occupied roads and trying to reconstruct them from a manifest.
+do
+  local live=rawget(_G,'beamngEarthBuildingRoadRuntime')
+  local group=scenetree.MissionGroup and scenetree.findObject('bngEarthRoads')
+  if live and group and group:getID()==live.group then return live.module end
+end
 local stopwatch = require('beamngEarth/stopwatch')
 
 local M = {}
+M.deferredRoads={}
 
 M.MATERIAL_FILES = { '/levels/west_coast_usa/art/road/main.materials.json',
   '/levels/east_coast_usa/art/road/main.materials.json',         -- ECA_road_edge_dirt (the asphalt's edge, roads.EDGE_DECAL)
@@ -136,6 +144,15 @@ end
 function M.sweep()
   local g = scenetree.MissionGroup and scenetree.findObject(M.GROUP)
   if not g then return 0 end
+  local journal=g:getField('buildingHolds',0)
+  if g:getField('buildingManaged',0)=='1' or g:getField('buildingOSM',0)=='1'
+      or (type(journal)=='string' and journal~='' and journal~='{}' and journal~='[]') then
+    -- A full VM reset lost the queues. No reliable reconstruction of road
+    -- ownership exists: preserve the occupied group and fail closed.
+    M.recoveryBlocked=true
+    M.recoveryReason='Full Lua VM reset lost road ownership context; retained roads need a safe world reload'
+    return 0
+  end
   local n = g:getCount()
   if n > 0 then
     g:deleteAllObjects()
@@ -266,7 +283,7 @@ local function msgSlot(msg, what)
   if type(e) ~= 'table' then return nil end
   local n, serial = slotOf(e[1]), tonumber(e[2])
   if not n or not serial then return nil end
-  return { n, serial, session, path = e[1] }
+  return { n, serial, e[1]:match('/beamngEarth/([^/]+)/slot_') or session, path = e[1] }
 end
 
 -- The [slot, serial] pairs gone since the last call, for server session `sess`.
@@ -311,6 +328,13 @@ function M.heldSessions()
   -- Pooled road resources from an old server survive until their last object and collision barrier go.
   for _,h in pairs(activationHolds) do if not h.released then set[h.session]=true end end
   for k in pairs(slotLive) do local s=k:match('^(.*):%d+$'); if s and s~='nil' then set[s]=true end end
+  -- Declared/parked resources may be needed later even without a live object.
+  for _,t in pairs(tiles) do for _,sl in pairs(t.slots or {}) do if sl[3] then set[sl[3]]=true end end end
+  for _,f in pairs(far) do
+    if f.slot and f.slot[3] then set[f.slot[3]]=true end
+    for _,part in pairs(f.parts or {}) do if part.slot and part.slot[3] then set[part.slot[3]]=true end end
+  end
+  for _,r in pairs(M.deferredRoads) do for _,sl in pairs(r.msg.slots or {}) do local sid=sl[1]:match('/beamngEarth/([^/]+)/slot_'); if sid then set[sid]=true end end end
   for s in pairs(set) do out[#out+1]=s end
   table.sort(out); return out
 end
@@ -318,6 +342,21 @@ function M.activationReloaded()
   for _,fence in pairs(releaseFence) do
     if not fence.observed and reloads>fence.reload then fence.observed=updateFrames end
   end
+end
+function M.buildingSlotReferences()
+  local rows,set={},{}
+  local function add(sid,n)
+    local k=tostring(sid)..':'..tostring(n)
+    if sid and type(n)=='number' and not set[k] then set[k]=true; rows[#rows+1]={sid,n} end
+  end
+  for _,h in pairs(activationHolds) do if not h.released then add(h.session,h.n) end end
+  for _,t in pairs(tiles) do for _,sl in pairs(t.slots or {}) do add(sl[3],sl[1]) end end
+  for _,f in pairs(far) do
+    if f.slot then add(f.slot[3],f.slot[1]) end
+    for _,part in pairs(f.parts or {}) do if part.slot then add(part.slot[3],part.slot[1]) end end
+  end
+  for _,r in pairs(M.deferredRoads) do for _,sl in pairs(r.msg.slots or {}) do add(sl[1]:match('/beamngEarth/([^/]+)/slot_'),slotOf(sl[1])) end end
+  return rows
 end
 function M.activationSwept(g)
   local text=g:getField('buildingHolds',0)
@@ -740,6 +779,7 @@ end
 
 -- Server message `roads_tile` for a geotile key: its content (data: the JSON; frame, h, slots, exact).
 function M.onGeoTile(msg, currentAnchor, a)
+  if M.recoveryBlocked then M.releaseBuildingMessage(msg,nil); return false end
   a = a or anchorObj
   if not a then return false end
   anchorObj = a
@@ -1029,11 +1069,39 @@ M._geoMade = geoMade
 -- Server message `roads_tile` {anchorId, key, path, n, data (the file's JSON, optional), slots}. A geotile key
 -- (geotile.lua): onGeoTile (a: the current anchor, geodesy).
 function M.onTile(msg, currentAnchor, a)
+  if M.recoveryBlocked then M.releaseBuildingMessage(msg,nil); return false end
   if not M.enabled then return false end
   switchAnchor(currentAnchor)
   if geotile.isKey(msg.key) then return M.onGeoTile(msg, currentAnchor, a) end
   if msg.anchorId ~= currentAnchor then return false end
   local key = tileKey(msg.anchorId, msg.key)
+  if type(msg.data)=='table' and msg.data.buildingPending then
+    for previous,t in pairs(tiles) do if t.activation and t.ghost and not t.geo then
+      local frame=t.activation.frame
+      local same=frame and a and frame[1]==a.lat and frame[2]==a.lon
+      if same and previous:match(':(.*)$')==msg.key and not tiles[key] then
+        tiles[previous],tiles[key]=nil,t
+        t.anchor,t.ghost,t.activationDropPending=currentAnchor,nil,nil
+        for _,list in ipairs({walkQ,parked,held,createQ}) do for _,q in ipairs(list) do if q.tile==t then q.key=key end end end
+        break
+      elseif not same then
+        local x,y=tostring(msg.key):match('^(%-?%d+)_(%-?%d+)$')
+        local overlaps=not t.cx or not x or (math.abs((tonumber(x)+0.5)*M.TILE_M-t.cx)<M.TILE_M*2 and math.abs((tonumber(y)+0.5)*M.TILE_M-t.cy)<M.TILE_M*2)
+        if overlaps then
+          local count=0 for _ in pairs(M.deferredRoads) do count=count+1 end
+          if not M.deferredRoads[key] and count<64 then M.deferredRoads[key]={msg=msg,anchor=currentAnchor,frame=a}
+          else
+            local kept={slots={}}
+            local queued=M.deferredRoads[key]
+            if queued then for w in pairs(queued.msg.slots or {}) do kept.slots[w]=msgSlot(queued.msg,w) end end
+            M.releaseBuildingMessage(msg,kept)
+          end
+          M.recoveryReason='Retained legacy road frame differs; road replay and building activation wait for safe clearance'
+          return false
+        end
+      end
+    end end
+  end
   if tiles[key] and type(msg.data)=='table' and msg.data.buildingPending then
     M.releaseBuildingMessage(msg,tiles[key]); return false
   end
@@ -1147,6 +1215,7 @@ M.SKY_UNIT = 4
 -- `brfar_tile` (kind 'B'): a far bridge tile's decks (server buildings.far_bridge_tile), shown only while the road
 -- tile of the same square has no deck or road mesh of its own.
 function M.onFarTile(msg, currentAnchor, kind)
+  if M.recoveryBlocked then M.releaseBuildingMessage(msg,nil); return false end
   if kind == true then kind = 'S' end
   local sky = kind == 'S'
   if not M.enabled then return false end
@@ -1501,6 +1570,8 @@ end
 
 -- Server message `roads_drop` {anchorId, key}. (A ghost goes when covered: releaseGhosts.)
 function M.onDrop(msg)
+  local pendingKey=tileKey(msg.anchorId,msg.key)
+  if M.deferredRoads[pendingKey] then M.releaseBuildingMessage(M.deferredRoads[pendingKey].msg,nil); M.deferredRoads[pendingKey]=nil end
   local key = geotile.isKey(msg.key) and geoKey(msg.key) or tileKey(msg.anchorId, msg.key)   -- (a geotile: any anchor's)
   local t = tiles[key]
   if t and t.activation and not M.activationRoadClear(t) then t.activationDropPending=true; return end
@@ -1685,6 +1756,24 @@ local function step(name)
 end
 function M.update(gov, currentAnchor, player, view, a)
   if M.activationSimStep~=false then updateFrames=updateFrames+1 end
+  for key,r in pairs(M.deferredRoads) do
+    if r.anchor~=currentAnchor then M.releaseBuildingMessage(r.msg,nil); M.deferredRoads[key]=nil
+    else
+      local blocked=false
+      local x,y=tostring(r.msg.key):match('^(%-?%d+)_(%-?%d+)$')
+      for _,t in pairs(tiles) do if t.activation and t.ghost and not t.geo then
+        local frame=t.activation.frame
+        if not frame or not a or frame[1]~=a.lat or frame[2]~=a.lon then
+          if not t.cx or not x or (math.abs((tonumber(x)+0.5)*M.TILE_M-t.cx)<M.TILE_M*2 and math.abs((tonumber(y)+0.5)*M.TILE_M-t.cy)<M.TILE_M*2) then blocked=true end
+        end
+      end end
+      if not blocked and gov:try('roadWalk') then
+        M.deferredRoads[key]=nil
+        local started=now(); M.onTile(r.msg,currentAnchor,a); gov:charge('roadWalk',now()-started)
+        break
+      end
+    end
+  end
   for key,t in pairs(tiles) do
     if t.activationDropPending and M.activationRoadClear(t) then dropTile(key) end
   end
@@ -2201,6 +2290,9 @@ M.ORPHAN_MAX_S = 120
 M.ORPHAN_FAR_M = 960
 local orphanSince = nil
 function M.newSession()
+  for _,r in pairs(M.deferredRoads) do M.releaseBuildingMessage(r.msg,nil) end
+  M.deferredRoads={}
+  if M.recoveryBlocked then return end
   local activated=false
   for _,t in pairs(tiles) do if t.activation then activated=true; break end end
   if not M.geo and not M.farGeo and not activated then return M.clear() end
@@ -2349,10 +2441,13 @@ function M.buildingActivationHost()
     end,
     delete=function(id) deleteQ[#deleteQ+1]=id end,
     farLamps=function(key,f,on) if f.geo then farGeoLamps(f,on) else farLamps(key,f,on) end end,
-    enabled=function() return M.enabled end,foci=function() return foci or {} end,
+    enabled=function() return M.enabled and not M.recoveryBlocked end,foci=function() return foci or {} end,
     fociBroken=function() return M.activationFociBroken==true end,
     attribution=function() group():setField('buildingOSM',0,'1') end,
-    flushJournal=function() group(); saveActivationHolds() end,
+    flushJournal=function()
+      local g=group(); saveActivationHolds(); g:setField('buildingManaged',0,'1')
+      rawset(_G,'beamngEarthBuildingRoadRuntime',{module=M,group=g:getID()})
+    end,
     journal=function(sl,collision)
       if not sl then error('missing activation slot') end
       local k=holdKey(sl[1],sl[2],sl[3]); local count=0

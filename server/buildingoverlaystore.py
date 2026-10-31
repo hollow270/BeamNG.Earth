@@ -686,11 +686,13 @@ class OverlayStore:
             self._publish(before, revision, history, before.enabled or enable, affected)
             return Commit(revision, result, True, affected, self._state_token())
 
-    def set_enabled(self, enabled):
+    def set_enabled(self, enabled, *, expected_state=None):
         if type(enabled) is not bool:
             raise ValueError("enabled must be a boolean")
         with self._locked():
             before = self._load()
+            if expected_state is not None and self._state_token()!=expected_state:
+                raise StalePreview("accepted state changed; refresh the current state first")
             if before.enabled != enabled:
                 self._publish(before, before.revision, before.history, enabled,
                               _union([e.bounds for e in before.entries]))
@@ -702,10 +704,12 @@ class OverlayStore:
     def disable(self):
         return self.set_enabled(False)
 
-    def rollback(self, revision=None):
+    def rollback(self, revision=None, *, expected_state=None):
         """Restore an ancestor snapshot (default: one step, including back to no overlay)."""
         with self._locked():
             before = self._load()
+            if expected_state is not None and self._state_token()!=expected_state:
+                raise StalePreview("accepted state changed; refresh the current state first")
             if not before.history:
                 raise ValueError("no revision to roll back")
             if revision is None:

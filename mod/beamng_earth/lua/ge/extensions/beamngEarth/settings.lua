@@ -847,6 +847,17 @@ function M.uiCacheMapResult(id)
   return core and core.takeCacheMap and core.takeCacheMap(tonumber(id)) or nil
 end
 
+-- Manual building refresh: cached public status and a bounded authenticated command bridge.
+function M.uiBuildingsState()
+  local core=ext('beamngEarth_core')
+  return core and core._buildingUI and core._buildingUI.state() or {available=false,state='unavailable',reason='BeamNG.Earth is not loaded'}
+end
+function M.uiBuildingsCommand(op,payload)
+  local core=ext('beamngEarth_core')
+  if not core or not core.buildingCommand then return {error='BeamNG.Earth is not loaded'} end
+  return core.buildingCommand(op,payload)
+end
+
 -- Saved areas (server areas.py): a picked box's estimate (send -> { id }, poll -> nil or the estimate), a new area and
 -- pause / resume / delete (send -> { id }, poll uiAreaResult -> nil or { ok, error }), the list (uiAreas).
 local areaId = 0

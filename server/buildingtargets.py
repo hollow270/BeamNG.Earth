@@ -31,7 +31,7 @@ class Discovery:
                     count=len(self.requests), relevant_slots=list(self.relevant), targets=[r.wire() for r in self.requests])
 
 
-def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections=8, max_cells=512):
+def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections=8, max_cells=512, current_only=False):
     w,s,e,n = _bounds(bounds)
     try:
         area = set(mapcells.cells_for_bbox(s,w,n,e,max_cells=max_cells))
@@ -78,7 +78,11 @@ def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections
                            zoom=anchor.zooms[0],gzoom=gzoom,options=options)
 
     def add(req, retained_target=False):
+        if current_only:
+            from buildingactivation import _live
+            if not any(_live(c,req) for c in connections): return
         affected = bool(area.intersection(blockworker.building_cells(*req.geometry())))
+        if current_only and not affected: return
         if affected:
             relevant.add(semantic(req))
         if retained_target or affected:
@@ -95,7 +99,7 @@ def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections
         add(current(req.kind,req.x,req.y,anchor,req),True)
 
     try:
-        for key in getattr(server,"_far_geo_done",{}):
+        for key in (() if current_only else getattr(server,"_far_geo_done",{})):
             visited += 1
             if visited > max_keys:
                 raise ResourceLimit("server far-geotile inspection budget exceeded")
@@ -117,7 +121,8 @@ def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections
                     raise DiscoveryError("tracker/active anchor changed; retry discovery")
                 kind = geo if getattr(tracker,"geo",False) else legacy
                 unique = set()
-                for name in ("sent","empty","building","car","futs","retry","info","skins","shown"):
+                for name in (("sent","empty","building","car","futs","retry","shown") if current_only else
+                             ("sent","empty","building","car","futs","retry","info","skins","shown")):
                     for key in getattr(tracker,name,()):
                         if key in unique:
                             continue

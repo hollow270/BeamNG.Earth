@@ -50,6 +50,7 @@ export const settingsSchema = [
       { id: "clouds", type: "bool", default: true, name: "Clouds", desc: "A volumetric cloud layer that follows the ground under you." },
       { id: "realGravity", type: "bool", default: true, name: "Real gravity", desc: "Gravity as it really is where you are (it varies a little with latitude, height and the ground below). Off: the usual 9.81 m/s2." },
       { id: "roads", type: "bool", default: true, name: "Roads", desc: "Real roads, bridges and buildings near you from OpenStreetMap and Overture. Off: bare terrain only." },
+      { id: "osmBuildings", type: "info", name: "Manual OSM building refresh", desc: "Open the world map, then OSM buildings. Choose up to 500 × 500 metres, fetch a preview, and explicitly accept it. This updates saved building overlays only; roads and terrain keep the original baseline. Requires a permitted endpoint and local controls configured in the companion app." },
       { id: "highwaySigns", type: "bool", default: true, name: "Highway signs", desc: "Exit and overhead destination signs, merge warnings and Interstate mile markers along US highways, from the signs mapped in OpenStreetMap. Needs Roads." },
       { id: "rebaseDistance", type: "float", min: 2000, max: 16000, step: 100, default: 15000, name: "Rebase distance (m)", desc: "Advanced. How far you drive before the world quietly moves back under you (keeps the physics precise). 15 km keeps precision at about 1 mm." },
     ],
@@ -211,6 +212,7 @@ export function fmt(v, digits) {
 
 export function infoValue(item) {
   const s = status.value
+  if (item.id === "osmBuildings") return s.buildingRefresh?.available ? `Available — ${s.buildingRefresh.state}` : (s.buildingRefresh?.reason || "Use World map → OSM buildings for availability and configuration status")
   if (item.id === "connection") return connectionText.value
   if (item.id === "anchor") return s.anchorId ? `#${s.anchorId}  ${fmt(s.anchorLat, 5)}, ${fmt(s.anchorLon, 5)}` : "none"
   if (item.id === "player") return (typeof s.playerLat === "number") ? `${fmt(s.playerLat, 5)}, ${fmt(s.playerLon, 5)}  (${fmt(s.dist / 1000, 1)} km from origin)` : "-"

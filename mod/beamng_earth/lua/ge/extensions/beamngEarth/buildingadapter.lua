@@ -57,11 +57,15 @@ function M.new(c)
         plans[#plans+1]={row=r,key=key,near=near,old=old,new=old,create={},oldIds={},kept=kept,reuse=true}
       else
         if near and not old and not r.allowEmpty then return nil,'near target is not in the current world' end
-        if old and (old.ghost or old.orphan) then return nil,'orphan/ghost target needs a current world handoff first' end
+        if old and (old.ghost or old.orphan) and not old.geo then
+          local frame=old.activation and old.activation.frame
+          if not frame or frame[1]~=r.frame[1] or frame[2]~=r.frame[2] then return nil,'retained road frame differs; preserve occupied roads until a safe world handoff' end
+        end
         if old and (old.oldPart or old.oldPartSlot) then return nil,'existing exact-variant handoff is unfinished' end
         local p={row=r,key=key,near=near,old=old,new=copy(old),create={},oldIds={},oldSlots={},oldHidden={}}
         local n=p.new
-        n.activation={content=r.content,session=msg.sessionId,seq=msg.seq}
+        n.activation={content=r.content,session=msg.sessionId,seq=msg.seq,frame=r.frame}
+        n.ghost,n.orphan,n.activationDropPending=nil,nil,nil
         if near then
           n.pendingBuildings=nil
           n.anchor,n.objs,n.queued=msg.anchorId,n.objs or {},n.queued or 0
@@ -225,6 +229,7 @@ function M.new(c)
     for _,p in ipairs(plans) do if not p.reuse then
       local n=p.new
       if p.near then
+        if p.old then n.queued=p.old.queued end
         c.replaceQueues(p.old,n,p.key)
         for _,q in ipairs(p.create) do if q.collision then
           n.cq[q.what]={key=p.key,tile=n,what=q.what,geo=n.geo,walk=n.parts[q.what],activation=true}

@@ -5,6 +5,7 @@ durable inside OverlayStore refresh metadata; preparation is a separate durable 
 """
 from collections import OrderedDict
 from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import asdict, replace
 import hashlib
@@ -45,6 +46,11 @@ class Workflow:
         self.ttl, self.max_previews, self.max_bytes = preview_ttl,max_previews,max_preview_bytes
         self.previews, self.lock = OrderedDict(),threading.Lock()
         self.retired = False
+        self.discovery_context = ContextVar("manual_building_discovery",default=None)
+
+    def _discover(self, bounds):
+        world=self.discovery_context.get() or self.server
+        return buildingtargets.discover(world,bounds,current_only=bool(getattr(world,"building_current_targets",False)))
 
     @contextmanager
     def _operation(self, manual):
@@ -169,7 +175,7 @@ class Workflow:
                 incoming_buildings=[asdict(f) for f in source.buildings],incoming_parts=[asdict(f) for f in source.parts],
                 spatial_diagnostics=self._diagnostics(effective_before,source),game_activated=False)
             try:
-                report["generation_preview"] = buildingtargets.discover(self.server,context.bounds).report()
+                report["generation_preview"] = self._discover(context.bounds).report()
             except Exception as e:
                 report["generation_preview"] = dict(status="unavailable",error=self._error(e))
             report["generation_preview"]["advisory"] = True  # rediscovered from current server settings after acceptance
@@ -198,7 +204,7 @@ class Workflow:
             context = self._context(bounds,snapshot)
             self.store.compose(snapshot,context.buildings,baseline_parts=context.parts,
                                baseline_release=self.md.release,bounds=context.bounds)
-            targets = buildingtargets.discover(self.server,context.bounds)
+            targets = self._discover(context.bounds)
             if targets.status!="discovered":
                 return dict(status=targets.status,discovery=targets.report(),prepared=False)
             result = self.server.refresh_building_overlays(targets.requests,expected_state=state,replace_requests=True)
@@ -207,7 +213,7 @@ class Workflow:
         except Exception as e:
             return dict(status="pending",prepared=False,error=self._error(e))
 
-    def accept(self, token, *, manual=False):
+    def accept(self, token, *, manual=False, prepare=True):
         with self._operation(manual):
             if not isinstance(token,str) or len(token)!=64:
                 raise StalePreview("invalid preview token")
@@ -246,7 +252,7 @@ class Workflow:
             finally:
                 self.client.coordinator.lock.release()
             self.previews.pop(token,None)
-            generation = self._prepare(row["info"].bounds,commit.state_token)
+            generation = self._prepare(row["info"].bounds,commit.state_token) if prepare else dict(status="not_attempted",prepared=False)
             return dict(status="accepted",workflow_token=token,accepted_revision=commit.revision,
                         accepted_state=commit.state_token,merge=commit.merge_result.report(),
                         generation=generation,game_activated=False)
@@ -265,10 +271,15 @@ class Workflow:
         snapshot,_ = self.store.load_state()
         return self._accepted(snapshot)
 
-    def retry(self, token=None, *, manual=False):
+    def retry(self, token=None, *, manual=False, prepare=True):
         with self._operation(manual):
             snapshot,state = self.store.load_state()
             operations = self._accepted(snapshot)
+            if not prepare:
+                if token is not None and not any(r["token"]==token for r in operations):
+                    raise StalePreview("workflow is not present in current accepted history")
+                return dict(status="retry",workflow_token=token,preparing_revision=snapshot.revision,
+                            accepted_workflows=operations,game_activated=False)
             if token is None:
                 if len(operations)!=1:
                     raise ValueError("specify an accepted workflow token (use accepted() to list them)")

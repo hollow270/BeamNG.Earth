@@ -255,6 +255,8 @@ class MapData:
         self._building_store = None
         self._building_view = None
         overlay = os.environ.get("BNGE_BUILDING_OVERLAY_DIR") if building_overlays is None else building_overlays
+        if overlay is None and os.environ.get("BNGE_OSM_BUILDINGS")=="on":
+            overlay = os.path.join(cache_dir,"building-overlays")
         if overlay:
             from buildingoverlaystore import OverlayStore
             from buildingrender import BuildingView

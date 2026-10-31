@@ -94,6 +94,8 @@ local terrainpatch = require('beamngEarth/terrainpatch')   -- ground under the i
 local farcars = require('beamngEarth/farcars')             -- far player cars saved, taken out and put back
 local fociBroken = false
 M._buildingActivation = require('beamngEarth/buildingactivation')
+M._buildingUI = require('beamngEarth/buildingui')
+function M.buildingCommand(op,payload) return M._buildingUI.command(op,payload,net.send) end
 function M._buildingSessions()
   local set,out={},{}
   for _,s in ipairs(farfield.heldSessions()) do set[s]=true end
@@ -898,6 +900,8 @@ local function onMessage(msg)
     -- vegFlat: the vegetation tiles may come as one flat array of numbers (trees.lua onTile), no table per tree
     net.send({ type = 'hello', protocol = PROTOCOL, format = FORMAT, modVersion = MOD_VERSION,
       sessions = M._buildingSessions(), slotSession = farfield.session(), slotsHeld = held, vegFlat = true, buildingActivation = 1,
+      buildingBatches = 1, buildingControl = 1, buildingMultiplayer = beammp.inSession(),
+      buildingClient = M._buildingUI.client(),
       geoTiles = require('beamngEarth/geotile').Z,
       -- (geotiles: vegetation in the global tiles' frames: trees.lua)
       roadGeo = roads.ROAD_GEO,        -- (road tiles as geotiles too: roads.lua)
@@ -906,6 +910,7 @@ local function onMessage(msg)
     setStatus('Connected to companion server')
   elseif t == '_disconnected' then
     M._buildingActivation.disconnect()
+    M._buildingUI.disconnect()
     st.pending, st.sessionId, st.terrainPending = nil, nil, nil
     cacheInfo = nil
     st.serverNote, st.serverNoteDetail, st.terrainErrorAt = nil, nil, nil
@@ -917,6 +922,7 @@ local function onMessage(msg)
     setStatus('Disconnected from companion server: ' .. tostring(msg.error))
   elseif t == 'hello' then
     M._buildingActivation.hello(msg.sessionId,msg.buildingEpoch)
+    M._buildingUI.hello(msg)
     st.sessionId = msg.sessionId
     st.refreshLater = nil       -- (a restarted server numbers its anchors from 1 again)
     roads.setSession(msg.sessionId)   -- the road / building tiles' pooled shape files belong to this server
@@ -1070,6 +1076,20 @@ local function onMessage(msg)
     setStatus('Terrain request failed: ' .. tostring(msg.error))
   elseif t == 'building_activate' then
     M._buildingActivation.receive(msg,st.anchorId,roads.buildingActivationHost(),net.send)
+  elseif t == 'building_activate_batch' then
+    M._buildingActivation.receiveBatch(msg,st.anchorId,roads.buildingActivationHost(),net.send)
+  elseif t == 'building_status' then
+    M._buildingUI.message(msg)
+  elseif t == 'building_reconcile' then
+      M._buildingUI.inventory(msg,{sessions=M._buildingSessions,blocked=function() return roads.recoveryBlocked end,
+        fence=M._buildingActivation.inventoryFence,
+        pending=M._buildingActivation.references,slots=function()
+          local rows=roads.buildingSlotReferences()
+          for _,sid in ipairs(M._buildingSessions()) do
+            for _,sl in ipairs(farfield.slotsHeld(sid)) do rows[#rows+1]={sid,sl[1]} end
+          end
+          return rows
+        end},net.send)
   elseif t == 'building_cancel' then
     M._buildingActivation.cancel(msg,net.send)
   elseif t == 'roads_tile' then
@@ -1691,6 +1711,7 @@ local function buildView()
     rebaseDistance = rebase.distance, rebaseMin = rebase.MIN_DISTANCE, rebaseMax = rebase.MAX_DISTANCE,
     status = st.status,
     attribution = attributionText(fs),
+    buildingRefresh = M._buildingUI.state(),
   }
 end
 
@@ -2114,6 +2135,7 @@ local function onUpdate(dtReal, dtSim)
     roads.activationFociBroken=fociBroken
     roads.activationSimStep=dtSim>0
     M._buildingActivation.update(gov,st.anchorId,st.anchor,net.send,dtSim)
+    require('beamngEarth/buildinginventory').update(gov)
     roads.update(gov, st.anchorId, st.player, M.viewAway(), st.anchor)
     gasstations.update(gov)
     t = mark('roads', t)
@@ -2254,7 +2276,7 @@ end
 
 -- BeamMP finished joining a server (its own hook): the combined app layout (beammp.lua); the first pose asks where
 -- the others are (mpsession.lua).
-function M.onBeamMPPostJoin() beammp.onPostJoin(); mpsession.onPostJoin() end
+function M.onBeamMPPostJoin() beammp.onPostJoin(); mpsession.onPostJoin(); M._buildingUI.revoke(net.send) end
 
 -- BeamMP left the server (its own hook): the other players' cars we deactivated back on.
 function M.onBeamMPServerLeave() pcall(beammp.onServerLeave); pcall(mpsession.reset) end

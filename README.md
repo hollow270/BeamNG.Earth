@@ -1,5 +1,9 @@
 # BeamNG.Earth
 
+This fork's opt-in development workflow for manual OSM building refresh is described
+in [Live OSM buildings (Stage 5B2)](docs/LIVE_OSM_BUILDINGS.md), including local
+configuration, tests and remaining Stage 6 engine verification.
+
 A 1:1 scale, streamed Earth for [BeamNG.drive](https://www.beamng.com/): drive anywhere on the
 planet on real elevation data and satellite imagery, with distance-based level of detail and the
 real curvature of the Earth.

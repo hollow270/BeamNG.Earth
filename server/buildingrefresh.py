@@ -435,16 +435,23 @@ class Coordinator:
         if cancel is not None and cancel.is_set():
             raise CancelledError("building refresh cancelled")
 
-    def _build(self, request, snapshot, identity, cancel, directory, vfs):
+    def _build(self, request, snapshot, identity, cancel, directory, vfs, lease):
+        # Both the physical worker and publication own the OS lease. A completed
+        # worker is not proof that its caller has finished scanning/publishing.
+        lease.retain()
         end = time.monotonic() + self.limits.timeout
-        while not self._jobs.acquire(timeout=0.05):
-            self._cancel(cancel)
-            if time.monotonic() >= end:
-                raise TimeoutError("building worker budget is busy")
+        try:
+            while not self._jobs.acquire(timeout=0.05):
+                self._cancel(cancel)
+                if time.monotonic() >= end:
+                    raise TimeoutError("building worker budget is busy")
+        except BaseException:
+            lease.close(); raise
         try:
             future = self.submit(request, snapshot, str(directory), vfs, identity, self.limits)
         except BaseException:
             self._jobs.release()
+            lease.close()
             raise
         abandoned = threading.Event()
         with self._active_lock:
@@ -455,8 +462,11 @@ class Coordinator:
                 self._active.discard(directory)
                 discard = directory in self._discard
                 self._discard.discard(directory)
-            if abandoned.is_set() or discard:
-                self._remove_work(directory)
+            try:
+                if abandoned.is_set() or discard:
+                    self._remove_work(directory)
+            finally:
+                lease.close()
         future.add_done_callback(finished)
         try:
             while True:
@@ -477,7 +487,7 @@ class Coordinator:
             # A running cancelled/timed-out job owns its private directory until it exits.
             raise
 
-    def refresh(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False):
+    def refresh(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=()):
         if not self._requests.acquire(blocking=False):
             raise ResourceLimit("too many simultaneous building refreshes")
         work = []
@@ -498,14 +508,17 @@ class Coordinator:
                 target_registry = {r.slot:r.wire() for r in requests} if replace_requests else registered
                 if not target_registry:
                     raise ValueError("register at least one building tile before requesting regeneration")
-                if len(registered) > self.limits.requests:
+                if len(target_registry) > self.limits.requests:
                     raise ResourceLimit("registered building tile budget exhausted")
                 snapshot, state_token = self.store.load_state()
                 if expected_state is not None and state_token != expected_state:
                     raise StaleGeneration("accepted workflow state changed before preparation")
                 desired, feature_ids = {}, set()
+                if not isinstance(priority,(tuple,list)) or len(priority)>self.limits.requests or len(set(priority))!=len(priority) or any(k not in target_registry for k in priority):
+                    raise ValueError("invalid preparation priority")
+                ranks={k:i for i,k in enumerate(priority)}
                 with self.md.building_snapshot(snapshot):
-                    for key, row in sorted(target_registry.items()):
+                    for key, row in sorted(target_registry.items(),key=lambda kv:(ranks.get(kv[0],len(ranks)),kv[0])):
                         req = TileRequest(**row)
                         identity, dependency = req.inputs(self.md)
                         desired[key] = (req, identity, dependency)
@@ -513,7 +526,9 @@ class Coordinator:
                         feature_ids.update(self.md.building_dependencies(blockworker.building_cells(*req.geometry())).feature_ids)
                 overlay = _index(snapshot, feature_ids)
                 cells = changed_cells(state["overlay"], overlay, self.limits.changed_cells)
-                state.update(sequence=state["sequence"]+1, requests=registered)
+                state.update(sequence=state["sequence"]+1)
+                if not replace_requests:
+                    state["requests"]=registered
                 ticket = state["sequence"]
                 self._usage()
                 self._save(state)
@@ -526,10 +541,12 @@ class Coordinator:
                     continue
                 generation = uuid.uuid4().hex
                 directory = self.io.root / "work" / generation
+                from buildingretention import WorkLease
+                lease=WorkLease(self.io.root,generation,create=True).acquire(create=True)
+                work.append((directory,lease))
                 directory.mkdir()
-                work.append(directory)
                 vfs = "@BUILDING_OVERLAY@/" + generation
-                row = self._build(req, snapshot, identity, cancel, directory, vfs)
+                row = self._build(req, snapshot, identity, cancel, directory, vfs, lease)
                 if row["identity"] != identity or row["dependency"] != dependency or row["snapshot"] != snapshot.revision \
                         or row["baseline_release"] != self.md.release \
                         or row["request"] != req.wire():
@@ -573,12 +590,15 @@ class Coordinator:
                         affected_cells=cells, publication=current["publication"])
         finally:
             try:
-                for directory in work:
-                    with self._active_lock:
-                        active = directory in self._active
-                        if active:
-                            self._discard.add(directory)
-                    if not active:
-                        self._remove_work(directory)
+                for directory,lease in work:
+                    try:
+                        with self._active_lock:
+                            active = directory in self._active
+                            if active:
+                                self._discard.add(directory)
+                        if not active:
+                            self._remove_work(directory)
+                    finally:
+                        lease.close()
             finally:
                 self._requests.release()

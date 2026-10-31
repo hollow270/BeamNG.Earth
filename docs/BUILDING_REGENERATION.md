@@ -1,5 +1,9 @@
 # Selective building generation preparation (Stage 4B)
 
+The current opt-in UI, asynchronous scheduling, bounded activation and cleanup
+are documented in [Stage 5B2: Live OSM buildings](LIVE_OSM_BUILDINGS.md). This
+document retains the original Stage 4B preparation and cache contracts.
+
 Stage 4B prepares complete, revision-safe server outputs using saved overlays. It
 adds a bounded manual server API, selective output reuse, explicit worker snapshots
 and an atomic catalog of prepared generations. The original Overture baseline and

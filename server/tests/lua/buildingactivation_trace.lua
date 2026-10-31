@@ -58,7 +58,10 @@ function tick(n)
     roads.update(gov,1,vehicles[1] and vehicles[1]:getPosition(),nil,anchor)
   end
 end
-function receive(m) return activation.receive(m,1,roads.buildingActivationHost(),send) end
+function receive(m)
+  if m.type=='building_activate_batch' then return activation.receiveBatch(m,1,roads.buildingActivationHost(),send) end
+  return activation.receive(m,1,roads.buildingActivationHost(),send)
+end
 function latest() return acks[#acks] end
 function tile(key) return roads.buildingActivationHost() end
 function nearSeed(key,withBuildings)

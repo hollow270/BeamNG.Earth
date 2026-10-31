@@ -1,5 +1,10 @@
 # Prepared building activation (Stage 5B1)
 
+[Stage 5B2: Live OSM buildings](LIVE_OSM_BUILDINGS.md) extends this mechanism with
+manual map controls, bounded batches, future-tile preparation, recovery and cleanup.
+The limitations below describe the original Stage 5B1 checkpoint; actual engine
+collision readiness remains unverified pending Stage 6.
+
 Stage 5B1 adds a development-only, explicit activation call for a catalog already
 prepared by [Stage 5A](MANUAL_OSM_BUILDINGS.md). It does not fetch OSM, accept a
 preview, install the mod, or add refresh UI. Activation uses the existing CDAE

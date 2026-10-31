@@ -1245,7 +1245,7 @@ class Server:
                                      lambda la, lo: self.ground(anchor.frame, la, lo, self.dem.sample(la, lo, zoom)),
                                      self.out_dir, self.vfs_dir, aid, self.lamp_region(anchor))
 
-    def refresh_building_overlays(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False):
+    def refresh_building_overlays(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=()):
         """Manual Stage 4B preparation; never writes/sends live session resources (Stage 5).
 
         requests: bounded buildingrefresh.TileRequest objects, retained for later local refreshes.
@@ -1265,7 +1265,7 @@ class Server:
                 coordinator = self._building_refresh = buildingrefresh.Coordinator(
                     os.path.join(self.cache_dir, "building-generations"), self.mapdata,
                     self.mapdata._building_store, submit)
-        return coordinator.refresh(requests, cancel=cancel, expected_state=expected_state, replace_requests=replace_requests)
+        return coordinator.refresh(requests, cancel=cancel, expected_state=expected_state, replace_requests=replace_requests,priority=priority)
 
     def configure_osm_buildings(self, config, *, transport=None):
         """Explicit runtime configuration only; endpoint/credentials are never source defaults."""
@@ -1291,7 +1291,7 @@ class Server:
                     old.lock.release()
 
     def activate_building_overlays(self, connection, publication, *, manual=False):
-        """Development API on the event-loop thread; no fetch, accept or automatic activation."""
+        """Owning-thread API; the live controller uses this with its copied World facade."""
         import buildingactivation
         try:
             manager = self.__dict__.get("_building_activation")
@@ -1304,6 +1304,9 @@ class Server:
             return dict(state="rejected",game_activated=False,error=dict(type=type(e).__name__,message=str(e)))
 
     def building_activation_status(self, transaction):
+        live=self.__dict__.get("_building_live")
+        if live is not None:
+            return dict(live.activation_states.get(transaction,dict(state="unknown",game_activated=False)))
         manager = self.__dict__.get("_building_activation")
         return manager.status(transaction) if manager is not None else dict(state="unknown",game_activated=False)
 
@@ -1321,11 +1324,11 @@ class Server:
     def preview_osm_buildings(self, bounds, *, manual=False, enable=False):
         return self._manual_building_workflow().preview(bounds,manual=manual,enable=enable)
 
-    def accept_osm_buildings(self, token, *, manual=False):
-        return self._manual_building_workflow().accept(token,manual=manual)
+    def accept_osm_buildings(self, token, *, manual=False, prepare=True):
+        return self._manual_building_workflow().accept(token,manual=manual,prepare=prepare)
 
-    def retry_osm_buildings(self, token=None, *, manual=False):
-        return self._manual_building_workflow(retry=True).retry(token,manual=manual)
+    def retry_osm_buildings(self, token=None, *, manual=False, prepare=True):
+        return self._manual_building_workflow(retry=True).retry(token,manual=manual,prepare=prepare)
 
     def build_signs_tile(self, aid, tx, ty):
         """signstream.build_tile: the highway signs of road tile (tx, ty) of anchor aid (its roads are with the mod
@@ -3006,7 +3009,8 @@ class Server:
     def slot_held(self, n):
         """Does some game still hold pooled slot n (a far_tile with it not reported gone)?"""
         manager = self.__dict__.get("_building_activation")
-        return bool(manager is not None and manager.held(n)) or any(n in c.slot_holds for c in self.connections)
+        live = self.__dict__.get("_building_live")
+        return bool(manager is not None and manager.held(n)) or bool(live and live.authority and live.authority.held(n)) or any(n in c.slot_holds for c in self.connections)
 
     def slots_let_go(self, slots):
         """Event loop: these slots' holds ended (reported gone, or a connection closed)."""
@@ -3834,8 +3838,13 @@ class Connection:
         self.send(self.s.areas_message({"id": msg.get("id"), "ok": bool(ok)}))
 
     def send(self, msg):
+        live = self.s.__dict__.get("_building_live")
         manager = self.s.__dict__.get("_building_activation")
-        if manager is not None:
+        if live is not None:
+            msg=live.filter_message(self,msg)
+            if msg is None:
+                return
+        elif manager is not None:
             msg = manager.filter_message(self,msg)
             if msg is None:
                 return
@@ -3910,6 +3919,10 @@ class Connection:
 
     async def run(self):
         log.info("client connected %s", self.peer)
+        live=self.s.__dict__.get("_building_live")
+        if live is not None and live.local_control and self.s.connections:
+            self.writer.close()  # explicit write mode: one local game per companion
+            return
         self.s.connections.add(self)
         self.streamer = asyncio.create_task(self.stream())
         try:
@@ -3928,6 +3941,9 @@ class Connection:
             log.warning("client %s: %s", self.peer, e)
         finally:
             self.route_dl_version += 1          # (a running route_download stops: no one to show its bar to)
+            live=self.s.__dict__.get("_building_live")
+            if live is not None:
+                live.context_changed(self,disconnect=True)
             manager = self.s.__dict__.get("_building_activation")
             if manager is not None:
                 manager.context_changed(self)
@@ -4011,13 +4027,17 @@ class Connection:
     def dispatch(self, msg):
         kind = msg["type"]
         if kind == "hello":
+            live=self.s.__dict__.get("_building_live")
+            if live is not None:
+                live.context_changed(self)
             manager = self.s.__dict__.get("_building_activation")
             if manager is not None:
                 manager.context_changed(self)
             self.building_activation = 1 if msg.get("buildingActivation")==1 and type(msg.get("buildingActivation")) is int else 0
             self.building_epoch = __import__("uuid").uuid4().hex if self.building_activation else None
+            self.building_batches = 1 if msg.get("buildingBatches")==1 and type(msg.get("buildingBatches")) is int else 0
             self.building_recovery_error = None
-            if self.building_activation and manager is None and self.s.mapdata is not None and self.s.mapdata._building_store is not None:
+            if live is None and self.building_activation and manager is None and self.s.mapdata is not None and self.s.mapdata._building_store is not None:
                 from pathlib import Path
                 from itertools import islice
                 directory=Path(self.s.cache_dir)/"building-generations"
@@ -4040,6 +4060,10 @@ class Connection:
                  "nearVisual": self.s.near_visual, "attribution": self.s.attribution()}
             if self.building_activation:
                 m.update(buildingActivation=1,buildingEpoch=self.building_epoch)
+            if live is not None:
+                m.update(live.hello(self,msg))
+                if self.__dict__.get("building_control_denied"):
+                    self.send(m); self.writer.close(); return
             if self.s.imagery is not None:      # the world map credits the sources its view shows
                 m["imageryCredits"] = self.s.imagery.credits_by_area()
                 m["otherCredits"] = self.s.attribution_rest()
@@ -4112,6 +4136,8 @@ class Connection:
             self.send(m)
             if self.building_recovery_error:
                 self.status("Building activation recovery deferred: "+self.building_recovery_error)
+            if live is not None:
+                live.publish(self)
             if self.weather.msg is not None:        # a reconnected mod gets the weather again
                 self.send(self.weather.msg)
             if self.gravity.msg is not None:        # ... and its gravity
@@ -4131,10 +4157,30 @@ class Connection:
                 log.info("the game's %d %s on CPUs %s", n, "processes" if sys.platform == "win32" else "threads",
                          ",".join(map(str, sorted(self.s.game_cpus))))
         elif kind == "building_ack":
+            live=self.s.__dict__.get("_building_live")
+            if live is not None:
+                live.queue_ack(self,msg)
+                return
             manager = self.s.__dict__.get("_building_activation")
             if manager is None:
                 raise ValueError("unexpected building activation acknowledgment")
             manager.acknowledge(self,msg)
+        elif kind == "building_control":
+            live=self.s.__dict__.get("_building_live")
+            if live is None:
+                self.send(dict(type="building_status",available=False,state="unavailable",game_activated=False,
+                    reason="Manual OSM buildings are not configured in the companion app."))
+            else:
+                live.command(self,msg)
+        elif kind == "building_inventory":
+            live=self.s.__dict__.get("_building_live")
+            if live is not None:
+                live.inventory(self,msg)
+        elif kind == "building_revoke":
+            live=self.s.__dict__.get("_building_live")
+            if live is not None and self is live.owner:
+                live.context_changed(self)
+                live.revoked=True; live.secret=None; live.publish(self)
         elif kind == "prepare_anchor":
             self.spawn(self.prepare_anchor(msg))
         elif kind == "server_list":             # the BeamNG.Earth servers for the tab in BeamMP's browser
@@ -4570,6 +4616,9 @@ class Connection:
         keep = {k: t for k, t in self.sent.items() if farfield.is_global_key(k)} if old is not None else {}
         self._retire(self.ck(k) for k in self.sent if k not in keep)
         self.active = aid
+        live=self.s.__dict__.get("_building_live")
+        if live is not None:
+            live.context_changed(self)
         manager = self.s.__dict__.get("_building_activation")
         if manager is not None:
             manager.context_changed(self)
@@ -4620,6 +4669,7 @@ class Connection:
         if not isinstance(gone, list):
             return
         let_go = []
+        live_rows = []
         activation_changed = False
         for g in gone:
             if isinstance(g, dict):
@@ -4627,6 +4677,7 @@ class Connection:
             if not isinstance(g, (list, tuple)) or len(g) != 2:
                 continue
             n, serial = g
+            live_rows.append((n,serial))
             manager = self.s.__dict__.get("_building_activation")
             if manager is not None and type(n) is int and type(serial) is int:
                 activation_changed = manager.release(n,serial,persist=False) or activation_changed
@@ -4634,6 +4685,9 @@ class Connection:
                 del self.slot_holds[int(n)]
                 let_go.append(int(n))
         self.s.slots_let_go(let_go)
+        live=self.s.__dict__.get("_building_live")
+        if live is not None:
+            live.queue_releases(self,live_rows)
         if activation_changed:
             manager._save()
 
@@ -5596,6 +5650,8 @@ async def main_async(args):
                     sea=seacarvemod.SeaCarver(mapdata, args.cache_dir) if args.sea == "on" else None,
                     vegetation=(vegetationmod.Vegetation(mapdata, args.cache_dir) if args.trees == "on" else None))
     server.update_check = args.update_check == "on"
+    import buildinglive
+    buildinglive.install_from_environment(server)
     server.geo_tiles = args.geo_tiles == "on"
     server.global_far = args.global_far == "on"
     server.lod_px = args.lod_px
@@ -5718,6 +5774,8 @@ async def main_async(args):
             map_srv.close()
         if server.areas is not None:
             server.areas.close()
+        if server.__dict__.get("_building_live") is not None:
+            await server._building_live.close()
         net.close()                 # today's request counters
         disk.close()                # the cache's last uses
 

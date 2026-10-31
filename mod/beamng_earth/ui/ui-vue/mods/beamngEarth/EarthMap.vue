@@ -188,9 +188,11 @@
                      :config="cacheSelectConfig" @valueChanged="v => (cacheMode = v)" />
         </div>
       </div>
+      <button class="map-btn" :class="{ on: buildingsOpen }" @click="buildingsOpen = !buildingsOpen">OSM buildings</button>
       <button v-if="!embedded" class="map-btn close" @click="close" title="Close (Esc / M)">Close</button>
     </div>
 
+    <EarthBuildingRefresh v-if="buildingsOpen" :bounds="buildingSelection" @pick="pickBuildings" @close="buildingsOpen = false" />
     <!-- the cache view's legend (bumpers: the next view) -->
     <div v-if="cacheOn" class="cache-legend" @mousedown.stop @wheel.stop>
       <div class="cache-legend-title">Cache: {{ mm.CACHE_MODE_NAMES[cacheMode] }}</div>
@@ -406,6 +408,7 @@ import { vBngOnUiNav } from "@/common/directives"
 import * as mm from "./mapmath.js"
 import layerData from "./maplayers.js"
 import { BngSelect } from "@/common/components/base"
+import EarthBuildingRefresh from "./EarthBuildingRefresh.vue"
 
 const props = defineProps({ embedded: { type: Boolean, default: false } })
 const embedded = props.embedded
@@ -1159,6 +1162,12 @@ watch([cacheGrid, view, w, h, cacheOn], () => {
 // crosshair), X downloads, B cancels. The confirm box shows the server's estimate (size, download, time with the hosts'
 // daily limits, the imagery left out). The list (Places panel) shows each area's progress, Pause / Resume, Delete.
 const selecting = ref(false)
+const buildingsOpen = ref(false), buildingSelection = ref(null), selectPurpose = ref("cache")
+function pickBuildings() {
+  if (selecting.value) cancelSelect()
+  toggleSelect()
+  selectPurpose.value = "buildings"
+}
 const boxStart = ref(null), boxEnd = ref(null)      // { lat, lon } corners
 const areaAsk = ref(null)                           // { box: {s, w, n, e}, plan, error, busy }
 const areaName = ref("")
@@ -1169,7 +1178,8 @@ let areaSeq = 0, areaTimer = null, confirmAreaTimer = null
 const areaList = computed(() => toArray(areas.value && areas.value.areas))
 const selectHint = computed(() => (areaAsk.value ? "X: pre-cache this area · B: cancel"
   : padMode.value ? (boxStart.value ? "A: the other corner · B: cancel" : "A: one corner of the area · B: cancel")
-    : "Drag a box over the area to download · Esc: cancel"))
+    : selectPurpose.value === "buildings" ? "Drag a building refresh box (max. 500 m per side) · Esc: cancel"
+      : "Drag a box over the area to download · Esc: cancel"))
 
 function toggleSelect() {
   if (selecting.value) { cancelSelect(); return }
@@ -1177,6 +1187,7 @@ function toggleSelect() {
   if (playersPanel.value) closePlayers()
   if (followingPlayer()) follow.value = false
   selecting.value = true
+  selectPurpose.value = "cache"
   boxStart.value = boxEnd.value = null
   areaAsk.value = null
 }
@@ -1280,6 +1291,11 @@ function askRoute(half) {
 function askArea(again) {
   const b = again || pickedBox.value
   if (!b) return
+  if (!again && selectPurpose.value === "buildings") {
+    buildingSelection.value = { ...b }
+    selecting.value = false
+    return
+  }
   const rect = rectOf(b)
   if (!again && (rect.w < 6 || rect.h < 6)) { boxStart.value = boxEnd.value = null; return }      // a click, not a box
   const seq = ++areaSeq

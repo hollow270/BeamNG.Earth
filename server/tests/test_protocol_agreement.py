@@ -87,6 +87,12 @@ def F(types, *flags):
 
 # message type -> {field: F(types, flags)}; "type" itself is implied.
 MOD_TO_SERVER = {
+    "building_control": {"id": F(int), "sessionId": F(str), "epoch": F(str), "authorization": F(str), "op": F(str),
+                         "bounds": F(list, OPT), "preview_token": F(str, OPT), "confirm": F(bool, OPT), "expected_state": F(str, OPT)},
+    "building_revoke": {"sessionId": F(str), "epoch": F(str)},
+    "building_inventory": {"sessionId": F(str), "epoch": F(str), "challenge": F(str), "client": F(str),
+                           "complete": F(bool), "sessions": F((list,dict)), "reason": F(str),
+                           "slots": F((list,dict)), "pending": F((list,dict)), "sequence": F(int)},
     "building_ack": {"sessionId": F(str), "epoch": F(str), "anchorId": F(int), "seq": F(int),
                      "transaction": F(str), "status": F(str), "detail": F(str)},
     # sessions: the session folders whose files the mod's objects still use (farfield.heldSessions; a
@@ -104,7 +110,8 @@ MOD_TO_SERVER = {
               # ... and the far buildings, skyline and far bridges (roads.lua FAR_GEO: blockworker.far_geo)
               "farGeo": F(int, OPT),
               # ... and the far field from level 3 up as global tiles (farfield.lua GLOBAL_FAR: select_global)
-              "globalFar": F(int, OPT), "buildingActivation": F(int, OPT)},
+              "globalFar": F(int, OPT), "buildingActivation": F(int, OPT), "buildingBatches": F(int, OPT),
+              "buildingControl": F(int, OPT), "buildingMultiplayer": F(bool, OPT), "buildingClient": F(str, OPT)},
     "prepare_anchor": {"requestId": F(int), "lat": F(NUM), "lon": F(NUM), "cx": F(NUM, OPT), "cy": F(NUM, OPT),
                        # 2026-10-22: the player's spot when not the origin (BeamMP: onto another player's anchor)
                        "px": F(NUM, OPT), "py": F(NUM, OPT),
@@ -180,6 +187,16 @@ TERRAIN = {"cx": F(NUM), "cy": F(NUM), "heightmap": F(str), "size": F(int), "squ
            "base": F(str, OPT), "baseSize": F(NUM, OPT),           # --near-visual detail: the block's photo
            "ter": F(str, OPT)}                                     # the block as a .ter (swapped in, no import)
 SERVER_TO_MOD = {
+    "building_reconcile": {"sessionId": F(str), "epoch": F(str), "challenge": F(str), "sequence": F(int)},
+    "building_status": {"state": F(str), "available": F(bool), "game_activated": F(bool), "reason": F(str),
+                        **{k:F(t,OPT,NULL) for k,t in dict(accepted_revision=str,activated_revision=str,activated_enabled=bool,
+                            max_dimension_m=int,collision_engine_verified=bool,configured=bool,fetch_available=bool,
+                            fetch_reason=str,accepted_state=str,enabled=bool,can_rollback=bool,deferred=list,
+                            error=dict,preview=dict,selection=list,workflow_token=str,detail=str,publication=str,
+                            transaction=str,held_slots=int,resources=dict).items()}},
+    "building_activate_batch": {"version": F(int), "sessionId": F(str), "epoch": F(str), "anchorId": F(int), "seq": F(int),
+                          "transaction": F(str), "publication": F(str), "revision": F(str,NULL), "osm": F(bool),
+                          "targets": F(list), "part": F(int), "parts": F(int), "total": F(int)},
     "building_activate": {"version": F(int), "sessionId": F(str), "epoch": F(str), "anchorId": F(int), "seq": F(int),
                           "transaction": F(str), "publication": F(str), "revision": F(str, NULL), "osm": F(bool), "targets": F(list)},
     "building_cancel": {"sessionId": F(str), "epoch": F(str), "anchorId": F(int), "seq": F(int), "transaction": F(str)},
@@ -211,6 +228,8 @@ SERVER_TO_MOD = {
     "map_tiles_ready": {"tiles": F(list)},  # [z, x, y, ok, layer] each: written to <user>/temp/beamngEarth/maptiles
     "hello": {"protocol": F(int), "format": F(int), "serverVersion": F(str), "appVersion": F(str), "sessionId": F(str),
               "farFormat": F(str), "material": F(str), "buildingActivation": F(int, OPT), "buildingEpoch": F(str, OPT),
+              "buildingControl": F(int,OPT), "buildingControlToken": F(str,OPT), "buildingControlReason": F(str,OPT),
+              "buildingClient": F(str,OPT),
               "nearVisual": F(str), "attribution": F(str),          # protocol 4
               "cells": F(int, OPT),             # v1.4 M1: cells per tile edge, FORMAT 4 only
               "blockSize": F(int, OPT),         # v1.4 M4: terrain block size, only when not 1024 (--block 512)
@@ -329,6 +348,7 @@ WEATHER_NESTED = {"cover": {"total", "low", "mid", "high"}, "wind": {"ms", "from
                   "aloft": {"ms", "fromDeg"}}
 # message types the plain session cannot produce (each has its own session test below)
 EXERCISED_ELSEWHERE = {"building_activate", "building_cancel",  # test_buildingactivation
+                       "building_activate_batch", "building_status", "building_reconcile", # test_buildinglive/batches/recovery
                        "far_retex", "roads_tile", "roads_drop",   # roads: needs map data (roads tests)
                        "roads_skin", "roads_exact",                  # road geotiles (test_roadgeo)
                        "terrain_refresh",                            # a provisional first block: --grading (map data)
@@ -403,7 +423,8 @@ def mod_sends():
     net.send)."""
     out = {}
     for names, pattern in ((("core.lua", "places.lua", "mpsession.lua", "serverlist.lua"), r"net(?:'\))?\.send\(\{"),
-                           (("terrainpatch.lua","buildingactivation.lua"), r"\bsend\(\{")):
+                           (("terrainpatch.lua","buildingactivation.lua"), r"\bsend\(\{"),
+                           (("buildingui.lua",), r"(?:\bsend\(|\blocal m=)\{")):
         text = code_only("\n".join((LUA / n).read_text(encoding="utf-8") for n in names), "--")
         for m in re.finditer(pattern, text):
             t = lua_tables(text, m.end() - 1)

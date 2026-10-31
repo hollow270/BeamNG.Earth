@@ -58,4 +58,18 @@ function M.rays()
   dump(out); jsonWriteFile('/stage6a-rays.json',out,true)
   return out
 end
+-- One bounded snapshot. No imports, timers, object changes or governor mutations.
+function M.progress()
+  local core=rawget(_G,'beamngEarth_core')
+  local roads=package.loaded['beamngEarth/roads']
+  local far=package.loaded['beamngEarth/farfield']
+  if not core or not core._governor or not core._buildingActivation or not roads or not far then
+    return {available=false,reason='BeamNG.Earth scheduling modules are not loaded'}
+  end
+  local gov=core._governor()
+  local out={available=true,controller=core._buildingActivation.status(),governor=gov:snapshot(),
+    building_work=core._buildingActivation.hasWork(),roads_work=roads.hasWork(),farfield_work=far.hasWork(),
+    road_walk_estimate=gov.est.roadWalk}
+  dump(out); return out
+end
 return M

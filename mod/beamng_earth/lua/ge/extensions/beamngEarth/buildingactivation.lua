@@ -212,7 +212,18 @@ function M.update(gov,aid,a,send,dtSim)
     last,pending=p,nil
   end
 end
-function M.status() return pending and {phase=pending.phase,status=pending.status,seq=pending.msg.seq} or last and {status=last.status,seq=last.msg.seq} or {} end
+-- Only staging consumes streaming tokens. Waiting/safety and collision fences do
+-- not keep the bucket busy; roads owns any queued deletes/collision reload work.
+function M.hasWork(aid)
+  return pending~=nil and pending.phase=='staging' and (aid==nil or pending.msg.anchorId==aid)
+end
+function M.status()
+  if not pending then return last and {status=last.status,seq=last.msg.seq} or {} end
+  local p=pending
+  return {phase=p.phase,status=p.status,seq=p.msg.seq,target_cursor=p.cursor,object_cursor=p.stage,
+    planned_targets=#p.plans,target_count=#p.msg.targets,
+    target_objects=p.plans[p.cursor] and #p.plans[p.cursor].create or 0}
+end
 function M.inventoryFence(seq)
   if not integer(seq) then return false end
   high=math.max(high,seq)

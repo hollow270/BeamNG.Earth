@@ -2081,7 +2081,8 @@ local function onUpdate(dtReal, dtSim)
   end
   -- the governor's frame opens first: its clock is the wall time since the last onUpdate (hptimer)
   gov:setLoading(st.placeFrames ~= nil or st.clock < st.loadingUntil or st.slowFor > SLOW_S)
-  gov:beginFrame(farfield.hasWork() or roads.hasWork())
+  gov:beginFrame(farfield.hasWork() or roads.hasWork()
+    or (st.active and dtSim > 0 and M._buildingActivation.hasWork(st.anchorId)))
   gov:chargeEngine(engineTickMs())     -- what the engine spent on last frame's new tiles (governor.lua)
   for _, msg in ipairs(net.update(dtReal)) do
     local ok, err = pcall(onMessage, msg)

@@ -402,6 +402,11 @@ Coverage includes all requested scenario groups:
 
 ## Stage 6 handoff — instructions only
 
+The user-operated Stage 6B test also exposed governor starvation during building
+staging. [The Stage 6C fix and isolated continuation procedure](STAGE6C_SCHEDULER_FIX.md)
+document the confirmed mechanism and simulated regression evidence. Actual engine
+activation/collision retesting of that fix remains pending.
+
 The user-operated Stage 6B run found an empty-Lua-table preview rendering failure
 in BeamNG.drive 0.40.1. The focused fix, runtime regression evidence and separate
 kit/continuation procedure are in [STAGE6B_UI_FIX.md](STAGE6B_UI_FIX.md).

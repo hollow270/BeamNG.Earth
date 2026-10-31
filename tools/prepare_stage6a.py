@@ -18,7 +18,7 @@ REPO=Path(__file__).resolve().parents[1]
 REQUIRED_SERVER=('buildingoverlay','buildingoverlaystore','osmbuildings','buildingmanual','buildingbaseline',
                  'buildingtargets','buildingspatial','buildingrender','buildingrefresh','buildingactivation',
                  'buildingretention','buildinglive','earthd','mapdata','buildings','blockworker','netfetch','matslots','protocol')
-REQUIRED_LUA=('core','roads','settings','net','buildingactivation','buildingadapter','buildingui','buildinginventory')
+REQUIRED_LUA=('core','roads','settings','net','governor','buildingactivation','buildingadapter','buildingui','buildinginventory')
 REQUIRED_UI=('index.js','EarthMap.vue','EarthBuildingRefresh.vue','buildingRefresh.js','earthSettingsStore.js','EarthSettingsPage.vue','EarthSettingsBody.vue')
 
 
@@ -37,9 +37,9 @@ def no_links(path):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',default=str(REPO/'.venv/stage6a/kit'))
-    parser.add_argument('--stage',choices=('6A','6B'),default='6A')
+    parser.add_argument('--stage',choices=('6A','6B','6C'),default='6A')
     args=parser.parse_args()
-    stage=args.stage; port=47624 if stage=='6B' else 47623
+    stage=args.stage; port={'6A':47623,'6B':47624,'6C':47625}[stage]
     mod_name='beamng_earth_stage'+stage.lower()+'.zip'
     root=Path(args.output).absolute()
     if '..' in root.parts or not root.resolve().is_relative_to(REPO): parser.error('Output must remain in the repository')
@@ -91,7 +91,7 @@ def main():
             raise RuntimeError('Embedded runtime has an external search path')
     for name in ('serve.py','scenario.py','diagnostics.lua','verify.py'): shutil.copy2(REPO/'tools/stage6a'/name,root/name)
     docs=root/'docs'; docs.mkdir()
-    for name in ('LIVE_OSM_BUILDINGS.md','STAGE6A_MANUAL_TEST.md','STAGE6B_UI_FIX.md'):
+    for name in ('LIVE_OSM_BUILDINGS.md','STAGE6A_MANUAL_TEST.md','STAGE6B_UI_FIX.md','STAGE6C_SCHEDULER_FIX.md'):
         p=REPO/'docs'/name
         if p.is_file(): shutil.copy2(p,docs/name)
     sys.path[:0]=[str(source/package_root/'server'),str(root)]
@@ -109,7 +109,8 @@ def main():
         python=sys.version,numpy=numpy.__version__,pillow=PIL.__version__,optional_dependencies=optional,
         scope='Windows x64 synthetic legacy-frame development test; no frozen app or real engine test',
         development_sources={str(p.relative_to(REPO)):sha(p.read_bytes()) for p in
-            [Path(__file__),REPO/'docs/LIVE_OSM_BUILDINGS.md',REPO/'docs/STAGE6A_MANUAL_TEST.md',REPO/'docs/STAGE6B_UI_FIX.md',
+            [Path(__file__),REPO/'docs/LIVE_OSM_BUILDINGS.md',REPO/'docs/STAGE6A_MANUAL_TEST.md',REPO/'docs/STAGE6B_UI_FIX.md',REPO/'docs/STAGE6C_SCHEDULER_FIX.md',
+             REPO/'server/tests/test_buildingscheduler.py',REPO/'tools/test_building_overlay.ps1',
              REPO/'tools/building_ui_render.mjs',REPO/'tools/test_building_ui.mjs',
              *sorted((REPO/'tools/stage6a').glob('*')),*sorted((REPO/'tools/ui-tests').glob('*'))] if p.is_file()},
         range_limits=dict(roads_send_m=384,far_buildings_send_m=384,skyline_send_m=768),

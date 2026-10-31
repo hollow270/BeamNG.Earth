@@ -70,7 +70,7 @@ Push-Location -LiteralPath $overlayRepo
 try {
     $overlayFailed = @()
     foreach ($overlayPattern in @('test_buildingoverlay*.py', 'test_osmbuildings.py', 'test_buildingrender.py',
-                                  'test_buildingrefresh.py', 'test_buildingmanual.py', 'test_buildingactivation.py',
+                                  'test_buildingrefresh.py', 'test_buildingmanual.py', 'test_buildingactivation.py', 'test_buildingscheduler.py',
                                   'test_buildinglive.py', 'test_buildingbatches.py', 'test_buildingretention.py', 'test_buildingrecovery.py',
                                   'test_geotiles.py', 'test_pools.py',
                                   'test_buildings.py', 'test_blockworker.py', 'test_roads.py', 'test_roadwidth.py',

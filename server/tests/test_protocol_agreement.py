@@ -87,6 +87,8 @@ def F(types, *flags):
 
 # message type -> {field: F(types, flags)}; "type" itself is implied.
 MOD_TO_SERVER = {
+    "building_ack": {"sessionId": F(str), "epoch": F(str), "anchorId": F(int), "seq": F(int),
+                     "transaction": F(str), "status": F(str), "detail": F(str)},
     # sessions: the session folders whose files the mod's objects still use (farfield.heldSessions; a
     # restarted server keeps an earlier run's folder named here, docs/ROADMAP.md "Robustness" 3)
     "hello": {"protocol": F(int), "format": F(int), "modVersion": F(str), "sessions": F((list, dict), OPT),
@@ -102,7 +104,7 @@ MOD_TO_SERVER = {
               # ... and the far buildings, skyline and far bridges (roads.lua FAR_GEO: blockworker.far_geo)
               "farGeo": F(int, OPT),
               # ... and the far field from level 3 up as global tiles (farfield.lua GLOBAL_FAR: select_global)
-              "globalFar": F(int, OPT)},
+              "globalFar": F(int, OPT), "buildingActivation": F(int, OPT)},
     "prepare_anchor": {"requestId": F(int), "lat": F(NUM), "lon": F(NUM), "cx": F(NUM, OPT), "cy": F(NUM, OPT),
                        # 2026-10-22: the player's spot when not the origin (BeamMP: onto another player's anchor)
                        "px": F(NUM, OPT), "py": F(NUM, OPT),
@@ -178,6 +180,9 @@ TERRAIN = {"cx": F(NUM), "cy": F(NUM), "heightmap": F(str), "size": F(int), "squ
            "base": F(str, OPT), "baseSize": F(NUM, OPT),           # --near-visual detail: the block's photo
            "ter": F(str, OPT)}                                     # the block as a .ter (swapped in, no import)
 SERVER_TO_MOD = {
+    "building_activate": {"version": F(int), "sessionId": F(str), "epoch": F(str), "anchorId": F(int), "seq": F(int),
+                          "transaction": F(str), "publication": F(str), "revision": F(str, NULL), "osm": F(bool), "targets": F(list)},
+    "building_cancel": {"sessionId": F(str), "epoch": F(str), "anchorId": F(int), "seq": F(int), "transaction": F(str)},
     "server_list": {"servers": F(list, OPT), "error": F(str, OPT)},   # earthd.server_list (the list service)
     "geocode_result": {"id": F(int), "results": F(list), "error": F(str, OPT)},   # geocode.py (Photon)
     # covermap.py: w x h levels (base64, north row first) for the asked box, clipped to the world; gen changes with
@@ -205,7 +210,7 @@ SERVER_TO_MOD = {
     "place_previews_ready": {"keys": F(list)},
     "map_tiles_ready": {"tiles": F(list)},  # [z, x, y, ok, layer] each: written to <user>/temp/beamngEarth/maptiles
     "hello": {"protocol": F(int), "format": F(int), "serverVersion": F(str), "appVersion": F(str), "sessionId": F(str),
-              "farFormat": F(str), "material": F(str),
+              "farFormat": F(str), "material": F(str), "buildingActivation": F(int, OPT), "buildingEpoch": F(str, OPT),
               "nearVisual": F(str), "attribution": F(str),          # protocol 4
               "cells": F(int, OPT),             # v1.4 M1: cells per tile edge, FORMAT 4 only
               "blockSize": F(int, OPT),         # v1.4 M4: terrain block size, only when not 1024 (--block 512)
@@ -280,11 +285,11 @@ SERVER_TO_MOD = {
                    # a road geotile (key "g17_x_y", hello.roadGeo): its content in the frame [lat, lon] of its centre,
                    # each part {shape, pos, pivot, relief} in data, h its content hash (kept across a server restart),
                    # exact {what: shape}: the parts this anchor shows as their exact variants (slots "x:<what>")
-                   "frame": F(list, OPT), "h": F(str, OPT), "exact": F(dict, OPT)},
+                   "frame": F(list, OPT), "h": F(str, OPT), "exact": F(dict, OPT), "buildingGeneration": F(str, OPT)},
     # a road geotile's draped surfaces for an anchor (road mesh, plazas, sidewalks; their colliders), a JSON file
     "roads_skin": {"anchorId": F(int), "key": F(str), "path": F(str), "data": F(dict, OPT), "slots": F(dict, OPT)},
     # a road geotile's parts shown as their exact variant for an anchor ({what: shape}; false: the base shape again)
-    "roads_exact": {"anchorId": F(int), "key": F(str), "parts": F(dict), "slots": F(dict, OPT)},
+    "roads_exact": {"anchorId": F(int), "key": F(str), "parts": F(dict), "slots": F(dict, OPT), "buildingGeneration": F(str, OPT)},
     "roads_drop": {"anchorId": F(int), "key": F(str)},
     # trees, bushes and rocks of a tile (vegetation.py, --trees on): a JSON file of items
     # (a geotile, key "g17_x_y": frame [lat, lon] of its centre and pivot, m in that frame: the mod places it,
@@ -297,11 +302,11 @@ SERVER_TO_MOD = {
     # places it and keeps it across rebases; the skyline's and far bridges' keys "g15_x_y")
     "bldfar_tile": {"anchorId": F(int), "key": F(str), "path": F(str), "n": F(int), "data": F(dict, OPT),
                     "slots": F(dict, OPT),     # {"shape": [pooled shape path, serial]}
-                    "frame": F(list, OPT), "pivot": F(NUM, OPT)},
+                    "frame": F(list, OPT), "pivot": F(NUM, OPT), "buildingGeneration": F(str, OPT)},
     "bldfar_drop": {"anchorId": F(int), "key": F(str)},
     # the skyline past them (buildings.skyline_tile): the same, one per SKY_UNIT x SKY_UNIT road tiles
     "bldsky_tile": {"anchorId": F(int), "key": F(str), "path": F(str), "n": F(int), "data": F(dict, OPT),
-                    "slots": F(dict, OPT), "frame": F(list, OPT), "pivot": F(NUM, OPT)},
+                    "slots": F(dict, OPT), "frame": F(list, OPT), "pivot": F(NUM, OPT), "buildingGeneration": F(str, OPT)},
     "bldsky_drop": {"anchorId": F(int), "key": F(str)},
     # the bridges past the road tiles (buildings.far_bridge_tile): the same, a road tile's square of decks
     "brfar_tile": {"anchorId": F(int), "key": F(str), "path": F(str), "n": F(int), "data": F(dict, OPT),
@@ -323,7 +328,8 @@ SERVER_TO_MOD = {
 WEATHER_NESTED = {"cover": {"total", "low", "mid", "high"}, "wind": {"ms", "fromDeg", "gustMs"},
                   "aloft": {"ms", "fromDeg"}}
 # message types the plain session cannot produce (each has its own session test below)
-EXERCISED_ELSEWHERE = {"far_retex", "roads_tile", "roads_drop",   # roads: needs map data (roads tests)
+EXERCISED_ELSEWHERE = {"building_activate", "building_cancel",  # test_buildingactivation
+                       "far_retex", "roads_tile", "roads_drop",   # roads: needs map data (roads tests)
                        "roads_skin", "roads_exact",                  # road geotiles (test_roadgeo)
                        "terrain_refresh",                            # a provisional first block: --grading (map data)
                        "update_status",                              # the player's "Update now" (test_selfupdate)
@@ -397,7 +403,7 @@ def mod_sends():
     net.send)."""
     out = {}
     for names, pattern in ((("core.lua", "places.lua", "mpsession.lua", "serverlist.lua"), r"net(?:'\))?\.send\(\{"),
-                           (("terrainpatch.lua",), r"\bsend\(\{")):
+                           (("terrainpatch.lua","buildingactivation.lua"), r"\bsend\(\{")):
         text = code_only("\n".join((LUA / n).read_text(encoding="utf-8") for n in names), "--")
         for m in re.finditer(pattern, text):
             t = lua_tables(text, m.end() - 1)
@@ -468,7 +474,9 @@ class SessionsAgreementTest(test_server.ServerHarness):
         for kind in ("hello", "pose"):
             t = next(lua_tables(core, m.end() - 1) for m in re.finditer(r"net\.send\(\{", core)
                      if f"type = '{kind}'" in lua_tables(core, m.end() - 1))
-            self.assertIn("sessions = farfield.heldSessions()", t, kind)
+            self.assertIn("sessions = M._buildingSessions()", t, kind)
+        self.assertIn("roads.heldSessions()",lua_function(core,"_buildingSessions"))
+        self.assertIn("farfield.heldSessions()",lua_function(core,"_buildingSessions"))
         self.assertIn("'^/temp/beamngEarth/([^/]+)/'", far)
         self.assertEqual(self.server.vfs_dir, f"/temp/beamngEarth/{self.server.sid}")
         self.assertEqual(modsim.folder_of(self.server.vfs_dir + "/far_1_0_0_0.cdae"), self.server.sid)

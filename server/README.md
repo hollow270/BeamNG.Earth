@@ -900,6 +900,11 @@ preparation retry API is documented in
 [`MANUAL_OSM_BUILDINGS.md`](../docs/MANUAL_OSM_BUILDINGS.md). Stage 5A prepares
 assets only and does not activate them in the game.
 
+The separate development-only activation API and its revision, collision and
+resource-ownership rules are documented in
+[`BUILDING_ACTIVATION.md`](../docs/BUILDING_ACTIVATION.md) (Stage 5B1). This adds no
+refresh UI and does not automatically prepare future streamed building targets.
+
 Show this in the mod UI (the server sends the line for the sources in use as `hello.attribution`):
 "Imagery: USGS The National Map (public domain); EOxCloudless https://cloudless.eox.at by EOX IT
 Services GmbH (Contains modified Copernicus Sentinel data 2023), CC BY-NC-SA 4.0; EOxCloudless

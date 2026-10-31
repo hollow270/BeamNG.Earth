@@ -36,7 +36,7 @@ import roads  # noqa: E402
 
 LAT, LON = 39.2834, -76.5934
 CACHE = os.path.expanduser("~/.cache/beamng-earth")
-HAVE_DATA = os.path.isdir(os.path.join(CACHE, "mapdata")) and os.environ.get("BNGE_ROADGEO_REAL", "1") != "0"
+HAVE_DATA = os.environ.get("BNGE_ROADGEO_REAL", "1") != "0" and os.path.isdir(os.path.join(CACHE, "mapdata"))
 
 
 def east(lat, lon, km):

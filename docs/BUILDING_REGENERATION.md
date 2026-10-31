@@ -250,6 +250,11 @@ their visual generation, but no live collision swap is attempted in Stage 4B.
 
 ## Changed files
 
+The later [Stage 5B1 implementation](BUILDING_ACTIVATION.md) activates explicitly
+selected prepared catalogs through existing slots and governed building-only
+handoffs. It documents the observable collision criterion, safe future-LOD
+deferral, recovery limits and remaining Stage 5B2 work.
+
 | File | Change |
 | --- | --- |
 | [buildingrefresh.py](../server/buildingrefresh.py) | Requests, deterministic inputs, worker receipt, bounded orchestration and atomic prepared catalog. |

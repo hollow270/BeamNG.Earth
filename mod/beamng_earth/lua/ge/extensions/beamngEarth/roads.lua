@@ -140,7 +140,9 @@ function M.sweep()
   if n > 0 then
     g:deleteAllObjects()
     be:reloadCollision()
+    if M.collisionRebuilt then M.collisionRebuilt() end
   end
+  if g:getCount()==0 and M.activationSwept then M.activationSwept(g) end
   return n
 end
 
@@ -193,6 +195,30 @@ local objSlot = {}         -- object id -> slot number of the pooled file it loa
 local slotLive = {}        -- slot number -> objects alive with it
 local slotDropped = {}     -- slot number -> { serial, session } of a dropped tile's slot, reported at its last delete
 local slotsGone = {}       -- { n, serial, session } to report
+local activationHolds, releaseFence, updateFrames = {}, {}, 0
+local function slotKey(n,s) return tostring(s)..':'..tostring(n) end
+local function holdKey(n,serial,s) return slotKey(n,s)..':'..tostring(serial) end
+local function saveActivationHolds()
+  local g=scenetree.findObject(M.GROUP)
+  if g then
+    local encoded=jsonEncode(activationHolds)
+    if #encoded>131072 then error('activation scene ownership journal exceeds budget') end
+    local previous=g:getField('buildingHolds',0)
+    g:setField('buildingHolds',0,encoded)
+    if g:getField('buildingHolds',0)~=encoded then
+      g:setField('buildingHolds',0,previous)
+      error('engine cannot retain the activation ownership journal')
+    end
+  end
+end
+local function activationGone(n,serial,s)
+  local k=holdKey(n,serial,s)
+  local h=activationHolds[k]
+  if h and h.collision and h.everUsed then
+    releaseFence[k]={reload=reloads}
+    collisionDirty=true
+  end
+end
 local function slotOf(path) return tonumber(type(path) == 'string' and path:match('/slot_(%d+)%.cdae$') or nil) end
 
 function M.setSession(s) session = s end
@@ -201,8 +227,13 @@ function M.setSession(s) session = s end
 local function slotMade(id, path)
   local n = slotOf(path)
   if not n then return end
-  objSlot[id] = n
-  slotLive[n] = (slotLive[n] or 0) + 1
+  local sid=path:match('/beamngEarth/([^/]+)/slot_') or session
+  local k=slotKey(n,sid)
+  objSlot[id] = k
+  slotLive[k] = (slotLive[k] or 0) + 1
+  local changed=false
+  for _,h in pairs(activationHolds) do if h.n==n and h.session==sid and not h.everUsed then h.everUsed=true; changed=true end end
+  if changed then saveActivationHolds() end
 end
 local function slotObjGone(id)
   local n = objSlot[id]
@@ -212,14 +243,22 @@ local function slotObjGone(id)
   if slotLive[n] <= 0 then
     slotLive[n] = nil
     local d = slotDropped[n]
-    if d then slotDropped[n] = nil; slotsGone[#slotsGone + 1] = { n, d[1], d[2] } end
+    if d then
+      slotDropped[n] = nil
+      activationGone(d[3],d[1],d[2])
+      slotsGone[#slotsGone + 1] = { d[3], d[1], d[2] }
+    end
   end
 end
 -- A tile's slot { n, serial, session } is let go: at once if no object has it, else at its last delete.
 local function slotDrop(sl)
   if not sl then return end
-  if (slotLive[sl[1]] or 0) > 0 then slotDropped[sl[1]] = { sl[2], sl[3] }
-  else slotsGone[#slotsGone + 1] = { sl[1], sl[2], sl[3] } end
+  local k=slotKey(sl[1],sl[3])
+  if (slotLive[k] or 0) > 0 then slotDropped[k] = { sl[2], sl[3], sl[1] }
+  else
+    activationGone(sl[1],sl[2],sl[3])
+    slotsGone[#slotsGone + 1] = { sl[1], sl[2], sl[3] }
+  end
 end
 -- The slots of msg.slots[what] as { n, serial, session } (nil: not pooled).
 local function msgSlot(msg, what)
@@ -233,9 +272,19 @@ end
 -- The [slot, serial] pairs gone since the last call, for server session `sess`.
 function M.takeSlotsGone(sess)
   if #slotsGone == 0 then return {} end
-  local out = {}
-  for _, g in ipairs(slotsGone) do if g[3] ~= nil and g[3] == sess then out[#out + 1] = { g[1], g[2] } end end
-  slotsGone = {}
+  local out,keep,changed = {},{},false
+  for _, g in ipairs(slotsGone) do
+    local k=holdKey(g[1],g[2],g[3]); local fence=releaseFence[k]
+    local ready=not fence or (fence.observed and updateFrames>=fence.observed+2)
+    if ready and g[3]==sess then
+      out[#out+1]={g[1],g[2]}; activationHolds[k],releaseFence[k],changed=nil,nil,true
+    elseif activationHolds[k] then
+      if ready and not activationHolds[k].released then activationHolds[k].released=true; changed=true end
+      keep[#keep+1]=g
+    end
+  end
+  slotsGone = keep
+  if changed then saveActivationHolds() end
   return out
 end
 
@@ -252,8 +301,43 @@ function M.slotsHeld(sess)
       if p.slot and p.slot[3] == sess then out[#out + 1] = { p.slot[1], p.slot[2] } end
     end
   end
-  for n, d in pairs(slotDropped) do if d[2] == sess then out[#out + 1] = { n, d[1] } end end
+  for _, d in pairs(slotDropped) do if d[2] == sess then out[#out + 1] = { d[3], d[1] } end end
+  for _,h in pairs(activationHolds) do if h.session==sess and not h.released then out[#out+1]={h.n,h.serial} end end
   return out
+end
+
+function M.heldSessions()
+  local out,set={},{}
+  -- Pooled road resources from an old server survive until their last object and collision barrier go.
+  for _,h in pairs(activationHolds) do if not h.released then set[h.session]=true end end
+  for k in pairs(slotLive) do local s=k:match('^(.*):%d+$'); if s and s~='nil' then set[s]=true end end
+  for s in pairs(set) do out[#out+1]=s end
+  table.sort(out); return out
+end
+function M.activationReloaded()
+  for _,fence in pairs(releaseFence) do
+    if not fence.observed and reloads>fence.reload then fence.observed=updateFrames end
+  end
+end
+function M.activationSwept(g)
+  local text=g:getField('buildingHolds',0)
+  if type(text)~='string' or #text==0 or #text>131072 then return end
+  local ok,data=pcall(jsonDecode,text)
+  if not ok or type(data)~='table' then return end
+  for k,h in pairs(data) do if type(h)=='table' and type(h.n)=='number' and type(h.serial)=='number' and type(h.session)=='string' then
+    activationHolds[k]=h
+    activationGone(h.n,h.serial,h.session)
+    slotsGone[#slotsGone+1]={h.n,h.serial,h.session}
+  end end
+  saveActivationHolds()
+end
+
+-- A replay of retained content must not release the slot/serial it still uses.
+function M.releaseBuildingMessage(msg,old)
+  for w,e in pairs(type(msg.slots)=='table' and msg.slots or {}) do
+    local sl=old and ((old.slots or {})[w] or (w=='shape' and old.slot) or ((old.parts or {})[w] or {}).slot)
+    if not sl or sl.path~=e[1] or sl[2]~=e[2] then slotDrop(msgSlot(msg,w)) end
+  end
 end
 
 local function now() return os.clock() * 1000 end
@@ -448,8 +532,9 @@ local function isCollider(o)
 end
 
 -- collide: true ('Visible Mesh Final'), a collision type name, or false / nil (render only)
-local function createWalk(walk, collide)
+local function createWalk(walk, collide, allocated)
   local o = createObject('TSStatic')
+  if allocated then allocated(o) end
   o:setField('shapeName', 0, walk.shape)
   -- 'Visible Mesh Final' (the engine's own suggestion: 'Performance: Mesh is using visible collision ... switch the
   -- mesh to Visible Mesh Final'); the same collision (in-game rays, 2026-10-17)
@@ -667,11 +752,13 @@ function M.onGeoTile(msg, currentAnchor, a)
   local key = geoKey(msg.key)
   local old = tiles[key]
   local h = msg.h or data.h
+  if old and data.buildingPending then M.releaseBuildingMessage(msg,old); return false end
+  if old and old.activation and msg.buildingGeneration~=old.activation.content and h~=old.h then
+    M.releaseBuildingMessage(msg,old); return false
+  end
   if old and old.geo and h and old.h == h then
     -- the same content again (a server restart): its objects stay; the new message's slots are not used
-    if type(msg.slots) == 'table' then
-      for w in pairs(msg.slots) do slotDrop(msgSlot(msg, w)) end
-    end
+    M.releaseBuildingMessage(msg,old)
     old.anchor, old.orphan = currentAnchor, nil
     M.geoStats.kept = M.geoStats.kept + 1
     return true
@@ -706,6 +793,7 @@ function M.onGeoTile(msg, currentAnchor, a)
   end
   t.rowPivot = np > 0 and pivots / np or 0
   t.data = data
+  t.pendingBuildings=data.buildingPending==true
   M.placeGeoTile(t, a)
   tiles[key] = t
   sinceChange = stopwatch.new()
@@ -798,7 +886,9 @@ function M.onExact(msg, currentAnchor)
     return false
   end
   for what, path in pairs(msg.parts) do
-    if t.parts[what] then
+    if t.activation and what:sub(1,3)=='bld' and msg.buildingGeneration~=t.activation.content then
+      slotDrop(msgSlot(msg,what))
+    elseif t.parts[what] then
       local sl = msgSlot(msg, what)
       if t.slots['x:' .. what] then t.oldPartSlot = t.oldPartSlot or {}; t.oldPartSlot[what] = t.slots['x:' .. what] end
       t.slots['x:' .. what] = sl
@@ -944,6 +1034,12 @@ function M.onTile(msg, currentAnchor, a)
   if geotile.isKey(msg.key) then return M.onGeoTile(msg, currentAnchor, a) end
   if msg.anchorId ~= currentAnchor then return false end
   local key = tileKey(msg.anchorId, msg.key)
+  if tiles[key] and type(msg.data)=='table' and msg.data.buildingPending then
+    M.releaseBuildingMessage(msg,tiles[key]); return false
+  end
+  if tiles[key] and tiles[key].activation then
+    M.releaseBuildingMessage(msg,tiles[key]); return false
+  end
   if tiles[key] then dropTile(key) end
   -- the file's JSON in the message (server staging.inline_json: Windows' first read of a file the server just wrote took
   -- up to 0.5 s in the frame), else the file
@@ -1061,8 +1157,11 @@ function M.onFarTile(msg, currentAnchor, kind)
   if type(data) ~= 'table' then ok, data = pcall(jsonDecode, readFile(msg.path) or '') end
   if not ok or type(data) ~= 'table' then lastError = 'unreadable far building tile ' .. tostring(msg.path); return false end
   local key = tileKey(msg.anchorId, (kind or '') .. msg.key)
-  if not kind then farSeen[key] = true end
+  if not kind then farSeen[key] = not data.buildingPending or nil end
   local old = far[key]
+  if old and old.activation then
+    M.releaseBuildingMessage(msg,old); return msg.buildingGeneration==old.activation.content
+  end
   if old then farLamps(key, old, false) end
   if old and old.id then deleteQ[#deleteQ + 1] = old.id end
   if old then slotDrop(old.slot) end
@@ -1214,18 +1313,21 @@ function M.onFarGeo(msg, currentAnchor, kind)
     return false
   end
   local key = farGeoKey(k, msg.key)
-  if k == 'F' then farSeen[key] = true end
+  if k == 'F' then farSeen[key] = not data.buildingPending or nil end
   local old = far[key]
   local h = data.h
+  if old and old.activation and msg.buildingGeneration~=old.activation.content and h~=old.h then
+    M.releaseBuildingMessage(msg,old); return false
+  end
   if old and old.geo and h ~= nil and old.h == h then
-    release()
+    M.releaseBuildingMessage(msg,old)
     old.orphan, old.anchor = nil, currentAnchor
     M.geoStats.farKept = (M.geoStats.farKept or 0) + 1
     return true
   end
   if old then
     if old.geo then M.dropFarGeo(key) else far[key] = nil end
-    if k == 'F' then farSeen[key] = true end
+    if k == 'F' then farSeen[key] = not data.buildingPending or nil end
   end
   local frame = geotile.frameOf({ frame = msg.frame or data.frame, key = msg.key })
   if not frame then release(); lastError = 'far geotile without a frame: ' .. tostring(msg.key); return false end
@@ -1267,7 +1369,7 @@ end
 local BLD_WHATS = { 'bld', 'bld2', 'bld3', 'bld4' }
 function M.nearShowsBuildings(gkey, tk)
   local t = tiles[tk or geoKey(gkey)]
-  if not t or not t.geo then return false end
+  if not t or not t.geo or t.pendingBuildings then return false end
   for _, what in ipairs(BLD_WHATS) do
     if t.parts[what] and not t[what] then return false end
   end
@@ -1401,6 +1503,7 @@ end
 function M.onDrop(msg)
   local key = geotile.isKey(msg.key) and geoKey(msg.key) or tileKey(msg.anchorId, msg.key)   -- (a geotile: any anchor's)
   local t = tiles[key]
+  if t and t.activation and not M.activationRoadClear(t) then t.activationDropPending=true; return end
   if t and t.ghost then return end
   dropTile(key)
   sinceChange = stopwatch.new()
@@ -1547,7 +1650,7 @@ local function releaseGhosts(player)
       -- ghost looked kilometres away and all went: 46 road tiles -> 0 at each rebase, 2026-10-17)
       local far = p and t.cx and ghostSince() > M.GHOST_FAR_WAIT_S * 1000
         and M.boxGap(p.x, p.y, t.cx, t.cy, M.TILE_M / 2) > M.GHOST_FAR_M
-      if all or far or (t.cx and (t.signOnly and covered0(signsDone, t.cx, t.cy) or (not t.signOnly and covered(done, t.cx, t.cy, busyKeys)))) then
+      if (not t.activation or M.activationRoadClear(t)) and (all or far or (t.cx and (t.signOnly and covered0(signsDone, t.cx, t.cy) or (not t.signOnly and covered(done, t.cx, t.cy, busyKeys))))) then
         dropTile(key)
         if not t.signOnly then collisionDirty = true end
       else left = true end
@@ -1581,6 +1684,10 @@ local function step(name)
   stepT0 = t
 end
 function M.update(gov, currentAnchor, player, view, a)
+  if M.activationSimStep~=false then updateFrames=updateFrames+1 end
+  for key,t in pairs(tiles) do
+    if t.activationDropPending and M.activationRoadClear(t) then dropTile(key) end
+  end
   stepT0 = stepClock()
   viewAt = view
   if a then anchorObj = a end
@@ -1701,6 +1808,7 @@ function M.update(gov, currentAnchor, player, view, a)
     noteNewColliders()
     be:reloadCollision()
     lastReloadAt, reloads = now(), reloads + 1
+    M.activationReloaded()
     collisionDirty, deletesDirty, sinceReload = false, false, stopwatch.new()
     local ms = now() - t0
     -- out of the frame's budget, not into the meshes' cost estimate (from PR #41: a ~40 ms rebuild in the roadWalk
@@ -1931,6 +2039,7 @@ function M.collisionRebuilt()
   -- that rebuild already made them solid: one held now leaves the physics at the next one
   local removed = noteNewColliders()
   lastReloadAt, reloads = now(), reloads + 1
+  M.activationReloaded()
   collisionDirty, deletesDirty, sinceReload = removed > 0, false, stopwatch.new()
 end
 
@@ -1983,7 +2092,7 @@ function M.clear()
   end
   deleteQ = {}
   walkQ, parked = {}, {}
-  if collisionDirty then be:reloadCollision(); collisionDirty = false end
+  if collisionDirty then be:reloadCollision(); M.collisionRebuilt(); collisionDirty = false end
 end
 
 -- The level ended: its objects are gone with it.
@@ -1996,7 +2105,7 @@ function M.reset()
       if p.slot then slotsGone[#slotsGone + 1] = { p.slot[1], p.slot[2], p.slot[3] } end
     end
   end
-  for n, d in pairs(slotDropped) do slotsGone[#slotsGone + 1] = { n, d[1], d[2] } end
+  for _, d in pairs(slotDropped) do slotsGone[#slotsGone + 1] = { d[3], d[1], d[2] } end
   objSlot, slotLive, slotDropped = {}, {}, {}
   tiles, createQ, deleteQ, walkQ, anchorId, loadedMaterials = {}, {}, {}, {}, nil, false
   far, farQ = {}, {}
@@ -2092,10 +2201,16 @@ M.ORPHAN_MAX_S = 120
 M.ORPHAN_FAR_M = 960
 local orphanSince = nil
 function M.newSession()
-  if not M.geo and not M.farGeo then return M.clear() end      -- (anchor tiles only: all of them go)
+  local activated=false
+  for _,t in pairs(tiles) do if t.activation then activated=true; break end end
+  if not M.geo and not M.farGeo and not activated then return M.clear() end
   local any = false
   for key, t in pairs(tiles) do
-    if t.geo and M.geo then
+    if t.activation and not t.geo then
+      t.ghost,t.activationDropPending=true,true
+      ghostSince=stopwatch.new()
+      any=true
+    elseif t.geo and M.geo then
       t.orphan = true
       if t.skin then t.skin.anchor = -1 end
       any = true
@@ -2147,7 +2262,7 @@ local function releaseOrphans(player)
   for key, t in pairs(tiles) do
     if t.orphan then
       local far_ = player and t.cx and M.boxGap(player.x, player.y, t.cx, t.cy, M.TILE_M / 2) > M.ORPHAN_FAR_M
-      if all or far_ then dropTile(key); collisionDirty = true else left = true end
+      if (not t.activation or M.activationRoadClear(t)) and (all or far_) then dropTile(key); collisionDirty = true else left = true end
     end
   end
   if not left then orphanSince = nil end
@@ -2190,6 +2305,80 @@ function M.status()
     urgentWalks = M.urgentWalks or 0, quietS = sinceChange() / 1000, error = lastError, units = unitStats, unitLog = unitLog,
     geo = M.geo or false, geoStats = M.geoStats, farGeo = M.farGeo or false, farGeoTiles = ngf,
     farGeoShown = ngShown }
+end
+
+local activationHost
+function M.buildingAttribution()
+  local g=scenetree.findObject(M.GROUP)
+  return g and g:getField('buildingOSM',0)=='1'
+    and 'Buildings: © OpenStreetMap contributors (ODbL-1.0), https://www.openstreetmap.org/copyright' or nil
+end
+function M.activationRoadClear(t)
+  -- A whole old road bundle requires a much larger clearance than a building-only
+  -- handoff. Never let an orphan timeout remove that surface under any vehicle.
+  local function finite(v) return type(v)=='number' and v==v and math.abs(v)<math.huge end
+  if not finite(t.cx) or not finite(t.cy) or M.activationFociBroken or not be or not be.getObjectCount or not be.getObject then return false end
+  if be:getObjectCount()>1024 then return false end
+  for i=0,be:getObjectCount()-1 do
+    local v=be:getObject(i)
+    if not v or not v.getPosition or not v.getVelocity then return false end
+    local p,vel=v:getPosition(),v:getVelocity()
+    if not p or not vel or not finite(p.x) or not finite(p.y) or not finite(vel.x) or not finite(vel.y) then return false end
+    local r=4000+20*math.sqrt(vel.x^2+vel.y^2)
+    if (p.x-t.cx)^2+(p.y-t.cy)^2<=r*r then return false end
+  end
+  for _,f in ipairs(foci or {}) do
+    if not finite(f.x) or not finite(f.y) or not finite(f.r) then return false end
+    if (f.x-t.cx)^2+(f.y-t.cy)^2<=(4000+f.r)^2 then return false end
+  end
+  return true
+end
+function M.buildingActivationHost()
+  if activationHost then return activationHost end
+  activationHost=require('beamngEarth/buildingadapter').new({
+    tiles=function() return tiles end,far=function() return far end,farSeen=function() return farSeen end,
+    now=now,reloads=M.reloads,requestCollision=M.requestCollision,tileM=M.TILE_M,
+    resident=function(t) return M.collideNear(t,M.UNCOLLIDE_M) end,
+    frameOf=function(r) return geotile.frameOf({frame=r.frame,key=r.key}) end,parse=geotile.parse,
+    farGeoKey=farGeoKey,placeGeo=M.placeGeoTile,geoWalk=M.geoWalk,farPlace=farPartPlace,
+    create=createWalk,materials=loadMaterials,slotMade=slotMade,slotDrop=slotDrop,msgSlot=msgSlot,
+    used=function(path)
+      local n=slotOf(path); local sid=path:match('/beamngEarth/([^/]+)/slot_') or session
+      for _,h in pairs(activationHolds) do if h.n==n and h.session==sid then h.everUsed=true end end
+      saveActivationHolds()
+    end,
+    delete=function(id) deleteQ[#deleteQ+1]=id end,
+    farLamps=function(key,f,on) if f.geo then farGeoLamps(f,on) else farLamps(key,f,on) end end,
+    enabled=function() return M.enabled end,foci=function() return foci or {} end,
+    fociBroken=function() return M.activationFociBroken==true end,
+    attribution=function() group():setField('buildingOSM',0,'1') end,
+    flushJournal=function() group(); saveActivationHolds() end,
+    journal=function(sl,collision)
+      if not sl then error('missing activation slot') end
+      local k=holdKey(sl[1],sl[2],sl[3]); local count=0
+      for _ in pairs(activationHolds) do count=count+1 end
+      if not activationHolds[k] and count>=512 then error('activation hold journal is full') end
+      local h=activationHolds[k]
+      activationHolds[k]={n=sl[1],serial=sl[2],session=sl[3],collision=collision or (h and h.collision) or false,
+        everUsed=(h and h.everUsed) or (slotLive[slotKey(sl[1],sl[3])] or 0)>0}
+    end,
+    replaceQueues=function(old,new,key)
+      local function fix(list)
+        local keep={}
+        for _,q in ipairs(list) do
+          if not (q.key==key and type(q.what)=='string' and q.what:sub(1,3)=='bld') then
+            if old and q.tile==old then q.tile=new end
+            keep[#keep+1]=q
+          end
+        end
+        return keep
+      end
+      walkQ,parked,held,createQ=fix(walkQ),fix(parked),fix(held),fix(createQ)
+    end,
+    refreshFar=function(plans)
+      for _,p in ipairs(plans or {}) do if not p.near then updateFarOne(p.key,p.new) end end
+    end})
+  return activationHost
 end
 
 local okSweep, swept = pcall(M.sweep)

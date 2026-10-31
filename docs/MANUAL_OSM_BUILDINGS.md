@@ -5,6 +5,12 @@ the immutable Overture baseline and the Stage 1–4B overlay/mesh architecture.
 Prepared files are never activated in the game. No road source, Lua, protocol,
 Rust, installed-game file or global cache version changes are involved.
 
+That boundary describes Stage 5A alone. [Stage 5B1](BUILDING_ACTIVATION.md) now
+provides a separate development-only activation call with revision fences,
+building-only handoff and conservative collision/resource retirement. The full
+manual refresh UI and automatic preparation of future streamed targets remain
+Stage 5B2 work.
+
 ## Configuration and invocation
 
 The existing server must have buildings enabled and a configured

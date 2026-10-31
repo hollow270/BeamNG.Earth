@@ -93,6 +93,14 @@ local collisionfoci = require('beamngEarth/collisionfoci') -- other vehicles' co
 local terrainpatch = require('beamngEarth/terrainpatch')   -- ground under the islands off the terrain block
 local farcars = require('beamngEarth/farcars')             -- far player cars saved, taken out and put back
 local fociBroken = false
+M._buildingActivation = require('beamngEarth/buildingactivation')
+function M._buildingSessions()
+  local set,out={},{}
+  for _,s in ipairs(farfield.heldSessions()) do set[s]=true end
+  for _,s in ipairs(roads.heldSessions()) do set[s]=true end
+  for s in pairs(set) do out[#out+1]=s end
+  table.sort(out); return out
+end
 -- The pose's foci: the last collision foci (collisionfoci.lua), rounded, at most 16 (earthd FOCI_MAX); nil when none.
 local function poseFoci()
   local f = collisionfoci.last
@@ -889,7 +897,7 @@ local function onMessage(msg)
     end
     -- vegFlat: the vegetation tiles may come as one flat array of numbers (trees.lua onTile), no table per tree
     net.send({ type = 'hello', protocol = PROTOCOL, format = FORMAT, modVersion = MOD_VERSION,
-      sessions = farfield.heldSessions(), slotSession = farfield.session(), slotsHeld = held, vegFlat = true,
+      sessions = M._buildingSessions(), slotSession = farfield.session(), slotsHeld = held, vegFlat = true, buildingActivation = 1,
       geoTiles = require('beamngEarth/geotile').Z,
       -- (geotiles: vegetation in the global tiles' frames: trees.lua)
       roadGeo = roads.ROAD_GEO,        -- (road tiles as geotiles too: roads.lua)
@@ -897,6 +905,7 @@ local function onMessage(msg)
       globalFar = farfield.GLOBAL_FAR })  -- (and the far field from level 3 up as global tiles: farfield.lua)
     setStatus('Connected to companion server')
   elseif t == '_disconnected' then
+    M._buildingActivation.disconnect()
     st.pending, st.sessionId, st.terrainPending = nil, nil, nil
     cacheInfo = nil
     st.serverNote, st.serverNoteDetail, st.terrainErrorAt = nil, nil, nil
@@ -907,6 +916,7 @@ local function onMessage(msg)
     ambience.clear()
     setStatus('Disconnected from companion server: ' .. tostring(msg.error))
   elseif t == 'hello' then
+    M._buildingActivation.hello(msg.sessionId,msg.buildingEpoch)
     st.sessionId = msg.sessionId
     st.refreshLater = nil       -- (a restarted server numbers its anchors from 1 again)
     roads.setSession(msg.sessionId)   -- the road / building tiles' pooled shape files belong to this server
@@ -1058,6 +1068,10 @@ local function onMessage(msg)
     st.terrainPending, st.terrainRetryAt = nil, st.clock + follow.RETRY_S
     st.terrainErrorAt = st.clock -- the edge guard holds the car meanwhile
     setStatus('Terrain request failed: ' .. tostring(msg.error))
+  elseif t == 'building_activate' then
+    M._buildingActivation.receive(msg,st.anchorId,roads.buildingActivationHost(),net.send)
+  elseif t == 'building_cancel' then
+    M._buildingActivation.cancel(msg,net.send)
   elseif t == 'roads_tile' then
     roads.onTile(msg, st.anchorId, st.anchor)
   elseif t == 'roads_skin' then           -- a road geotile's draped surfaces for this anchor (roads.lua)
@@ -1443,7 +1457,7 @@ local function updateWorld(dt)
     net.send({ type = 'pose', anchorId = st.anchorId, x = pl.x, y = pl.y, z = pl.z, vx = pl.vx, vy = pl.vy,
       lat = pl.lat, lon = pl.lon, speed = pl.speed, follow = not st.followHeld,
       held = (farfield.session() == st.sessionId) and farfield.heldAnchors() or {},
-      sessions = farfield.heldSessions(),
+      sessions = M._buildingSessions(),
       slotsGone = slotsGoneNow(), -- pooled shape slots let go (server/matslots.py)
       foci = poseFoci(),          -- other vehicles' collision islands (collisionfoci.lua; earthd parse_foci)
       cam = c and { x = c.x, y = c.y, z = c.z, fx = c.fx, fy = c.fy, fz = c.fz, fovDeg = c.fovDeg, h = c.h } or nil })
@@ -1644,8 +1658,9 @@ end
 -- The credits line: the server's own (protocol 4 hello) when it sent one; else ours, with the
 -- imagery credits once satellite-textured tiles arrived.
 local function attributionText(fs)
-  if serverAttribution then return serverAttribution end
-  return (fs.textured > 0) and FULL_ATTRIBUTION or ATTRIBUTION
+  local text=serverAttribution or ((fs.textured > 0) and FULL_ATTRIBUTION or ATTRIBUTION)
+  local building=roads.buildingAttribution()
+  return building and (text..'; '..building) or text
 end
 
 local function buildView()
@@ -2096,6 +2111,9 @@ local function onUpdate(dtReal, dtSim)
     -- the roads before the far tiles: they share the governor's budget and the first to ask gets it; after a
     -- teleport the far field's hundreds of tiles took it frame after frame and the road meshes under the car
     -- came after it had passed (Brasov, Sinaia 2026-10-15: the car drove bare ground)
+    roads.activationFociBroken=fociBroken
+    roads.activationSimStep=dtSim>0
+    M._buildingActivation.update(gov,st.anchorId,st.anchor,net.send,dtSim)
     roads.update(gov, st.anchorId, st.player, M.viewAway(), st.anchor)
     gasstations.update(gov)
     t = mark('roads', t)

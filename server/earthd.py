@@ -282,6 +282,7 @@ TEX_NEAR, TEX_FAR = 256, 256    # 32 cells: texture edge (px) of the two finest 
                                  # near was 15x finer than USGS: no visible gain for 2x build time and VRAM);
                                  # --tex gives one per level (64 cells: farfield.TEX_DEFAULT)
 SESSION_MARKER = ".earthd-session"
+BUILDING_SESSION_HOLD = ".building-activation-hold"  # retained until proven activation retirement
 # The engine caches every loaded .dae as a .cdae under <user-dir>/temp/<VFS path, lower-cased>
 # (seen in-game: temp/beamngEarth/<sid>/far_*.dae -> temp/temp/beamngearth/<sid>/far_*.cdae,
 # 1.8 GB / 24k files after one v1 session). Those caches are deleted along with their sources.
@@ -838,7 +839,7 @@ class Server:
                 age = wall - os.path.getmtime(d)
             except OSError:
                 continue
-            if age > SESSION_STALE_S:
+            if age > SESSION_STALE_S and not os.path.lexists(os.path.join(self.root,sid,BUILDING_SESSION_HOLD)):
                 self._rmtree_session(sid)
             else:
                 self.orphans[sid] = now
@@ -846,6 +847,8 @@ class Server:
                          "shows its tiles", sid, age / 60)
 
     def _rmtree_session(self, sid):
+        if os.path.lexists(os.path.join(self.root,sid,BUILDING_SESSION_HOLD)):
+            return
         # detail mode's packed copies of its base photos in the game's terrain texture cache (terraincache.py) go
         # with it: blocks evicted during a run took theirs (prune), but whatever a run left behind stayed for good,
         # ~1.4 MB a block, 3.9 GB of them by 2026-10-18
@@ -905,6 +908,8 @@ class Server:
     def release_session(self, sid):
         """An adopted session the game no longer uses: its files go through the rate-limited delete
         queue (the game loaded them, P9), the marker and the folders last."""
+        if os.path.lexists(os.path.join(self.root,sid,BUILDING_SESSION_HOLD)):
+            return
         if self.orphans.pop(sid, None) is None:
             return
         d = os.path.join(self.root, sid)
@@ -926,7 +931,7 @@ class Server:
                 self._touch(sid)
         gone = []
         for sid, since in sorted(self.orphans.items()):
-            if sid in claimed or now - since < self.orphan_s:
+            if sid in claimed or now - since < self.orphan_s or os.path.lexists(os.path.join(self.root,sid,BUILDING_SESSION_HOLD)):
                 continue
             try:
                 idle = wall - os.path.getmtime(os.path.join(self.root, sid, SESSION_MARKER))
@@ -1284,6 +1289,23 @@ class Server:
             finally:
                 if old is not None:
                     old.lock.release()
+
+    def activate_building_overlays(self, connection, publication, *, manual=False):
+        """Development API on the event-loop thread; no fetch, accept or automatic activation."""
+        import buildingactivation
+        try:
+            manager = self.__dict__.get("_building_activation")
+            if manager is None:
+                if manual is not True:
+                    raise buildingactivation.Rejected("manual=True is required")
+                manager = self._building_activation = buildingactivation.Manager(self,self.__dict__.get("_building_refresh"))
+            return manager.activate(connection,publication,manual=manual)
+        except (ValueError,OSError,RuntimeError) as e:
+            return dict(state="rejected",game_activated=False,error=dict(type=type(e).__name__,message=str(e)))
+
+    def building_activation_status(self, transaction):
+        manager = self.__dict__.get("_building_activation")
+        return manager.status(transaction) if manager is not None else dict(state="unknown",game_activated=False)
 
     def _manual_building_workflow(self, retry=False):
         import buildingmanual
@@ -2983,7 +3005,8 @@ class Server:
 
     def slot_held(self, n):
         """Does some game still hold pooled slot n (a far_tile with it not reported gone)?"""
-        return any(n in c.slot_holds for c in self.connections)
+        manager = self.__dict__.get("_building_activation")
+        return bool(manager is not None and manager.held(n)) or any(n in c.slot_holds for c in self.connections)
 
     def slots_let_go(self, slots):
         """Event loop: these slots' holds ended (reported gone, or a connection closed)."""
@@ -3811,6 +3834,16 @@ class Connection:
         self.send(self.s.areas_message({"id": msg.get("id"), "ok": bool(ok)}))
 
     def send(self, msg):
+        manager = self.s.__dict__.get("_building_activation")
+        if manager is not None:
+            msg = manager.filter_message(self,msg)
+            if msg is None:
+                return
+        elif self.__dict__.get("building_recovery_error") and msg.get("type") in ("roads_tile","roads_exact","bldfar_tile","bldsky_tile"):
+            import buildingactivation
+            msg = buildingactivation.defer_message(self.s,self,msg)
+            if msg is None:
+                return
         if not self.writer.is_closing():
             self.writer.write(protocol.encode(msg))
 
@@ -3895,6 +3928,9 @@ class Connection:
             log.warning("client %s: %s", self.peer, e)
         finally:
             self.route_dl_version += 1          # (a running route_download stops: no one to show its bar to)
+            manager = self.s.__dict__.get("_building_activation")
+            if manager is not None:
+                manager.context_changed(self)
             self.s.connections.discard(self)
             self.s.slots_let_go(list(self.slot_holds))
             self.slot_holds = {}
@@ -3975,6 +4011,22 @@ class Connection:
     def dispatch(self, msg):
         kind = msg["type"]
         if kind == "hello":
+            manager = self.s.__dict__.get("_building_activation")
+            if manager is not None:
+                manager.context_changed(self)
+            self.building_activation = 1 if msg.get("buildingActivation")==1 and type(msg.get("buildingActivation")) is int else 0
+            self.building_epoch = __import__("uuid").uuid4().hex if self.building_activation else None
+            self.building_recovery_error = None
+            if self.building_activation and manager is None and self.s.mapdata is not None and self.s.mapdata._building_store is not None:
+                from pathlib import Path
+                from itertools import islice
+                directory=Path(self.s.cache_dir)/"building-generations"
+                if directory.is_dir() and any(p.name.startswith("activation-") and p.suffix==".json" for p in islice(directory.iterdir(),257)):
+                    import buildingactivation
+                    try:
+                        self.s._building_activation=buildingactivation.Manager(self.s,self.s.__dict__.get("_building_refresh"))
+                    except (ValueError,OSError,RuntimeError) as e:
+                        self.building_recovery_error=str(e)[:256]
             lay = self.s.layout
             fmt = msg.get("format", lay.format)
             if msg.get("protocol") != PROTOCOL:
@@ -3986,6 +4038,8 @@ class Connection:
                  "appVersion": updatesmod.local_version() or "",     # the release (VERSION): the players' reports
                  "sessionId": self.s.sid, "farFormat": self.s.far_format, "material": farfield.MATERIAL,
                  "nearVisual": self.s.near_visual, "attribution": self.s.attribution()}
+            if self.building_activation:
+                m.update(buildingActivation=1,buildingEpoch=self.building_epoch)
             if self.s.imagery is not None:      # the world map credits the sources its view shows
                 m["imageryCredits"] = self.s.imagery.credits_by_area()
                 m["otherCredits"] = self.s.attribution_rest()
@@ -4056,6 +4110,8 @@ class Connection:
             if self.global_far:
                 m["globalFar"] = farfield.GLOBAL_PROTO
             self.send(m)
+            if self.building_recovery_error:
+                self.status("Building activation recovery deferred: "+self.building_recovery_error)
             if self.weather.msg is not None:        # a reconnected mod gets the weather again
                 self.send(self.weather.msg)
             if self.gravity.msg is not None:        # ... and its gravity
@@ -4074,6 +4130,11 @@ class Connection:
                 n = cpupin.pin_game(self.s.game_cpus)
                 log.info("the game's %d %s on CPUs %s", n, "processes" if sys.platform == "win32" else "threads",
                          ",".join(map(str, sorted(self.s.game_cpus))))
+        elif kind == "building_ack":
+            manager = self.s.__dict__.get("_building_activation")
+            if manager is None:
+                raise ValueError("unexpected building activation acknowledgment")
+            manager.acknowledge(self,msg)
         elif kind == "prepare_anchor":
             self.spawn(self.prepare_anchor(msg))
         elif kind == "server_list":             # the BeamNG.Earth servers for the tab in BeamMP's browser
@@ -4509,6 +4570,9 @@ class Connection:
         keep = {k: t for k, t in self.sent.items() if farfield.is_global_key(k)} if old is not None else {}
         self._retire(self.ck(k) for k in self.sent if k not in keep)
         self.active = aid
+        manager = self.s.__dict__.get("_building_activation")
+        if manager is not None:
+            manager.context_changed(self)
         self.ppolys = {}
         self.desired, self.sent, self.groups, self.queue, self.qi = {}, keep, [], [], 0
         old_grid = self.s.horizon_grids.get(old.id) if old is not None else None
@@ -4556,19 +4620,28 @@ class Connection:
         if not isinstance(gone, list):
             return
         let_go = []
+        activation_changed = False
         for g in gone:
             if isinstance(g, dict):
                 g = [g.get("1"), g.get("2")]
             if not isinstance(g, (list, tuple)) or len(g) != 2:
                 continue
             n, serial = g
+            manager = self.s.__dict__.get("_building_activation")
+            if manager is not None and type(n) is int and type(serial) is int:
+                activation_changed = manager.release(n,serial,persist=False) or activation_changed
             if isinstance(n, (int, float)) and self.slot_holds.get(int(n)) == serial:
                 del self.slot_holds[int(n)]
                 let_go.append(int(n))
         self.s.slots_let_go(let_go)
+        if activation_changed:
+            manager._save()
 
     def on_pose(self, msg):
         self.slots_gone(msg.get("slotsGone"))
+        manager = self.s.__dict__.get("_building_activation")
+        if manager is not None:
+            manager.cancel_if_stale(self)
         held = msg.get("held")
         if isinstance(held, dict):      # an empty Lua table may encode as {}
             held = list(held.values())

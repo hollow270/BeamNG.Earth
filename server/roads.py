@@ -7267,6 +7267,8 @@ class Tracker:
             self.retry = {k: t for k, t in self.retry.items() if t > now}
 
     def _built(self, conn, aid, key, fut):
+        if self.futs.get(key) is not fut:
+            return  # superseded/cancelled same-tile revision, including an activation fence
         if aid != self.aid:                 # (an old anchor's: the same key may be in flight for the new one)
             return
         self.building.discard(key)
@@ -7538,6 +7540,8 @@ class GeoTracker:
             self.retry = {k: t for k, t in self.retry.items() if t > now}
 
     def _built(self, conn, aid, key, fut, content, skin, make):
+        if self.futs.get(key) is not fut:
+            return
         import geotiles
         if self.futs.get(key) is fut:
             self.building.discard(key)

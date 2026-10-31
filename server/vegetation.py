@@ -1017,6 +1017,8 @@ class Tracker:
         return geotiles.quad_dist(q, x, y)
 
     def _built_geo(self, conn, key, fut):
+        if self.futs.get(key) is not fut:
+            return
         import geotiles
         self.building.discard(key)
         self.futs.pop(key, None)
@@ -1073,6 +1075,8 @@ class Tracker:
         return roadsmod.box_gap(x0, y0, x0 + size, y0 + size, x, y)
 
     def _built(self, conn, aid, key, fut):
+        if self.futs.get(key) is not fut:
+            return
         if aid != self.aid:                 # (an old anchor's: the same key may be in flight for the new one)
             return
         self.building.discard(key)

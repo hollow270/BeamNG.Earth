@@ -11,6 +11,7 @@
     </template>
     <p v-if="area.error" class="building-warning">{{ area.error }}</p>
     <p v-if="status.fetch_reason" class="building-warning">{{ status.fetch_reason }}</p>
+    <p v-if="status.data_warning" class="building-warning" role="alert">{{ status.data_warning }}</p>
     <button class="map-btn primary" :disabled="!status.fetch_available || !!area.error || busy" @click="request('preview', { bounds: area.bounds })">Fetch and preview buildings</button>
     <p class="building-state" role="status">{{ buildingStates[status.state] || status.state || "Waiting for companion app" }}</p>
     <p v-if="status.detail">{{ status.detail }}</p>
@@ -57,7 +58,7 @@
     </div>
     <div v-if="confirm" class="building-review">
       <p>{{ confirmText[confirm] }}</p>
-      <button class="map-btn primary" @click="confirmed">Confirm {{ confirm }}</button>
+      <button class="map-btn primary" :disabled="busy" @click="confirmed">Confirm {{ confirm }}</button>
       <button class="map-btn" @click="confirm = null">Cancel</button>
     </div>
     <p class="building-footnote">Buildings may include © OpenStreetMap contributors, ODbL-1.0. Actual BeamNG engine collision readiness remains unverified until Stage 6 testing.</p>
@@ -66,36 +67,51 @@
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from "vue"
-import { selection, commandScript, canAccept, buildingStates, revisionText } from "./buildingRefresh.js"
+import { selection, commandScript, canAccept, buildingStates, revisionText, normalizeBuildingStatus } from "./buildingRefresh.js"
 const props = defineProps({ bounds: { type: Object, default: null } })
 defineEmits(["pick", "close"])
-const status = ref({ available: false, state: "unavailable" }), error = ref(""), confirm = ref(null)
+const status = ref(normalizeBuildingStatus({ available: false, state: "unavailable" })), error = ref(""), confirm = ref(null), pending = ref(null)
 const area = computed(() => selection(props.bounds))
 const matchingPreview = computed(() => canAccept(status.value, props.bounds))
-const busy = computed(() => ["fetching", "accepting", "preparing", "activating"].includes(status.value.state))
+const busy = computed(() => !!pending.value || status.value.operation_pending || status.value.command_pending || ["fetching", "accepting", "preparing", "activating"].includes(status.value.state))
 const confirmText = {
   disable: "Disable saved overlays and safely restore original Overture buildings. Stored OSM data is kept.",
   enable: "Enable saved overlays and prepare/activate them locally without fetching OSM.",
   rollback: "Restore the previous validated store revision, then prepare and activate it safely.",
   cleanup: "Inspect ownership and reclaim only resources whose release can be proven. Uncertain resources stay retained.",
 }
-let timer, alive = true
+let timer, alive = true, polling = false
 function engine(script, cb) {
-  if (!window.bngApi?.engineLua) { error.value = "BeamNG UI bridge is unavailable"; return }
-  window.bngApi.engineLua(script, cb)
+  try {
+    if (!window.bngApi?.engineLua) throw new Error("BeamNG UI bridge is unavailable")
+    window.bngApi.engineLua(script, cb)
+  } catch (e) { cb(null); error.value = typeof e?.message === "string" ? e.message : "BeamNG UI bridge failed" }
 }
 function poll() {
+  if (polling) return
+  polling = true
   engine("beamngEarth_settings and beamngEarth_settings.uiBuildingsState() or nil", value => {
-    if (alive && value) status.value = value
+    polling = false
+    if (!alive || !value) return
+    status.value = normalizeBuildingStatus(value)
+    if (pending.value?.id != null && ((!status.value.available) ||
+        (status.value.command_id === pending.value.id && !status.value.command_pending))) pending.value = null
   })
 }
 function request(op, payload = {}) {
+  if (busy.value) return
   error.value = ""
-  engine(commandScript(op, payload), result => {
-    if (!alive) return
-    if (!result || result.error) error.value = result?.error || "Companion app did not accept the request"
-    poll()
-  })
+  pending.value = { id: null }
+  try {
+    engine(commandScript(op, payload), result => {
+      if (!alive) return
+      if (!result || result.error || !Number.isSafeInteger(result.id)) {
+        error.value = typeof result?.error === "string" ? result.error : "Companion app did not accept the request"
+        pending.value = null
+      } else pending.value = { id: result.id }
+      poll()
+    })
+  } catch (e) { error.value = e.message; pending.value = null }
 }
 function confirmed() {
   const op = confirm.value; confirm.value = null

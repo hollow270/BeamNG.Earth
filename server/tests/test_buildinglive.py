@@ -268,6 +268,163 @@ class LiveTest(unittest.TestCase):
             finally: await self.service.close()
         asyncio.run(scenario())
 
+    def test_python_protocol_lua_bridge_preview_renders_in_real_vue_runtime(self):
+        async def scenario():
+            from dataclasses import replace
+            import subprocess
+            import protocol
+            payload=manual.ofx.response(manual.way()+manual.way(2,x=120))
+            source=manual.osm.parse(payload,manual.bounds(),now='2026-10-30T12:01:00Z')
+            await self.start([replace(source.buildings[0],feature_id='gers-same')],payload=payload)
+            try:
+                report=await self.preview()
+                self.assertEqual(report['changes'][0]['attributes'],[])
+                game=LuaGame(); ui=game.lua.eval("require('beamngEarth/buildingui')")
+                if isinstance(ui,tuple): ui=ui[0]
+                game.lua.globals().ui=ui
+                game.lua.execute('beamngEarth_settings={uiBuildingsState=function() return ui.state() end}')
+                public=self.service.public(self.conn)
+                public['resources']=dict(held=0,removed_generations=[],reclaimed_slots=[],released_sessions=[],uncertain=[])
+                cases=[]
+                for patch in ({},{'preview':dict(report,changes=[],issues=[],decisions=[],overture_only=[])},
+                              {'preview':dict(report,changes=[dict(feature_id='bad',attributes={'bad':1})],issues=[None])}):
+                    wire=protocol.encode(dict(type='building_status',**dict(public,**patch)))
+                    self.assertEqual(int.from_bytes(wire[:4],'little'),len(wire)-4)
+                    ui.message(game.lua.globals().jsonDecode(wire[4:].decode()))
+                    value=game.python(game.lua.execute('return beamngEarth_settings.uiBuildingsState()'))
+                    self.assertNotIn(self.authorization,json.dumps(value))
+                    cases.append(dict(status=value,bounds=dict(zip(('w','s','e','n'),manual.bounds()))))
+                self.assertEqual(cases[0]['status']['preview']['changes'][0]['attributes'],{})
+                self.assertEqual(cases[0]['status']['preview']['issues'],{})
+                self.assertEqual(cases[0]['status']['preview']['decisions'][1]['baseline_ids'],{})
+                result=subprocess.run(['node','tools/building_ui_render.mjs','--render-stdin'],
+                    cwd=Path(__file__).resolve().parents[2],input=json.dumps(cases),text=True,capture_output=True,check=True)
+                rendered=json.loads(result.stdout)
+                for row in rendered:
+                    self.assertEqual(row['errors'],[]); self.assertEqual(row['commands'],0)
+                self.assertIn('attributes: unchanged',rendered[0]['text'])
+                self.assertIn('Unchanged records1',rendered[0]['text'])
+                self.assertFalse(rendered[0]['accept_disabled']); self.assertFalse(rendered[1]['accept_disabled'])
+                self.assertTrue(rendered[2]['accept_disabled']); self.assertIn('malformed',rendered[2]['text'])
+            finally: await self.service.close()
+        asyncio.run(scenario())
+
+    def test_later_throttled_preview_keeps_review_and_explicit_acceptance_works(self):
+        async def scenario():
+            await self.start()
+            try:
+                first=await self.preview()
+                self.command('preview',bounds=list(manual.bounds(x=300)))
+                await self.until(lambda:not self.service.busy)
+                self.assertEqual(self.service.current['state'],'awaiting_acceptance')
+                self.assertEqual(self.service.current['preview'],first)
+                self.assertEqual(self.service.current['error']['type'],'Throttled')
+                self.assertIsNone(self.store.load().revision)
+                self.assertEqual(len(self.transport.calls),1)
+                await self.accept(first)
+                self.assertIsNotNone(self.store.load().revision)
+                self.assertEqual(len(self.transport.calls),1)
+            finally: await self.service.close()
+        asyncio.run(scenario())
+
+    def test_same_selection_preview_is_reused_without_fetch_or_renewing_expiry(self):
+        async def scenario():
+            await self.start()
+            try:
+                first=await self.preview()
+                created=self.workflow.previews[first['token']]['created']
+                for _ in range(2):
+                    self.command('preview',bounds=list(manual.bounds()))
+                    await self.until(lambda:not self.service.busy)
+                    self.assertEqual(self.service.current['state'],'awaiting_acceptance')
+                    self.assertEqual(self.service.current['preview'],first)
+                    self.assertIsNone(self.service.current.get('error'))
+                    self.assertEqual(self.workflow.previews[first['token']]['created'],created)
+                self.assertEqual(len(self.transport.calls),1)
+                self.assertIsNone(self.store.load().revision)
+            finally: await self.service.close()
+        asyncio.run(scenario())
+
+    def test_failed_later_fetch_keeps_review_but_expired_or_changed_state_never_revives(self):
+        async def scenario():
+            await self.start()
+            try:
+                first=await self.preview()
+                self.clock.advance(61); self.transport.status=503
+                self.command('preview',bounds=list(manual.bounds(x=300)))
+                await self.until(lambda:not self.service.busy)
+                self.assertEqual(self.service.current['state'],'awaiting_acceptance')
+                self.assertEqual(self.service.current['preview']['token'],first['token'])
+                self.assertEqual(self.service.current['error']['type'],'HTTPFailure')
+                self.store.set_enabled(True)
+                self.command('preview',bounds=list(manual.bounds(x=300)))
+                await self.until(lambda:not self.service.busy)
+                self.assertIsNone(self.service.current['preview'])
+                self.assertNotEqual(self.service.current['state'],'awaiting_acceptance')
+                self.command('accept',preview_token=first['token'],confirm=True)
+                await self.until(lambda:not self.service.busy)
+                self.assertEqual(self.service.current['state'],'superseded')
+            finally: await self.service.close()
+        asyncio.run(scenario())
+
+    def test_frame_change_during_failed_fetch_never_restores_previous_preview(self):
+        async def scenario():
+            import threading
+            started,release=threading.Event(),threading.Event()
+            await self.start()
+            try:
+                await self.preview()
+                def fail(*args,**kwargs):
+                    started.set(); release.wait(5); raise RuntimeError('synthetic failed fetch')
+                with mock.patch.object(self.server,'preview_osm_buildings',side_effect=fail):
+                    self.command('preview',bounds=list(manual.bounds(x=300)))
+                    await self.until(started.is_set)
+                    self.conn.active=2; self.service.context_changed(self.conn)
+                    release.set(); await self.until(lambda:not self.service.busy)
+                self.assertEqual(self.service.current['state'],'superseded')
+                self.assertIsNone(self.service.current['preview'])
+                self.assertIsNone(self.store.load().revision)
+            finally:
+                release.set(); await self.service.close()
+        asyncio.run(scenario())
+
+    def test_expired_review_is_not_restored_after_throttling(self):
+        async def scenario():
+            await self.start()
+            try:
+                first=await self.preview(); self.wall+=301
+                self.command('preview',bounds=list(manual.bounds()))
+                await self.until(lambda:not self.service.busy)
+                self.assertIsNone(self.service.current['preview'])
+                self.command('accept',preview_token=first['token'],confirm=True)
+                await self.until(lambda:not self.service.busy)
+                self.assertEqual(self.service.current['state'],'superseded')
+                self.assertIsNone(self.store.load().revision)
+            finally: await self.service.close()
+        asyncio.run(scenario())
+
+    def test_lua_single_flight_uses_matching_companion_receipt_and_resets_on_disconnect(self):
+        game=LuaGame(); ui=game.lua.eval("require('beamngEarth/buildingui')")
+        if isinstance(ui,tuple): ui=ui[0]
+        ui.hello(game.table(dict(buildingControl=1,buildingControlToken='a'*64,sessionId='session',buildingEpoch='e'*32)))
+        sent=[]
+        def send(value): sent.append(game.python(value)); return True
+        first=game.python(ui.command('preview','{}',send))
+        self.assertIn('error',game.python(ui.command('preview','{}',send)))
+        self.assertEqual(len(sent),1)
+        ui.message(game.table(dict(type='building_status',available=True,command_id=first['id']-1,command_pending=False)))
+        self.assertTrue(game.python(ui.state())['operation_pending'])
+        ui.message(game.table(dict(type='building_status',available=True,command_id=first['id'],command_pending=False)))
+        self.assertFalse(game.python(ui.state())['operation_pending'])
+        ui.command('preview','{}',send); self.assertEqual(len(sent),2)
+        ui.disconnect(); self.assertFalse(game.python(ui.state())['available'])
+        ui.hello(game.table(dict(buildingControl=1,buildingControlToken='b'*64,sessionId='session',buildingEpoch='f'*32)))
+        self.assertIn('error',game.python(ui.command('preview','{}',lambda value:False)))
+        self.assertFalse(game.python(ui.state())['operation_pending'])
+        ui.command('preview','{}',send); ui.revoke(send)
+        self.assertFalse(game.python(ui.state())['available'])
+        self.assertFalse(game.python(ui.state())['operation_pending'])
+
     def test_rapid_revision_changes_and_late_ack_cannot_claim_old_activation(self):
         async def scenario():
             await self.start(street=True)
@@ -295,10 +452,13 @@ class LiveTest(unittest.TestCase):
             await self.start()
             try:
                 client=self.service.client_id; old=self.authorization
+                self.service.current.update(command_id=1,command_pending=False)
                 self.service.context_changed(self.conn,disconnect=True)
                 self.conn.building_epoch='f'*32
                 hello=self.service.hello(self.conn,dict(buildingControl=1,buildingBatches=1,buildingClient=client))
                 self.assertEqual(hello['buildingControl'],1); self.assertNotEqual(hello['buildingControlToken'],old)
+                self.assertNotIn('command_id',self.service.current)
+                self.assertNotIn('command_pending',self.service.current)
                 self.service.context_changed(self.conn,disconnect=True)
                 denied=self.service.hello(self.conn,dict(buildingControl=1,buildingBatches=1,buildingClient='b'*64))
                 self.assertEqual(denied['buildingControl'],0); self.assertTrue(self.conn.building_control_denied)

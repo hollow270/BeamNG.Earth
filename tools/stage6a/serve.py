@@ -58,7 +58,9 @@ def safe_child(root,path):
 
 async def run(args):
     root=workspace(args.workspace)
-    source=safe_child(root,root/'source'/json.loads((root/'STAGE6A_WORKSPACE.json').read_text())['package_root'])
+    metadata=json.loads((root/'STAGE6A_WORKSPACE.json').read_text())
+    stage=metadata.get('stage','6A')
+    source=safe_child(root,root/'source'/metadata['package_root'])
     sys.path.insert(0,str(root))
     sys.path.insert(0,str(source/'server'))
     # Existing render-reach knobs, not road geometry edits or raised activation quotas.
@@ -164,7 +166,7 @@ async def run(args):
     port=listener.sockets[0].getsockname()[1]
     event('startup',synthetic=True,port=port,session=server.sid,profile=str(user),
           baseline=scenario.RELEASE,native_version=fast._ef.VERSION)
-    print(f'STAGE 6A SYNTHETIC ONLY; listening 127.0.0.1:{port}; profile={user}',flush=True)
+    print(f'STAGE {stage} SYNTHETIC ONLY; listening 127.0.0.1:{port}; profile={user}',flush=True)
     print('No public HTTP/DNS permitted; no actual BeamNG test is claimed.',flush=True)
     try:
         if args.smoke:

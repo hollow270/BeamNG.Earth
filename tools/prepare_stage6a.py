@@ -37,7 +37,10 @@ def no_links(path):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',default=str(REPO/'.venv/stage6a/kit'))
+    parser.add_argument('--stage',choices=('6A','6B'),default='6A')
     args=parser.parse_args()
+    stage=args.stage; port=47624 if stage=='6B' else 47623
+    mod_name='beamng_earth_stage'+stage.lower()+'.zip'
     root=Path(args.output).absolute()
     if '..' in root.parts or not root.resolve().is_relative_to(REPO): parser.error('Output must remain in the repository')
     no_links(root)
@@ -66,7 +69,7 @@ def main():
             entries[rel]=dict(bytes=len(data),sha256=sha(data))
         z.extractall(source)
         prefix=package_root+'/mod/beamng_earth/'
-        with zipfile.ZipFile(root/'beamng_earth_stage6a.zip','w',zipfile.ZIP_DEFLATED,compresslevel=9) as mod:
+        with zipfile.ZipFile(root/mod_name,'w',zipfile.ZIP_DEFLATED,compresslevel=9) as mod:
             for name in sorted(z.namelist()):
                 if name.startswith(prefix): mod.writestr(name[len(prefix):],z.read(name))
             mod.writestr('_stage6a/diagnostics.lua',(REPO/'tools/stage6a/diagnostics.lua').read_bytes())
@@ -88,7 +91,7 @@ def main():
             raise RuntimeError('Embedded runtime has an external search path')
     for name in ('serve.py','scenario.py','diagnostics.lua','verify.py'): shutil.copy2(REPO/'tools/stage6a'/name,root/name)
     docs=root/'docs'; docs.mkdir()
-    for name in ('LIVE_OSM_BUILDINGS.md','STAGE6A_MANUAL_TEST.md'):
+    for name in ('LIVE_OSM_BUILDINGS.md','STAGE6A_MANUAL_TEST.md','STAGE6B_UI_FIX.md'):
         p=REPO/'docs'/name
         if p.is_file(): shutil.copy2(p,docs/name)
     sys.path[:0]=[str(source/package_root/'server'),str(root)]
@@ -97,17 +100,18 @@ def main():
     save(root/'SCENARIO.json',scenario.manifest())
     (root/'synthetic-overpass.json').write_bytes(scenario.PAYLOAD)
     save(root/'STAGE6A_WORKSPACE.json',dict(schema='stage6a-workspace-v1',commit=commit,branch=branch,
-        package_root=package_root,port=47623,source_diff_sha256=sha(diff),synthetic_only=True))
+        package_root=package_root,port=port,stage=stage,source_diff_sha256=sha(diff),synthetic_only=True))
     optional={p:importlib.util.find_spec(p) is not None for p in ('duckdb','fsspec','certifi','truststore')}
-    save(root/'package-audit.json',dict(commit=commit,branch=branch,archive=archive.name,
-        archive_sha256=sha(archive.read_bytes()),game_mod_sha256=sha((root/'beamng_earth_stage6a.zip').read_bytes()),
+    save(root/'package-audit.json',dict(commit=commit,branch=branch,archive=archive.name,stage=stage,game_mod=mod_name,
+        archive_sha256=sha(archive.read_bytes()),game_mod_sha256=sha((root/mod_name).read_bytes()),
         files=entries,required_files=required,all_required_present=True,
         native_version=fast._ef.VERSION,native_required=fast.MIN_VERSION,
         python=sys.version,numpy=numpy.__version__,pillow=PIL.__version__,optional_dependencies=optional,
         scope='Windows x64 synthetic legacy-frame development test; no frozen app or real engine test',
         development_sources={str(p.relative_to(REPO)):sha(p.read_bytes()) for p in
-            [Path(__file__),REPO/'docs/LIVE_OSM_BUILDINGS.md',REPO/'docs/STAGE6A_MANUAL_TEST.md',
-             *sorted((REPO/'tools/stage6a').glob('*'))] if p.is_file()},
+            [Path(__file__),REPO/'docs/LIVE_OSM_BUILDINGS.md',REPO/'docs/STAGE6A_MANUAL_TEST.md',REPO/'docs/STAGE6B_UI_FIX.md',
+             REPO/'tools/building_ui_render.mjs',REPO/'tools/test_building_ui.mjs',
+             *sorted((REPO/'tools/stage6a').glob('*')),*sorted((REPO/'tools/ui-tests').glob('*'))] if p.is_file()},
         range_limits=dict(roads_send_m=384,far_buildings_send_m=384,skyline_send_m=768),
         known_blockers=['Default production-distance live discovery exceeds 128 targets in this fixture.',
                         'Optional online requirements are not installed in the synthetic runtime.',
@@ -123,7 +127,7 @@ $ErrorActionPreference='Continue' # Windows PowerShell represents native stderr 
 & (Join-Path $stage6Kit 'runtime/python.exe') -B (Join-Path $stage6Kit 'serve.py') --workspace $stage6Kit --synthetic-only --port 47623 2>&1 | Tee-Object -FilePath (Join-Path $stage6Kit 'companion-console.log')
 exit $LASTEXITCODE
 """
-    (root/'Start-Synthetic-Companion.ps1').write_text(launch,encoding='utf-8')
+    (root/'Start-Synthetic-Companion.ps1').write_text(launch.replace('--port 47623','--port '+str(port)),encoding='utf-8')
     print(json.dumps(dict(kit=str(root),archive=str(archive),files=len(entries),required=len(required),native_version=fast._ef.VERSION,optional_dependencies=optional),indent=2))
 
 

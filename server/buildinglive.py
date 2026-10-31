@@ -224,6 +224,9 @@ class Service:
             self.authorized_client=self.client_id
             self.revoked=False
             self.owner, self.secret, self.epoch = conn,secrets.token_hex(32),conn.building_epoch
+            # A reloaded Lua VM may restart request IDs; receipts belong to this hello.
+            self.current.pop('command_id',None)
+            self.current.pop('command_pending',None)
             self.seen.clear()
             self.applied.clear()
             # The authority worker switches identity using the copied socket/epoch key.
@@ -286,7 +289,8 @@ class Service:
         if op=="status":
             self.publish(conn); return
         if self.busy or self.clock()-self.last_command<0.25:
-            conn.send(dict(type="building_status",**dict(self.public(conn),error=dict(type="Busy",message="A building operation is running or was just requested."))))
+            conn.send(dict(type="building_status",**dict(self.public(conn),command_id=msg["id"],command_pending=False,
+                error=dict(type="Busy",message="A building operation is running or was just requested."))))
             return
         if op in ("accept","disable","enable","rollback","cleanup") and msg.get("confirm") is not True:
             raise ValueError("explicit confirmation is required")
@@ -464,10 +468,24 @@ class Service:
 
     async def _command(self,conn,msg):
         op=msg["op"]
+        frame,state=_frame(conn),self.state_token
+        retained=deepcopy(self.current.get("preview")) if op=="preview" and self.current.get("state")=="awaiting_acceptance" else None
         try:
             if self.revoked or conn is not self.owner: return
+            self.current.update(command_id=msg["id"],command_pending=True)
             if op=="preview":
-                self._set("fetching",error=None,preview=None,selection=msg["bounds"])
+                if retained is not None and retained.get("selection")==msg["bounds"]:
+                    try:
+                        _,current=await self.call(conn,lambda w,c:
+                            self.server._manual_building_workflow().validate_preview(retained["token"],manual=True))
+                    except Exception:
+                        current=False
+                    if current and self.state_token==state and _frame(conn)==frame:
+                        self._set("awaiting_acceptance",error=None)
+                        return # Same valid review, not another network request or a renewed expiry.
+                if self.revoked or conn is not self.owner or _frame(conn)!=frame:
+                    return
+                self._set("fetching",error=None,preview=retained,selection=msg["bounds"])
                 def preview(world,c):
                     return preview_for_ui(self.server.preview_osm_buildings(msg["bounds"],manual=True,enable=True))
                 report,current=await self.call(conn,preview)
@@ -500,9 +518,25 @@ class Service:
             if conn is self.owner:
                 await self.prepare(conn,explicit=True)
         except Exception as e:
-            self._set("superseded" if isinstance(e,StalePreview) else "failed",error=_public_error(e))
+            if conn is not self.owner or self.revoked or _frame(conn)!=frame:
+                return
+            restored=False
+            if retained is not None and self.state_token==state:
+                try:
+                    _,current=await self.call(conn,lambda w,c:
+                        self.server._manual_building_workflow().validate_preview(retained["token"],manual=True))
+                    restored=current and self.state_token==state and _frame(conn)==frame
+                except Exception:
+                    pass # An expired, reconfigured or superseded review is never revived.
+            if self.revoked or conn is not self.owner or _frame(conn)!=frame:
+                return
+            self._set("awaiting_acceptance" if restored else "superseded" if isinstance(e,StalePreview) else "failed",
+                      preview=retained if restored else None,error=_public_error(e))
         finally:
             self.busy=False
+            if conn is self.owner and self.current.get("command_id")==msg["id"]:
+                self.current["command_pending"]=False
+                self.publish(conn)
 
     def _regions(self):
         if self.snapshot is None: return []
@@ -667,7 +701,7 @@ class Service:
             self.context_task=asyncio.create_task(invalidate())
         for status in self.activation_states.values():
             status.update(state='orphaned',game_activated=False,detail='Connection or anchor changed; current activation is unconfirmed.')
-        self._set("superseded",activated_revision=None,activated_enabled=None,transaction=None,
+        self._set("superseded",preview=None,activated_revision=None,activated_enabled=None,transaction=None,
                   detail="The game connection or anchor changed; local data remains accepted.")
         if disconnect:
             self.owner=None; self.secret=None; self.epoch=None

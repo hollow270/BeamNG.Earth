@@ -213,6 +213,20 @@ class Workflow:
         except Exception as e:
             return dict(status="pending",prepared=False,error=self._error(e))
 
+    def validate_preview(self, token, *, manual=False):
+        """Recheck a retained review without fetching, consuming it or committing data.
+
+        Acceptance still performs its full validation under the writer lock.
+        """
+        with self._operation(manual):
+            row = self.previews.get(token)
+            if row is None or row["config"] != self._config(private=True):
+                raise StalePreview("preview expired or retrieval configuration changed")
+            if self.store.load_state()[1] != row["state"]:
+                raise StalePreview("accepted state changed after preview")
+            self._fresh(row["source"])
+            row["context"].validate(self.md)
+
     def accept(self, token, *, manual=False, prepare=True):
         with self._operation(manual):
             if not isinstance(token,str) or len(token)!=64:

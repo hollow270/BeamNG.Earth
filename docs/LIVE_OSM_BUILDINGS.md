@@ -402,6 +402,11 @@ Coverage includes all requested scenario groups:
 
 ## Stage 6 handoff — instructions only
 
+The user-operated Stage 6B run found an empty-Lua-table preview rendering failure
+in BeamNG.drive 0.40.1. The focused fix, runtime regression evidence and separate
+kit/continuation procedure are in [STAGE6B_UI_FIX.md](STAGE6B_UI_FIX.md).
+Actual in-game retesting of this fix remains pending.
+
 Stage 6A preparation is now documented in [the isolated development test procedure](STAGE6A_MANUAL_TEST.md).
 It provides repository-local artifacts and synthetic backend checks; no game has
 been installed into or launched. The original Stage 5B2 handoff below remains the

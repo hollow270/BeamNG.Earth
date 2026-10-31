@@ -336,6 +336,22 @@ class ManualTest(unittest.TestCase):
         with self.assertRaises(StalePreview):
             self.accept(p)
 
+    def test_retained_review_revalidation_is_read_only_and_checks_config_and_baseline(self):
+        self.setup([fx.record('gers-a',60,60,osm='w1@1')])
+        proposal=self.preview()
+        before=tree(self.store.root)
+        self.workflow.validate_preview(proposal['token'],manual=True)
+        self.assertEqual(tree(self.store.root),before)
+        self.assertIn(proposal['token'],self.workflow.previews)
+        config=self.workflow.client.config
+        self.workflow.client.config=replace(config,headers={'Authorization':'changed-private-value'})
+        with self.assertRaises(StalePreview): self.workflow.validate_preview(proposal['token'],manual=True)
+        self.workflow.client.config=config
+        path=Path(self.workflow.previews[proposal['token']]['context'].files[0][0])
+        path.write_bytes(path.read_bytes()+b'changed baseline')
+        with self.assertRaises(StalePreview): self.workflow.validate_preview(proposal['token'],manual=True)
+        self.assertIsNone(self.store.load().revision)
+
     def test_preview_stale_after_baseline_file_changes_even_with_a_warm_decoded_lru(self):
         self.setup([fx.record()])
         p = self.preview(enable=True)

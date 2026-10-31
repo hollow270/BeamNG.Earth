@@ -2,12 +2,14 @@
 local M={}
 local secret,session,epoch=nil,nil,nil
 local id=0
+local pending=nil
 local state={available=false,state='unavailable',reason='Companion app not connected'}
 local client=nil
 pcall(function() client=settings.getValue('beamngEarth_buildingClient') end)
 function M.client() return client end
 local allowed={status=true,preview=true,accept=true,retry=true,disable=true,enable=true,rollback=true,cleanup=true}
 function M.hello(m)
+  pending=nil
   require('beamngEarth/buildinginventory').reset()
   secret,session,epoch=m.buildingControlToken,m.sessionId,m.buildingEpoch
   if type(m.buildingClient)=='string' and #m.buildingClient==64 then
@@ -17,13 +19,15 @@ function M.hello(m)
   state={available=m.buildingControl==1,state='idle',reason=m.buildingControlReason or '',collision_engine_verified=false}
 end
 function M.disconnect()
+  pending=nil
   require('beamngEarth/buildinginventory').reset()
   secret,session,epoch=nil,nil,nil
   state={available=false,state='unavailable',reason='Companion app disconnected; accepted local data is retained'}
 end
 function M.message(m)
   if type(m)~='table' or m.type~='building_status' or #jsonEncode(m)>262144 then return false end
-  state=m; return true
+  if m.available~=true or (m.command_id==pending and m.command_pending==false) then pending=nil end
+  state=m; state.operation_pending=pending~=nil; return true
 end
 function M.state() return state end
 function M.inventory(m,context,send)
@@ -36,10 +40,11 @@ function M.inventory(m,context,send)
 end
 function M.revoke(send)
   if session and epoch then send({type='building_revoke',sessionId=session,epoch=epoch}) end
-  secret=nil; state.available=false; state.reason='Manual building writes are unavailable in multiplayer'
+  pending=nil; secret=nil; state.available=false; state.operation_pending=false; state.reason='Manual building writes are unavailable in multiplayer'
 end
 function M.command(op,payload,send)
   if not allowed[op] or not secret or not state.available then return {error=state.reason or 'Not authorized'} end
+  if op~='status' and pending then return {error='A building request is awaiting its companion result'} end
   if type(payload)~='string' or #payload>2048 then return {error='Invalid building request'} end
   local ok,data=pcall(jsonDecode,payload)
   if not ok or type(data)~='table' then return {error='Invalid building request'} end
@@ -48,7 +53,8 @@ function M.command(op,payload,send)
   id=id+1
   local m={type='building_control',id=id,sessionId=session,epoch=epoch,authorization=secret,op=op}
   for k,v in pairs(data) do m[k]=v end
-  if not send(m) then return {error='Companion app disconnected'} end
+  if op~='status' then pending=id; state.operation_pending=true end
+  if not send(m) then pending=nil; state.operation_pending=false; return {error='Companion app disconnected'} end
   return {id=id}
 end
 return M

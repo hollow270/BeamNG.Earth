@@ -22,10 +22,11 @@ def main():
     audit=json.loads((root/'package-audit.json').read_text())
     digest=lambda p:hashlib.sha256(p.read_bytes()).hexdigest()
     assert digest(root/'build'/audit['archive'])==audit['archive_sha256']
-    assert digest(root/'beamng_earth_stage6a.zip')==audit['game_mod_sha256']
+    mod_name=audit.get('game_mod','beamng_earth_stage6a.zip')
+    assert digest(serve.safe_child(root,root/mod_name))==audit['game_mod_sha256']
     for name,record in audit['files'].items():
         assert digest(serve.safe_child(root,source/name))==record['sha256'],name
-    with zipfile.ZipFile(root/'beamng_earth_stage6a.zip') as mod:
+    with zipfile.ZipFile(root/mod_name) as mod:
         assert mod.testzip() is None
         for name in mod.namelist():
             original=root/'diagnostics.lua' if name=='_stage6a/diagnostics.lua' else source/'mod/beamng_earth'/name

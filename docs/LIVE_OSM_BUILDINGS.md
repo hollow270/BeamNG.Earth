@@ -402,6 +402,19 @@ Coverage includes all requested scenario groups:
 
 ## Stage 6 handoff — instructions only
 
+The user confirmed Stage 6D restoration and collision through repeated teleports,
+then reached the retained-generation quota during a paused teleport. Stage 6E
+adds proof-based batch capacity admission/reclamation without raising quotas;
+the isolated kit and replay procedure are in
+[STAGE6E_GENERATION_CAPACITY.md](STAGE6E_GENERATION_CAPACITY.md).
+The user subsequently reported 16 successful Stage 6E restoration cycles,
+including paused teleport, in BeamNG.drive 0.40.1: A remained about 6 m, C about
+5 m; at the 512-generation limit 80 old generations were reclaimed and 80 new
+ones created, with zero work directories left. Retiring states resolved
+automatically. Both processes are closed. These are user-operated engine results;
+Codex's automated acknowledgements remain simulated. Earlier handoff notes below
+are historical.
+
 The user confirmed Stage 6C live activation and collision in BeamNG.drive 0.40.1,
 then found automatic restoration failed after teleport. The Stage 6D recovery
 fix, evidence limits, baseline fallback and separate port/profile continuation

@@ -429,6 +429,7 @@ class Coordinator:
                             continue  # a concurrent worker completed its atomic file/temporary-directory write
                         if size > self.limits.total_bytes:
                             raise ResourceLimit("retained building generations exceed disk budget")
+        return count,size
 
     def _remove_work(self, directory):
         # Only private, unreferenced work. Never delete published generations or held resources.
@@ -497,7 +498,7 @@ class Coordinator:
             # A running cancelled/timed-out job owns its private directory until it exits.
             raise
 
-    def refresh(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=()):
+    def refresh(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=(), reclaim=None):
         if not self._requests.acquire(blocking=False):
             raise ResourceLimit("too many simultaneous building refreshes")
         work = []
@@ -543,18 +544,38 @@ class Coordinator:
                 self._usage()
                 self._save(state)
             entries, rebuilt, reused = {k:v for k,v in state["entries"].items() if k in target_registry}, [], []
+            planned={}
             for key, (req, identity, dependency) in desired.items():
                 self._cancel(cancel)
                 old = entries.get(key)
                 if old is not None and old["identity"] == identity and self._valid(old):
                     reused.append(key)
                     continue
-                generation = uuid.uuid4().hex
-                directory = self.io.root / "work" / generation
+                planned[key]=None
+            # Collection obtains the catalog lock itself and must not run under
+            # this lock. It can only remove resources with existing release proof.
+            if reclaim is not None: reclaim(len(planned))
+            with self.io._locked():
+                if self._load()['sequence']!=ticket:
+                    raise StaleGeneration('a newer refresh superseded batch admission')
+                count,_=self._usage()
+                if count+len(planned)>self.limits.artifacts:
+                    raise ResourceLimit('insufficient retained generation capacity for building batch')
+                # Leased empty work directories are physical count reservations,
+                # visible to other processes until atomic publication or cleanup.
                 from buildingretention import WorkLease
-                lease=WorkLease(self.io.root,generation,create=True).acquire(create=True)
-                work.append((directory,lease))
-                directory.mkdir()
+                for key in planned:
+                    self._cancel(cancel)
+                    generation=uuid.uuid4().hex
+                    directory=self.io.root/'work'/generation
+                    lease=WorkLease(self.io.root,generation,create=True).acquire(create=True)
+                    work.append((directory,lease))
+                    directory.mkdir()
+                    planned[key]=(directory,lease)
+            for key,(directory,lease) in planned.items():
+                self._cancel(cancel)
+                req,identity,dependency=desired[key]
+                generation=directory.name
                 vfs = "@BUILDING_OVERLAY@/" + generation
                 row = self._build(req, snapshot, identity, cancel, directory, vfs, lease)
                 if row["identity"] != identity or row["dependency"] != dependency or row["snapshot"] != snapshot.revision \

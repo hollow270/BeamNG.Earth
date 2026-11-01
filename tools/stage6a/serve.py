@@ -145,7 +145,9 @@ async def run(args):
         elif msg.get('type')=='building_status':
             event('building_status',state=msg.get('state'),accepted_revision=msg.get('accepted_revision'),
                   activated_revision=msg.get('activated_revision'),error=(msg.get('error') or {}).get('type'),
-                  validation_code=(msg.get('error') or {}).get('validation_code'),restoration=msg.get('restoration'))
+                  validation_code=(msg.get('error') or {}).get('validation_code'),restoration=msg.get('restoration'),
+                  generation_capacity=(msg.get('resources') or {}).get('capacity'),
+                  removed_generations=len((msg.get('resources') or {}).get('removed_generations',())))
         return base_send(conn,msg)
     earthd.Connection.send=send
     class DevelopmentConnection(earthd.Connection):
@@ -173,7 +175,7 @@ async def run(args):
         if args.smoke:
             if getattr(args,'restoration_smoke',False):
                 from restoration_smoke import smoke as restore
-                await restore(server,port,transport,scenario,protocol,root)
+                await restore(server,port,transport,scenario,protocol,root,cycles=getattr(args,'reanchor_cycles',3))
             else: await smoke(server,port,transport,scenario,protocol,root)
         else:
             async with listener: await listener.serve_forever()
@@ -263,6 +265,7 @@ def main():
     parser.add_argument('--port',type=int,default=47623)
     parser.add_argument('--smoke',action='store_true')
     parser.add_argument('--restoration-smoke',action='store_true',help='Real socket anchor replay with SIMULATED acknowledgements, no game')
+    parser.add_argument('--reanchor-cycles',type=int,default=3,choices=range(3,17),help='Bounded restoration smoke length (3..16); acknowledgements/releases remain simulated')
     parser.add_argument('--default-ranges',action='store_true',help='Reproduce the known unmodified production-distance discovery quota blocker')
     args=parser.parse_args()
     args.smoke=args.smoke or args.restoration_smoke

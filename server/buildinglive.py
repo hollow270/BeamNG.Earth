@@ -625,9 +625,12 @@ class Service:
                 'Waiting for ordinary road streaming before restoring buildings.'))
             return
         self._set("preparing",error=None)
+        retention_report={}
+        frame=_frame(conn)
         def prepare(world,c):
             import buildingretention
-            self.current_retention=buildingretention.collect(world,self.authority,limit=8)
+            def reclaim(required):
+                return buildingretention.make_room(world,self.authority,required=required,report=retention_report)
             requests={}
             for bounds in regions:
                 discovery=buildingtargets.discover(world,bounds,current_only=True)
@@ -653,15 +656,21 @@ class Service:
                     original=coordinator.store
                     coordinator.store=_BaselineView(original)
                     try:
-                        prepared=coordinator.refresh(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order)
+                        prepared=coordinator.refresh(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order,reclaim=reclaim)
                     finally: coordinator.store=original
             else:
-                prepared=self.server.refresh_building_overlays(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order)
+                prepared=self.server.refresh_building_overlays(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order,reclaim=reclaim)
             return dict(prepared,
                         live_requests=[r.wire() for r in requests.values()])
-        result,current=await self.call(conn,prepare)
+        try: result,current=await self.call(conn,prepare)
+        except Exception:
+            # The worker may fail before invoking prepare. Cancellation must stay
+            # cancellation, and an obsolete context must not publish diagnostics.
+            if conn is self.owner and _frame(conn)==frame:
+                self.current['resources']=retention_report
+            raise
         if not current: self._set("superseded"); return
-        self.current["resources"]=self.current_retention
+        self.current['resources']=retention_report
         if result is None:
             self.completed_state=self.state_token
             self._set("accepted",detail="Accepted locally; no visible dependent tiles yet."); return

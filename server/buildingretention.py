@@ -238,3 +238,38 @@ def collect(server,manager=None,*,proof=None,limit=32):
                 _remove(directory,lease_root)
     report["uncertain"]=report["uncertain"][:64]
     return report
+
+
+def make_room(server,manager=None,*,required,report):
+    """Admit a bounded batch using ordinary collection, without inventing release proof.
+
+    This is not a reservation: Coordinator rechecks and reserves under the catalog
+    lock. A competing caller may consume space; that caller still cannot overbook.
+    No inventory is requested and no journal/work ownership rules are relaxed.
+    """
+    coordinator=manager.c if manager is not None else getattr(server,'_building_refresh',None)
+    if coordinator is None: raise CorruptStorage('no validated catalog for generation admission')
+    if type(required) is not int or not 0<=required<=coordinator.limits.requests:
+        raise ValueError('invalid building batch capacity')
+    report.update(removed_generations=[],removed_work=[],removed_journals=[],released_sessions=[],
+                  reclaimed_slots=[],uncertain=[],held=len(manager.holds) if manager is not None else 0,
+                  reclaimable=0,history_compacted=0)
+    capacity=report['capacity']=dict(required=required,passes=0)
+    # At most one full bounded inventory's worth of removals, in <=64-item passes.
+    for attempt in range((coordinator.limits.artifacts+63)//64+1):
+        with coordinator.io._locked(): count,_=coordinator._usage()
+        capacity.update(after=count,free=coordinator.limits.artifacts-count)
+        if attempt==0: capacity['before']=count
+        deficit=required-capacity['free']
+        if deficit<=0: return report
+        if attempt==(coordinator.limits.artifacts+63)//64: break
+        part=collect(server,manager,limit=min(64,deficit))
+        capacity['passes']+=1
+        for name in ('removed_generations','removed_work','removed_journals','released_sessions','reclaimed_slots'):
+            report[name].extend(part[name])
+        report['uncertain']=list(dict.fromkeys(report['uncertain']+part['uncertain']))[:64]
+        report.update(held=part['held'],reclaimable=part['reclaimable'],
+                      history_compacted=report['history_compacted']+part['history_compacted'])
+        if not part['removed_generations'] and not part['removed_work']: break
+    report['uncertain'].append('Insufficient proven generation capacity: need '+str(required)+', free '+str(capacity['free'])+'.')
+    raise ResourceLimit('insufficient proven generation capacity for building batch')

@@ -68,6 +68,10 @@ import math  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import sys  # noqa: E402
+_server_path=os.path.dirname(os.path.abspath(__file__))
+if not getattr(sys,'frozen',False):
+    for _path in (_server_path,os.path.dirname(_server_path)):
+        if _path not in sys.path:sys.path.insert(0,_path)
 import shutil  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402

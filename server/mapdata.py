@@ -337,7 +337,7 @@ class MapData:
         """Local effective-building tokens; not a global pipeline version or invalidation operation."""
         from buildingrender import Dependency
         keys=tuple(keys)
-        view = self._building_context.get() or (self._building_world.view(keys) if self._building_world is not None else self._building_view)
+        view = self._building_context.get() or (self._building_world.view(keys,preferred_bounds=render_bounds) if self._building_world is not None else self._building_view)
         return view.dependency(keys,render_bounds=render_bounds) if view is not None and view.active else Dependency()
 
     def _rails(self, key, layer, feats):

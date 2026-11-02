@@ -35,10 +35,11 @@ import sys
 import threading
 import time
 
+ROOT = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:sys.path.insert(0,ROOT)
 import apppaths
 
 FROZEN = getattr(sys, "frozen", False)
-ROOT = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 IS_WIN = os.name == "nt"
 APP_ID = "284160"
 GAME_EXE_LINUX = os.path.join("BinLinux", "BeamNG.drive.x64")

@@ -17,6 +17,7 @@ import buildingoverlay as bo
 from buildingoverlaystore import OverlayStore, Limits, CorruptStorage, ResourceLimit, StalePreview, _union, _intersects
 import buildingrender
 import mapcells
+import mapgeom
 import osmbuildings as osm
 
 log=logging.getLogger('earthd.osm_startup')
@@ -180,13 +181,22 @@ def context(md,bounds,snapshot,incoming=(),parts=()):
             if key not in loaded: loaded[key]=md.cell(key,layers=('buildings','building_parts'))
         parents=set(forced)
         for cell in loaded.values():
-            for f in bo.from_mapgeom(cell.layers['buildings']):
-                box=bo._bbox(f.geometry)
-                if f.feature_id in forced or box is None or _intersects(box,interest):
-                    parents.add(f.feature_id); scope=_union([scope,box])
+            layer=cell.layers['buildings'];indices=[]
+            # Select using the original coordinate arrays BEFORE copying full
+            # geometry/attributes. A small merge batch must not deserialize every
+            # building in a dense 2 km baseline cell on every closure pass.
+            for i,fid in enumerate(layer.ids):
+                xy=layer.lonlat[layer.coord_off[layer.ring_off[layer.part_off[i]]]:
+                                layer.coord_off[layer.ring_off[layer.part_off[i+1]]]]
+                box=(float(xy[:,0].min()),float(xy[:,1].min()),float(xy[:,0].max()),float(xy[:,1].max())) if len(xy) and layer.kind[i]==mapgeom.POLYGON else None
+                if str(fid) in forced or box is None or _intersects(box,interest):indices.append(i)
+            for f in bo.from_mapgeom(buildingrender._take(layer,indices)):
+                parents.add(f.feature_id);scope=_union([scope,bo._bbox(f.geometry)])
         for cell in loaded.values():
-            for f in bo.from_mapgeom(cell.layers['building_parts']):
-                if f.parent_id in parents: scope=_union([scope,bo._bbox(f.geometry)])
+            layer=cell.layers['building_parts'];pids=layer.attrs.get('building_id',())
+            indices=[i for i,pid in enumerate(pids) if str(pid) in parents]
+            for f in bo.from_mapgeom(buildingrender._take(layer,indices)):
+                scope=_union([scope,bo._bbox(f.geometry)])
         if scope==before: return buildingbaseline.collect(md,bounds,snapshot,incoming,parts)
     raise ResourceLimit('startup baseline closure did not converge')
 

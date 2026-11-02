@@ -180,22 +180,26 @@ def _groups(features):
     """
     byid={f.feature_id:f for f in features};parent={i:i for i in byid};grid={}
     rings={f.feature_id:bo._validated(f.geometry)[0] for f in features}
+    boxes={f.feature_id:bo._bbox(f.geometry) for f in features}
     def root(i):
         while parent[i]!=i: parent[i]=parent[parent[i]];i=parent[i]
         return i
     def join(a,b): parent[root(a)]=root(b)
     for f in features:
-        b=bo._bbox(f.geometry)
+        b=boxes[f.feature_id]
         if b is None: continue
         x0,x1=math.floor(b[0]*400),math.floor(b[2]*400)
         y0,y1=math.floor(b[1]*400),math.floor(b[3]*400)
         if (x1-x0+1)*(y1-y0+1)>4096: raise fs.ResourceLimit('source influence index budget')
+        seen=set()
         for x in range(x0,x1+1):
             for y in range(y0,y1+1):
                 bucket=grid.setdefault((x,y),[])
                 if len(bucket)>4096: raise fs.ResourceLimit('dense source influence index')
                 for other in bucket:
-                    c=bo._bbox(byid[other].geometry)
+                    if other in seen:continue
+                    seen.add(other)
+                    c=boxes[other]
                     if min(b[2],c[2])>max(b[0],c[0]) and min(b[3],c[3])>max(b[1],c[1]):
                         # AABBs of ordinary rotated neighbours overlap even when
                         # footprints do not. Do not turn a city of those into one

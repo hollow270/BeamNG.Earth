@@ -143,8 +143,16 @@ class Reader(osmtags.OsmTags):
         self.selected = None
         self.tolerant = tolerant
         self.raw_budget = raw_budget
+        self._ctx = None
+        self._schema = None
+        self._region = None
+        self.query_lock = threading.RLock()
+        self.diagnostics = dict(remote_scans=0,local_queries=0)
 
-    def close(self): self._reader.close()
+    def close(self):
+        if self._ctx is not None:
+            self._ctx[0].close();self._ctx=None
+        self._reader.close()
 
     def attach(self, version):
         """Reuse a session-selected source without a freshness request."""
@@ -191,25 +199,74 @@ class Reader(osmtags.OsmTags):
             raise rangeread.RangeError('invalid/oversized Parquet footer')
         return super()._groups(con,uri,remote,kind)
 
-    def query(self, bounds):
+    def _connection(self):
+        if self._ctx is None:
+            self._ctx=self._reader._connect({PATH:self._remote[1]},'demand')
+            con=self._ctx[0]
+            con.execute("SET memory_limit='256MB'")
+            con.execute("SET temp_directory=''")
+            try:con.execute('SET enable_geoparquet_conversion=false')
+            except Exception:pass
+        return self._ctx
+
+    def prepare_region(self,bounds):
+        """Scan the remote source ONCE per bounded data cell, then filter locally.
+
+        Each output query still enforces 512 features. The in-memory regional
+        staging table has a separate 50,000-row/256 MiB admission, no spill, and
+        lives only in the supervised acquisition process. No planet mirror.
+        """
+        bounds=_bounds(bounds)
+        if max((bounds[2]-bounds[0])*111320*math.cos(math.radians((bounds[1]+bounds[3])/2)),
+               (bounds[3]-bounds[1])*111320)>3000:raise ResourceLimit('source staging region exceeds one data cell')
+        with self.query_lock:
+            if self._region is not None:raise ValueError('source staging region already chosen')
+            self._query(bounds,stage=True)
+            self._region=tuple(bounds)
+
+    def query(self,bounds):
+        with self.query_lock:return self._query(bounds)
+
+    def _query(self, bounds, stage=False):
         bounds = _bounds(bounds)
         if self.selected is None: raise ValueError('select a source version explicitly first')
         if max((bounds[2]-bounds[0])*111320*math.cos(math.radians((bounds[1]+bounds[3])/2)),
-               (bounds[3]-bounds[1])*111320) > 2000:
+               (bounds[3]-bounds[1])*111320) > (3000 if stage else 2000):
             raise ResourceLimit('developer refresh requires bounded internal partitions')
         remote = self._remote[1]
-        con, proto, errors = self._reader._connect({PATH:remote}, 'demand')
+        con, proto, errors = self._connection()
+        tick=time.monotonic()
         try:
-            con.execute("SET memory_limit='256MB'")
-            con.execute("SET temp_directory=''")
             uri = f"'{proto}://{PATH}'"
+            if self._region is not None:
+                if not (self._region[0]<=bounds[0]<=bounds[2]<=self._region[2] and self._region[1]<=bounds[1]<=bounds[3]<=self._region[3]):
+                    raise ValueError('query outside staged source region')
+                if getattr(self,'_empty_region',False):return Snapshot(bounds,(),(),dict(self.selected))
+                w,s,e,n=bounds
+                rows=con.execute(f'''SELECT * EXCLUDE(bbox) FROM lc_region WHERE
+                    bbox.xmin <= {e!r} AND bbox.xmax >= {w!r} AND bbox.ymin <= {n!r} AND bbox.ymax >= {s!r}
+                    LIMIT {MAX_FEATURES+1}''').fetchall()
+                self.diagnostics['local_queries']+=1
+                if len(rows)>MAX_FEATURES:raise ResourceLimit('building partition feature budget exceeded')
+                return normalize([dict(zip(self._names,r)) for r in rows],bounds,self.selected,tolerant=self.tolerant)
             groups = self._groups(con,uri,remote,'demand')
-            schema = {r[0] for r in con.execute(f'DESCRIBE SELECT * FROM read_parquet({uri})').fetchall()}
+            if self._schema is None:self._schema={r[0] for r in con.execute(f'DESCRIBE SELECT * FROM read_parquet({uri})').fetchall()}
+            schema=self._schema
             if not {'id','geometry','bbox','building','version','timestamp'} <= schema:
                 raise ValueError('unsupported Layercake building schema')
             self.schema = tuple(sorted(schema))
             candidates = self._candidates(groups,bounds)
-            if not candidates: return Snapshot(bounds,(),(),dict(self.selected))
+            if not candidates:
+                if stage:
+                    # A tiny empty table with the same projection is unnecessary;
+                    # query() can return proven empty data without another scan.
+                    self._empty_region=True
+                    self._names=[]
+                    con.execute('CREATE TEMP TABLE lc_region (bbox STRUCT(xmin DOUBLE,ymin DOUBLE,xmax DOUBLE,ymax DOUBLE))')
+                    return
+                return Snapshot(bounds,(),(),dict(self.selected))
+            self.diagnostics.update(row_groups=len(groups),candidate_groups=candidates[:64],
+                candidate_rows=sum(groups[g]['n'] for g in candidates))
             wanted = {'id','geometry','bbox','version','timestamp','osm_type','type','building_id','parent_id'} | set(TAGS)
             self._reader._fetch({PATH:remote},{PATH:[r for rg in candidates for col,rs in groups[rg]['cols'].items()
                                                    if col in wanted for r in rs]},'demand')
@@ -233,15 +290,25 @@ class Reader(osmtags.OsmTags):
             expressions.append(f'({too_big}) AS _oversized_attributes')
             expressions.append('(octet_length(geometry) > 131072) AS _oversized_geometry')
             geometry='CASE WHEN octet_length(geometry) <= 131072 THEN geometry END AS geometry'
-            rows = con.execute(f'''SELECT {','.join(expressions)}, {geometry}
+            projection=f'{",".join(expressions)}, {geometry}'
+            scan=f'''SELECT {projection}{', bbox' if stage else ''}
                 FROM read_parquet({uri}, file_row_number=true) WHERE ({only}) AND {box}
-                LIMIT {MAX_FEATURES+1}''').fetchall()
+                LIMIT {50001 if stage else MAX_FEATURES+1}'''
+            self.diagnostics['remote_scans']+=1
+            self._names=columns+['_oversized_attributes','_oversized_geometry','geometry']
+            if stage:
+                con.execute('CREATE TEMP TABLE lc_region AS '+scan)
+                count=con.execute('SELECT count(*) FROM lc_region').fetchone()[0]
+                if count>50000:raise ResourceLimit('source staging feature capacity')
+                self.diagnostics.update(staged_rows=count,stage_seconds=round(time.monotonic()-tick,3))
+                return
+            rows = con.execute(scan).fetchall()
             if len(rows)>MAX_FEATURES: raise ResourceLimit('building partition feature budget exceeded')
             return normalize([dict(zip(columns+['_oversized_attributes','_oversized_geometry','geometry'],r)) for r in rows],bounds,self.selected,tolerant=self.tolerant)
         except Exception:
             if errors: raise errors[0]
             raise
-        finally: con.close()
+        finally:self.diagnostics['last_query_seconds']=round(time.monotonic()-tick,3)
 
 
 def normalize(rows, bounds, version, *, tolerant=False):

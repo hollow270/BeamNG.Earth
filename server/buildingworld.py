@@ -9,6 +9,8 @@ retrieval/merge primitives. No engine transactions, collider replacement or Lua 
 from dataclasses import dataclass,replace
 from collections import OrderedDict
 import logging
+import math
+import os
 from pathlib import Path
 import re
 import time
@@ -27,6 +29,7 @@ MAX_CELLS=4096
 MAX_OBJECTS=8192
 MAX_SESSIONS=1024
 WORLD_BYTES=512*1024**2
+READ_BUDGET_S=45.0
 
 
 def configured(cache):
@@ -51,10 +54,22 @@ def _store(cache):
     base=primary.Store(cache)
     store=object.__new__(primary.Store)
     store.directory=base.directory;store.root=base.root/'world';store.objects=store.root/'objects'
-    store.limits=primary.REGIONAL_LIMITS;store.lock_timeout=600.
-    for path in (store.root,store.objects,store.root/'sessions'):
+    # Bounded publication of two validated dense-cell JSON objects can take a
+    # few seconds on Windows. This is independent of the 45 s query deadline.
+    store.limits=primary.REGIONAL_LIMITS;store.lock_timeout=15.
+    for path in (store.root,store.objects,store.root/'sessions',store.root/'claims'):
         store._no_link(path);path.mkdir(exist_ok=True)
     return store
+
+
+def lease_store(store,name,timeout):
+    """A separate OS lease, never the world publication mutex."""
+    if name not in ('query-lane','query-network'):raise ValueError('unknown acquisition lease')
+    lease=object.__new__(primary.Store)
+    lease.directory=store.directory;lease.root=store.root/name;lease.limits=store.limits
+    lease.lock_timeout=max(.001,timeout)
+    store._no_link(lease.root);lease.root.mkdir(exist_ok=True)
+    return lease
 
 
 def start(cache,baseline):
@@ -113,12 +128,15 @@ def _load_object(store,digest,release):
 
 
 class Provider:
-    def __init__(self,md,session,*,reader_factory=None,wall=time.time,sleep=time.sleep):
+    def __init__(self,md,session,*,reader_factory=None,wall=time.time,sleep=time.sleep,runner=None):
         self.md,self.session=md,session
         self.store=_store(md.cache_dir)
-        self.reader_factory=reader_factory or (lambda:lc.Reader(Path(md.cache_dir)/'mapdata/raw',md.fetcher,
-                                                              tolerant=True,raw_budget=regions.RAW_BYTES))
+        self._default_reader_factory=lambda:lc.Reader(Path(md.cache_dir)/'mapdata/raw',md.fetcher,
+                                                      tolerant=True,raw_budget=regions.RAW_BYTES)
+        self.reader_factory=reader_factory or self._default_reader_factory
         self.wall,self.sleep=wall,sleep
+        self.inline_reader=reader_factory is not None  # deterministic fixture hook; production is supervised
+        self.runner=runner
         self.decoded=OrderedDict()
         self.cell_views=OrderedDict()
         self.path=self.store.root/'sessions'/(session.identity+'.json')
@@ -196,7 +214,17 @@ class Provider:
         except (ValueError,TypeError):raise fs.CorruptStorage('invalid pinned session ledger') from None
         return state
 
-    def _acquire(self,key,state,pinned):
+    def _pin_source(self,version):
+        primary.validate_version(version)
+        with self.store._locked():
+            latest=self._state()
+            if latest['source'] is None:
+                latest['source']=version
+                self.store._atomic_write(self.path,self.store._document(latest))
+            elif latest['source']!=version:raise ValueError('session source version changed during acquisition')
+        return latest
+
+    def _acquire(self,key,state,pinned,progress=lambda value:None):
         jobs=regions.Jobs(self.store);ledger=jobs.read()
         reader=None;box=key.bounds();results=[]
         # Previously acquired geometry in neighbouring cells is cache-first even
@@ -218,11 +246,13 @@ class Provider:
             if state['source'] is None:
                 version=reader.select(explicit=True)
                 primary.validate_version(version)
-                state['source']=version
                 # Durable source pin BEFORE querying geometry, shared by workers.
-                self.store._atomic_write(self.path,self.store._document(state))
+                state=self._pin_source(version)
             else:
                 version=state['source'];reader.attach(version)
+            progress(dict(phase='source_selected',source=version))
+            if hasattr(reader,'prepare_region'):reader.prepare_region(box)
+            progress(dict(phase='parquet_staged',diagnostics=getattr(reader,'diagnostics',{})))
             queue=regions.partition(box);index=0
             while index<len(queue):
                 bounds=queue[index];result=jobs.load(version,bounds)
@@ -252,6 +282,7 @@ class Provider:
                 filtered.append(replace(result,buildings=buildings,parts=tuple(p for p in result.parts if p.parent_id in ids)))
             before=replace(_empty(self.md.release),entries=tuple(e for e in pinned.values() if fs._intersects(e.bounds,influence)))
             observed={i for result in results for f in result.buildings+result.parts for i in bo._identities(f)}
+            progress(dict(phase='merging',partitions=len(queue),observed=len(observed)))
             saved,report,checks=regions.candidate(self.md,before,filtered,box,version,known_returned=observed)
             for check in checks:check.validate(self.md)
             prior={e.feature.feature_id:e for e in before.entries}
@@ -273,26 +304,140 @@ class Provider:
                 counts[action]+=1
             report['counts']=counts
             report.update(mode='world_first_visit',partitions=len(queue),coverage_complete=True,
-                          cached_identities_reused=len(observed & identities),freshness_checked=False)
+                          cached_identities_reused=len(observed & identities),freshness_checked=False,
+                          source_diagnostics=getattr(reader,'diagnostics',{}))
+            progress(dict(phase='validated',entries=len(saved.entries)))
             return saved,version,report
         finally:
             if reader is not None:reader.close()
 
-    def view(self,keys):
+    def _claim_path(self,key):
+        return self.store.root/'claims'/(fs._hash([self.session.identity,str(key)])+'.json')
+
+    def _claim(self,key):
+        value=self.store._read(self._claim_path(key))
+        if set(value)!={'session','cell','token','status','owner','expires'} or \
+                value['session']!=self.session.identity or value['cell']!=str(key) or \
+                not isinstance(value['token'],str) or not re.fullmatch('[0-9a-f]{32}',value['token']) or \
+                value['status'] not in ('pending','chosen') or type(value['owner']) is not int or value['owner']<=0 or \
+                type(value['expires']) not in (int,float) or not math.isfinite(value['expires']) or value['expires']<0:
+            raise fs.CorruptStorage('invalid acquisition claim')
+        return value
+
+    def claim_valid(self,key,token):
+        path=self._claim_path(key)
+        if not path.exists():return False
+        value=self._claim(key)
+        return value['token']==token and value['status']=='pending' and self.wall()<=value['expires']
+
+    def _pinned(self,state,keys):
+        manual_ids={i for e in self.session.baseline.entries for i in bo._identities(e.feature)}
+        entries={e.feature.feature_id:e for e in self.session.baseline.entries
+                 if any(fs._intersects(e.bounds,k.bounds()) for k in keys)}
+        for name,head in state['cells'].items():
+            if any(fs._intersects(state['influence'][name],k.bounds()) for k in keys):
+                for e in self.object(head).entries:
+                    if e.feature.feature_id not in entries and not set(bo._identities(e.feature)) & manual_ids:
+                        entries[e.feature.feature_id]=e
+        return entries
+
+    def _cooldown(self):
+        # Caller owns query-lane and has joined its child. No request-ledger
+        # writer can still be alive; the publication mutex is not held here.
+        with lease_store(self.store,'query-network',1.)._locked():
+            jobs=regions.Jobs(self.store);ledger=jobs.read()
+            ledger.update(clock=max(ledger['clock'],self.wall()),next_request=max(ledger['next_request'],self.wall()+60))
+            jobs.save(ledger)
+
+    def _resolve(self,key,deadline):
+        token=None
+        while True:
+            with self.store._locked():
+                state=self._state()
+                if str(key) in state['cells']:return
+                if str(key) in self._index()['cells']:
+                    cached=True
+                else:
+                    cached=False;path=self._claim_path(key)
+                    if not path.exists() and time.monotonic()<deadline:
+                        if len(list(path.parent.iterdir()))>=MAX_OBJECTS:raise fs.ResourceLimit('acquisition claim capacity')
+                        token=uuid.uuid4().hex
+                        self.store._atomic_write(path,self.store._document(dict(session=self.session.identity,cell=str(key),
+                            token=token,status='pending',owner=os.getpid(),expires=self.wall()+max(0,deadline-time.monotonic()))))
+                    elif path.exists():
+                        claim=self._claim(key)
+                        if claim.get('status')!='pending':
+                            raise fs.CorruptStorage('chosen acquisition claim has no session choice')
+                        if self.wall()>claim['expires']:break
+                pinned=self._pinned(state,(key,))
+            if cached:
+                self._choose((key,));return
+            if token is not None:break
+            if time.monotonic()>=deadline:break
+            self.sleep(min(.05,max(0,deadline-time.monotonic())))
+        if token is None:
+            self._choose((key,),TimeoutError('acquisition read budget exhausted while awaiting owner'))
+            return
+        started=time.monotonic()
+        try:
+            with lease_store(self.store,'query-lane',deadline-time.monotonic())._locked():
+                # Another reader may have chosen a safe fallback while this
+                # acquisition was queued. Never overwrite that immutable choice.
+                if self.ready((key,)):return
+                if time.monotonic()>=deadline:raise TimeoutError('acquisition read budget exhausted in queue')
+                try:
+                    if self.inline_reader or self.reader_factory is not self._default_reader_factory:
+                        acquired=self._acquire(key,state,pinned)
+                    elif self.md.fetcher.offline_flag:
+                        raise OSError('offline: Overture fallback frozen for this session')
+                    else:
+                        from buildingacquire import Runner
+                        request=dict(cache=str(self.md.cache_dir),release=self.md.release,offline=False,
+                            session=self.session,key=key,token=token,pinned=tuple(pinned.values()))
+                        def progress(value):log.info('OSM acquisition %s %.2fs: %s',key,time.monotonic()-started,value)
+                        acquired=(self.runner or Runner()).run(request,deadline,progress)
+                    if time.monotonic()>=deadline:raise TimeoutError('acquisition deadline before publication')
+                except (OSError,ValueError,RuntimeError) as error:
+                    acquired=error
+                    try:self._cooldown()
+                    except (OSError,ValueError):pass
+                self._choose((key,),acquired,token)
+        except fs.LockTimeout as error:
+            self._choose((key,),TimeoutError('acquisition lane deadline: '+str(error)))
+
+    def view(self,keys,*,preferred_bounds=None):
         keys=tuple(sorted(set(keys)))
         if any(k.z!=mapcells.ZOOM for k in keys):raise ValueError('world acquisition uses the ordinary map-data cell grid')
+        deadline=time.monotonic()+READ_BUDGET_S
+        order=keys
+        if preferred_bounds is not None:
+            w,s,e,n=fs._bounds(preferred_bounds);cx,cy=(w+e)/2,(s+n)/2
+            order=sorted(keys,key=lambda key:((key.center()[1]-cx)*math.cos(math.radians(cy)))**2+(key.center()[0]-cy)**2)
+        for key in order:self._resolve(key,deadline)
+        return self._commit(keys)
+
+    def _commit(self,keys,prepared=None,claim_token=None):
+        pinned,keys,heads=self._choose(keys,prepared,claim_token)
+        if pinned is None:pinned=self._pinned(self._state(),keys)
+        # Geometry conversion for rendering is private to this reader. It must
+        # never extend the shared publication critical section.
+        return self._view(pinned,keys,heads)
+
+    def _choose(self,keys,prepared=None,claim_token=None):
+        keys=tuple(sorted(set(keys)))
+        if any(k.z!=mapcells.ZOOM for k in keys):raise ValueError('world acquisition uses the ordinary map-data cell grid')
+        state=self._state()
+        if all(str(k) in state['cells'] for k in keys):
+            # Atomic ledger + immutable objects: ordinary cached reads need no
+            # exclusive writer mutex, including potentially costly decoding.
+            return None,keys,state['cells']
         with self.store._locked():
             state=self._state()
             manual_ids={i for e in self.session.baseline.entries for i in bo._identities(e.feature)}
             manual={e.feature.feature_id:e for e in self.session.baseline.entries
                     if any(fs._intersects(e.bounds,key.bounds()) for key in keys)}
             if all(str(k) in state['cells'] for k in keys):
-                pinned=dict(manual)
-                for key in keys:
-                    for e in self.object(state['cells'][str(key)]).entries:
-                        if e.feature.feature_id not in pinned and not set(bo._identities(e.feature)) & manual_ids:
-                            pinned[e.feature.feature_id]=e
-                return self._view(pinned,keys,state['cells'])
+                return None,keys,state['cells']
             index=self._index()
             pinned=dict(manual)
             frozen_keys={mapcells.parse(k) for k in state['cells']}
@@ -320,7 +465,11 @@ class Provider:
                     fallback,fallback_source=self.cached_entries(index,key.bounds())
                     try:
                         if len(index['cells'])>=MAX_CELLS:raise fs.ResourceLimit('persistent cell capacity')
-                        chosen,source,report=self._acquire(key,state,pinned)
+                        if isinstance(prepared,BaseException):raise prepared
+                        if prepared is None:raise TimeoutError('no acquisition result; fallback frozen')
+                        if claim_token is None or not self.claim_valid(key,claim_token):raise TimeoutError('acquisition result fenced')
+                        chosen,source,report=prepared
+                        if state['source']!=source:raise ValueError('acquisition source pin changed')
                         identities={i for e in chosen.entries for f in (e.feature,)+e.parts for i in bo._identities(f)}
                         if len(set(index['identities']) | identities)>regions.MAX_SOURCE_FEATURES:
                             raise fs.ResourceLimit('persistent OSM identity capacity')
@@ -336,13 +485,8 @@ class Provider:
                         chosen=replace(_empty(self.md.release),entries=tuple(fallback[k] for k in sorted(fallback)))
                         report=dict(mode='world_fallback',coverage_complete=False,error=str(error)[:512])
                         log.warning('OSM first visit %s: %s',name,report)
-                        try:
-                            jobs=regions.Jobs(self.store);ledger=jobs.read()
-                            ledger.update(clock=max(ledger['clock'],self.wall()),
-                                          next_request=max(ledger['next_request'],self.wall()+60))
-                            jobs.save(ledger)
-                        except (OSError,ValueError):pass  # uncertain ledger must never be reset
                 accepted=dict(pinned);deferred=0
+                previous=regions.SpatialEntries(pinned.values())
                 for e in chosen.entries:
                     fid=e.feature.feature_id
                     if fid in pinned or set(bo._identities(e.feature)) & manual_ids:continue
@@ -353,7 +497,7 @@ class Provider:
                     if any(fs._intersects(bo._bbox(e.feature.geometry),bo._bbox(old.feature.geometry)) and
                            bo._overlap(e.feature.geometry,bo._validated(e.feature.geometry)[0],
                                        old.feature.geometry,bo._validated(old.feature.geometry)[0])
-                           for old in pinned.values() if old.feature.status=='building'):
+                           for old in previous.near(bo._bbox(e.feature.geometry)) if old.feature.status=='building'):
                         deferred+=1;continue
                     accepted[fid]=e
                 if len(accepted)+sum(len(e.parts) for e in accepted.values())>primary.REGIONAL_LIMITS.max_entries:
@@ -376,9 +520,13 @@ class Provider:
                 state['cells'][name]=head
                 state['influence'][name]=fs._union([key.bounds()]+[e.bounds for e in local.entries])
                 self.store._atomic_write(self.path,self.store._document(state))
+                claim=self._claim_path(key)
+                if claim.exists():
+                    value=self.store._read(claim);value['status']='chosen'
+                    self.store._atomic_write(claim,self.store._document(value))
                 frozen[key]=local;frozen_keys.add(key);pinned=accepted
                 log.info('OSM cell %s: %s',name,report)
-            return self._view(pinned,keys,state['cells'])
+            return pinned,keys,state['cells']
 
 
 def saved_entries(cache,bounds,release,ignore=()):

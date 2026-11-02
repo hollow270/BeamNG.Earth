@@ -255,6 +255,15 @@ def _bbox(geometry):
 def _equivalent(a, b):
     if a is None or b is None:
         return False
+    # Hausdorff-equivalent rings must also have equivalent axis extrema in the
+    # local projections used below. Use the smaller longitude scale over both
+    # rings, so this is necessary for both the vertex and Hausdorff paths.
+    # Reject distant pairs without weakening the duplicate tolerance.
+    scale=111320.0*math.cos(math.radians(max(abs(p[1]) for ring in (a,b) for p in ring)))
+    for axis,metres in ((0,scale),(1,110540.0)):
+        if any(abs(fn(p[axis] for p in a)-fn(p[axis] for p in b))*metres > DUPLICATE_TOLERANCE_M+1e-8
+               for fn in (min,max)):
+            return False
     aa, bb = _xy(a, a[0]), _xy(b, a[0])
     if len(a) == len(b):
         for points in (bb, tuple(reversed(bb))):

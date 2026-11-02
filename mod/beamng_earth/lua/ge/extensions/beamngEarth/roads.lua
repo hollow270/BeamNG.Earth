@@ -1919,6 +1919,11 @@ M.PLAYER_DZ = 2.5   -- m above / below
 -- curb held the whole tile's sidewalk collision (one mesh a tile), and a tile made again while the car drove its
 -- streets had no solid sidewalks at all (the user, 2026-10-27: "sidewalks are missing collision", Fells Point)
 M.WALK_PLAYER_R = 0.0
+-- Building boxes already enclose the whole footprint, including empty corners of
+-- rotated/concave buildings. Adding the generic 3 m radius can hold a whole tile's
+-- bldcol while the car is safely outside a wall (Agadir, 2026-11-02). Keep the
+-- centre-inside-box protection, but do not expand building keep-out boxes again.
+M.BUILDING_PLAYER_R = 0.0
 M.DECK_BOX_BELOW_M = 2.2    -- a deck box's floor is this far under its lowest surface (server roads.collider_boxes:
                             -- roadmesh.DECK_DEPTH 1.2 + 1.0)
 M.DECK_ON_M = 0.2           -- the car's position this far under that surface or less: on the deck (not held)
@@ -1943,7 +1948,10 @@ playerIn = function(boxes, what, t)
     local x, y, z = pp.inv:apply(p.x, p.y, p.z)
     p = { x = x, y = y, z = z }
   end
-  local r, dz = (what == 'walk' or what == 'walkcol') and M.WALK_PLAYER_R or M.PLAYER_R, M.PLAYER_DZ
+  local building = type(what) == 'string' and what:sub(1, 3) == 'bld'
+  local r = (what == 'walk' or what == 'walkcol') and M.WALK_PLAYER_R
+    or building and M.BUILDING_PLAYER_R or M.PLAYER_R
+  local dz = M.PLAYER_DZ
   for _, b in ipairs(boxes) do
     if p.x >= b[1] - r and p.x <= b[4] + r and p.y >= b[2] - r and p.y <= b[5] + r then
       if what == 'deck' then
@@ -2391,9 +2399,15 @@ function M.status()
       for _, p in pairs(f.parts) do if p.id and not p.hidden then nf, ngShown = nf + 1, ngShown + 1 end end
     end
   end
+  local heldBuildings, heldInfo = 0, {}
+  for _, q in ipairs(held) do
+    if type(q.what) == 'string' and q.what:sub(1, 3) == 'bld' then heldBuildings = heldBuildings + 1 end
+    if #heldInfo < 8 then heldInfo[#heldInfo + 1] = { key = q.key, what = q.what } end
+  end
   return { enabled = M.enabled, tiles = nt, roads = no, queued = #createQ, deleting = #deleteQ, anchor = anchorId,
     walks = nw, roadMeshes = nr, decks = nd, buildings = nb, guardrailForestTiles = ngForest,
     guardrailForestRows = ngRows, farBuildings = nf, walksQueued = #walkQ, solidAround = M.solidAround or 0,
+    heldMeshes = #held, heldBuildingMeshes = heldBuildings, heldColliders = heldInfo, heldTruncated = #held > #heldInfo,
     urgentWalks = M.urgentWalks or 0, quietS = sinceChange() / 1000, error = lastError, units = unitStats, unitLog = unitLog,
     geo = M.geo or false, geoStats = M.geoStats, farGeo = M.farGeo or false, farGeoTiles = ngf,
     farGeoShown = ngShown }

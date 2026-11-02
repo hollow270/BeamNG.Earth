@@ -43,7 +43,7 @@ _s = None       # this process's state (init)
 
 class _State:
     def __init__(self, cache_dir, offline, roads, grading, road_widths, surface, airports=False, sea=False,
-                 gas_stations=False):
+                 gas_stations=False, building_snapshot=None):
         self.cache_dir = cache_dir
         import revisit
         revisit.CACHE_DIR = cache_dir
@@ -54,7 +54,7 @@ class _State:
         _railways.COARSE_AT = self.dem.coarse_at
         # runways graded in (--airports on): the copy the server loaded, never refreshed here
         self.airports = load_airports(cache_dir, self.dem) if airports else None
-        md = mapdatamod.MapData(cache_dir, fetcher=net) if (roads or surface or sea) else None
+        md = mapdatamod.MapData(cache_dir, fetcher=net, building_snapshot=building_snapshot) if (roads or surface or sea) else None
         if md is not None:
             md.dem = self.dem       # (gradesep's ground)
         # the sea's and the lakes' floors carved in (--sea on)
@@ -150,7 +150,7 @@ def _trace_memory(every_s=60.0, top=10):
 
 
 def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_level=logging.INFO, airports=False,
-         sea=False, nice=0, roads_in_ground=None, gas_stations=False):
+         sea=False, nice=0, roads_in_ground=None, gas_stations=False, building_snapshot=None):
     """nice: this worker's niceness on top of the server's (earthd NICE_*): the terrain blocks' workers keep the
     server's own, the road tiles' and the far field's run below them, so the ground under the car wins the server's
     few cores (2026-10-19: at 180 mph the next block waited 6 s behind the road tiles ahead and a ball fell off the
@@ -173,7 +173,7 @@ def init(cache_dir, offline, roads, grading, road_widths, surface, warm_q, log_l
     import sampler
     sampler.maybe_start(f".{os.getpid()}")      # BNGE_SAMPLE: this worker's own sampling profile (debugging)
     xproc.PRIORITY = nice
-    _s = _State(cache_dir, offline, roads, grading, road_widths, surface, airports, sea, gas_stations)
+    _s = _State(cache_dir, offline, roads, grading, road_widths, surface, airports, sea, gas_stations, building_snapshot)
     threading.Thread(target=_watch_parent, args=(os.getppid(),), daemon=True, name="parent-watch").start()
     if warm_q is not None:      # (only the block pools plan roads ahead: the far, road and far building pools pass None)
         threading.Thread(target=_read_warm, args=(warm_q,), daemon=True, name="warm-read").start()
@@ -532,7 +532,7 @@ def _md_versions():
     return _s.md.versions() if _s.md is not None else None
 
 
-def building_versions(md, frame, box, enabled=True):
+def building_versions(md, frame, box, enabled=True, kind=None):
     """Offline cache identity for building-bearing output; baseline versions never change.
 
     Include the density neighbourhood, but no unrelated world-wide overlay revision.
@@ -541,8 +541,21 @@ def building_versions(md, frame, box, enabled=True):
     versions = md.versions() if md is not None else None
     if not enabled or not getattr(md, "building_overlays_active", False):
         return versions
-    dependency = md.building_dependencies(building_cells(frame, box))
+    dependency = md.building_dependencies(building_cells(frame, box),render_bounds=building_render_bounds(frame,box,kind))
     return dict(versions, building_overlay=dependency.revision) if dependency.revision is not None else versions
+
+
+def building_render_bounds(frame, box, kind=None):
+    """Actual render reads: density neighbourhood only where the renderer uses it."""
+    import buildings
+    x0,y0,x1,y1=box
+    la,lo,_=frame.enu_to_geodetic((x0+x1)/2,(y0+y1)/2,0.)
+    margin=5.0  # conservative centroid/projection/boundary guard
+    if kind not in ('skyline','bldsky') and bool(surfacemod.dry_west(float(la),float(lo))):
+        margin+=buildings.DISTRICT_M
+    la,lo,_=frame.enu_to_geodetic(np.array([x0-margin,x1+margin,x0-margin,x1+margin]),
+                                 np.array([y0-margin,y0-margin,y1+margin,y1+margin]),0.)
+    return float(lo.min()),float(la.min()),float(lo.max()),float(la.max())
 
 
 def building_cells(frame, box):
@@ -926,9 +939,9 @@ def _content_hash(text, vfs_dir):
     return hashlib.sha1(text.replace(f"{vfs_dir}/", "@V@/").encode("utf-8")).hexdigest()[:16]
 
 
-def _building_content_hash(text, vfs_dir, out_dir, names, frame, box):
+def _building_content_hash(text, vfs_dir, out_dir, names, frame, box, kind=None):
     """Overlay content identity includes mesh bytes, even if all JSON bounds/counts stay the same."""
-    if not (building_versions(getattr(_s, "md", None), frame, box) or {}).get("building_overlay"):
+    if not (building_versions(getattr(_s, "md", None), frame, box,kind=kind) or {}).get("building_overlay"):
         return _content_hash(text, vfs_dir)
     import hashlib
     h = hashlib.sha1(text.replace(f"{vfs_dir}/", "@V@/").encode("utf-8"))
@@ -1527,7 +1540,7 @@ def skyline_tile(aid, lat, lon, zoom, ux, uy, out_dir, vfs_dir, lamp_region=None
     sx0, sy0, _, _ = roadsmod_tile_bbox(ux * u, uy * u)
     _, _, sx1, sy1 = roadsmod_tile_bbox(ux * u + u - 1, uy * u + u - 1)
     k = revisit.key("bldsky", round(float(lat), 7), round(float(lon), 7), zoom, ux, uy,
-                    building_versions(_s.md, frame, (sx0, sy0, sx1, sy1)), lamp_region)
+                    building_versions(_s.md, frame, (sx0, sy0, sx1, sy1),kind='skyline'), lamp_region)
     return _revisit_tile("bldsky", k, aid, ux, uy, out_dir, vfs_dir, f"bldsky_{aid}_{ux}_{uy}.json",
                          lambda: buildingsmod.skyline_tile(frame, ux, uy, _s.md,
                                                            lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, zoom)),
@@ -1695,7 +1708,7 @@ def far_geo(kind, gx, gy, gzoom, out_dir, vfs_dir, lamp_region=None):
     tile = geotiles.geobox(gx, gy, z)
     names = far_geo_names(kind, tile.key)
     k = revisit.key(kind, "g", tile.key, int(gzoom),
-                    building_versions(_s.md, tile.frame, tile.box, kind != "brfar"), lamp_region)
+                    building_versions(_s.md, tile.frame, tile.box, kind != "brfar",kind=kind), lamp_region)
     frame_ll = (float(tile.frame.lat0), float(tile.frame.lon0))
     got = revisit.load(_s.cache_dir, kind, k)
     if got is not None:
@@ -1713,7 +1726,7 @@ def far_geo(kind, gx, gy, gzoom, out_dir, vfs_dir, lamp_region=None):
         return None
     data, shapes, n = res
     text = json.dumps(data, separators=(",", ":"), sort_keys=True)
-    data["h"] = _building_content_hash(text, vfs_dir, out_dir, shapes.values(), tile.frame, tile.box) \
+    data["h"] = _building_content_hash(text, vfs_dir, out_dir, shapes.values(), tile.frame, tile.box,kind=kind) \
         if kind != "brfar" else _content_hash(text, vfs_dir)
     text = json.dumps(data, separators=(",", ":"), sort_keys=True)
     _write_bytes(os.path.join(out_dir, names["json"]), text.encode("utf-8"))

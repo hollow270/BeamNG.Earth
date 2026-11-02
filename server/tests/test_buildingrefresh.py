@@ -164,6 +164,8 @@ class RefreshTest(unittest.TestCase):
         self.assertEqual(self.entry(request)[0]["mesh_digest"], added["mesh_digest"])
 
     def test_unaffected_outputs_retain_the_same_files_and_identity_and_density_neighbours_rebuild(self):
+        # District density is a real render dependency only in an arid region.
+        mock.patch('surface.dry_west',return_value=True).start()
         request = self.setup_worker()
         neighbour, distant = replace(request, x=3), replace(request, x=12)
         self.coordinator.refresh([request, neighbour, distant])

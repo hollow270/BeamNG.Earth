@@ -15,6 +15,13 @@ import launcher  # noqa: E402
 FP = (".var", "app", "com.valvesoftware.Steam")
 
 
+def setUpModule():
+    # A missed platform mock must never open Steam or a real game during tests.
+    guard=mock.patch.object(os,'startfile',side_effect=AssertionError('external application launch forbidden in tests'),create=True)
+    guard.start()
+    unittest.addModuleCleanup(guard.stop)
+
+
 def touch(path, mtime=None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w").close()
@@ -323,6 +330,7 @@ class SteamRunningTest(unittest.TestCase):
         self.assertFalse(self.run_it({}, {500: "steamwebhelper", 501: "kwin"}))
 
 
+@unittest.skipIf(os.name == 'nt', 'Linux direct-start fixtures do not mock Windows Steam launching')
 class DirectStartAdoptsOptionsTest(unittest.TestCase):
     """The direct start applies the launch options' variables to the game's environment and appends their options
     (through Steam, Steam applies them itself: nothing passed on)."""

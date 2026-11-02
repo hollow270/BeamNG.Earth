@@ -1,5 +1,9 @@
 # Manual live OSM building overlays — Stage 5B2
 
+For the simpler opt-in refresh-before-startup workflow, see
+[Restart-based OSM buildings](RESTART_OSM_BUILDINGS.md). That mode uses ordinary
+streaming from a fixed session snapshot and disables the live controls below.
+
 Stage 5B2 connects the existing conservative merge, persistent store, controlled
 retrieval, immutable mesh generations and building activation controller to the
 World Map. This is an opt-in development feature. **No installed game was changed

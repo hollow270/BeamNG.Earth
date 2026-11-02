@@ -1251,6 +1251,8 @@ class Server:
         requests: bounded buildingrefresh.TileRequest objects, retained for later local refreshes.
         Existing road/far pools do the work; no new compute pool or game message is introduced.
         """
+        if self.__dict__.get('_building_startup') is not None:
+            raise RuntimeError('startup mode freezes buildings until the next full restart')
         import buildingrefresh
         if self.mapdata is None or self.mapdata._building_store is None or not self.buildings:
             raise ValueError("building overlays must be explicitly configured")
@@ -1292,6 +1294,8 @@ class Server:
 
     def activate_building_overlays(self, connection, publication, *, manual=False):
         """Owning-thread API; the live controller uses this with its copied World facade."""
+        if self.__dict__.get('_building_startup') is not None:
+            return dict(state='rejected',game_activated=False,error=dict(type='RestartRequired',message='Restart mode does not activate live building replacements.'))
         import buildingactivation
         try:
             manager = self.__dict__.get("_building_activation")
@@ -4027,13 +4031,19 @@ class Connection:
     def dispatch(self, msg):
         kind = msg["type"]
         if kind == "hello":
+            if self.s.__dict__.get('_building_startup') is not None:
+                import buildingstartup
+                if not buildingstartup.fresh_connection(self.s,msg):
+                    self.status('Restart mode requires a fresh game process; close BeamNG.drive and restart the application.')
+                    self.writer.close()
+                    return
             live=self.s.__dict__.get("_building_live")
             if live is not None:
                 live.context_changed(self)
             manager = self.s.__dict__.get("_building_activation")
             if manager is not None:
                 manager.context_changed(self)
-            self.building_activation = 1 if msg.get("buildingActivation")==1 and type(msg.get("buildingActivation")) is int else 0
+            self.building_activation = 1 if self.s.__dict__.get('_building_startup') is None and msg.get("buildingActivation")==1 and type(msg.get("buildingActivation")) is int else 0
             self.building_epoch = __import__("uuid").uuid4().hex if self.building_activation else None
             self.building_batches = 1 if msg.get("buildingBatches")==1 and type(msg.get("buildingBatches")) is int else 0
             self.building_recovery_error = None
@@ -4060,6 +4070,8 @@ class Connection:
                  "nearVisual": self.s.near_visual, "attribution": self.s.attribution()}
             if self.building_activation:
                 m.update(buildingActivation=1,buildingEpoch=self.building_epoch)
+            if self.s.__dict__.get('_building_startup') is not None:
+                m.update(buildingControl=0,buildingControlReason='Buildings refresh before startup; live replacement is disabled.')
             if live is not None:
                 m.update(live.hello(self,msg))
                 if self.__dict__.get("building_control_denied"):
@@ -5550,6 +5562,16 @@ class Connection:
 
 
 async def main_async(args):
+    primary_mode=os.environ.get('BNGE_OSM_PRIMARY') == 'layercake'
+    startup_path=os.environ.get('BNGE_OSM_STARTUP_CONFIG')
+    startup_config=None
+    if startup_path and not primary_mode:
+        import buildingstartup
+        startup_config=buildingstartup.Config.read(startup_path)
+        if args.roads!='on' or args.buildings!='on':
+            raise ValueError('startup OSM buildings require roads and buildings enabled')
+    if primary_mode and (args.roads!='on' or args.buildings!='on'):
+        raise ValueError('primary OSM buildings require roads and buildings enabled')
     fmt = args.far_format
     if fmt == "cdae":
         v = cdae.engine_version(args.user_dir)
@@ -5567,8 +5589,34 @@ async def main_async(args):
     threading.Thread(target=prune_own_caches, args=(args.cache_dir, time.time()), daemon=True,
                      name="cache-prune").start()
     # map data (mapdata.py): land cover for the surfaces, roads; one instance shares its cache locks
-    mapdata = (mapdatamod.MapData(args.cache_dir, fetcher=net)
+    mapdata = (mapdatamod.MapData(args.cache_dir, fetcher=net,building_overlays=False if startup_config is not None or primary_mode else None)
                if "on" in (args.surface, args.roads, args.sea, args.trees) else None)
+    frozen_buildings=None
+    startup_report=None
+    primary_lease=None
+    if primary_mode:
+        from contextlib import ExitStack
+        import buildingprimary
+        primary_lease=ExitStack()
+        try:
+            primary_lease.enter_context(buildingprimary.Store(args.cache_dir).session())
+            # Also release on failures during pool/listener construction, before
+            # the normal server-shutdown finally block has been reached.
+            asyncio.current_task().add_done_callback(lambda task: primary_lease.close())
+            frozen_buildings,startup_report=buildingprimary.cached(mapdata,args.cache_dir)
+            mapdata.pin_buildings(frozen_buildings)
+        except BaseException:
+            primary_lease.close()
+            mapdata.close(); net.close(); disk.close()
+            raise
+    elif startup_config is not None:
+        # Barrier: no listener, worker, saved-area job or streaming task exists yet.
+        try:
+            frozen_buildings,startup_report=buildingstartup.prepare(mapdata,args.cache_dir,startup_config)
+            mapdata.pin_buildings(frozen_buildings)
+        except BaseException:
+            mapdata.close(); net.close(); disk.close()
+            raise
     pacer.DUTY = args.background_duty
     global DETAIL_RING_M, AHEAD_ON, ROUTE_AHEAD_ON, ROUTE_AHEAD_MAX_M
     DETAIL_RING_M = args.detail_ring
@@ -5587,14 +5635,14 @@ async def main_async(args):
                           args.grading == "on" and args.roads == "on",
                           args.road_widths == "on" and args.roads == "on", args.surface == "on", warm_q,
                           logging.getLogger().level, args.airports == "on", args.sea == "on", 0,
-                          roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on")), warm_q))
+                          roadsmod.ROADS_IN_GROUND, args.gas_stations == "on" and args.roads == "on",frozen_buildings)), warm_q))
         far_pool = poolsmod.RespawningPool(
             "far tile", args.workers, mp_context=ctx, initializer=blockworker.init,
             initargs=(args.cache_dir, args.offline, args.roads == "on",
                       args.grading == "on" and args.roads == "on",
                       args.road_widths == "on" and args.roads == "on", False, None,
                       logging.getLogger().level, args.airports == "on", args.sea == "on", NICE_FAR,
-                      roadsmod.ROADS_IN_GROUND))
+                      roadsmod.ROADS_IN_GROUND,False,frozen_buildings))
     if far_pool is not None:
         # compute sharing: far tiles to helpers (--peers) and, in a BeamMP group, split with the players on our anchor,
         # built with the same settings as these workers (peerwork.py)
@@ -5617,14 +5665,16 @@ async def main_async(args):
             "road tile", args.road_processes, mp_context=ctx, initializer=blockworker.init,
             initargs=(args.cache_dir, args.offline, True, args.grading == "on", args.road_widths == "on",
                       args.surface == "on", None, logging.getLogger().level,
-                      args.airports == "on", args.sea == "on", NICE_ROADS, roadsmod.ROADS_IN_GROUND))
+                      args.airports == "on", args.sea == "on", NICE_ROADS, roadsmod.ROADS_IN_GROUND,
+                      False,frozen_buildings))
     far_bld_pool = None
     if road_pool is not None and args.buildings == "on":
         far_bld_pool = poolsmod.RespawningPool(   # far building tiles (blockworker.far_buildings_tile)
             "far building", 1, mp_context=ctx, initializer=blockworker.init,
             initargs=(args.cache_dir, args.offline, True, args.grading == "on", args.road_widths == "on",
                       args.surface == "on", None, logging.getLogger().level,
-                      args.airports == "on", args.sea == "on", NICE_FAR_BUILDINGS, roadsmod.ROADS_IN_GROUND))
+                      args.airports == "on", args.sea == "on", NICE_FAR_BUILDINGS, roadsmod.ROADS_IN_GROUND,
+                      False,frozen_buildings))
     server = Server(args.user_dir, args.cache_dir, args.workers, kfun, args.hysteresis, args.far_radius, fmt,
                     imagery=args.imagery, near_visual=args.near_visual, tex_near=args.tex_near,
                     tex_far=args.tex_far, tone=args.tone, near_radii=radii,
@@ -5650,8 +5700,11 @@ async def main_async(args):
                     sea=seacarvemod.SeaCarver(mapdata, args.cache_dir) if args.sea == "on" else None,
                     vegetation=(vegetationmod.Vegetation(mapdata, args.cache_dir) if args.trees == "on" else None))
     server.update_check = args.update_check == "on"
-    import buildinglive
-    buildinglive.install_from_environment(server)
+    if startup_report is not None:
+        server._building_startup=startup_report
+    else:
+        import buildinglive
+        buildinglive.install_from_environment(server)
     server.geo_tiles = args.geo_tiles == "on"
     server.global_far = args.global_far == "on"
     server.lod_px = args.lod_px
@@ -5778,6 +5831,8 @@ async def main_async(args):
             await server._building_live.close()
         net.close()                 # today's request counters
         disk.close()                # the cache's last uses
+        if primary_lease is not None:
+            primary_lease.close()
 
 
 # (shared world building, commented out 2026-10-27 (off since 2026-10-23; the user: not coming back for a while))

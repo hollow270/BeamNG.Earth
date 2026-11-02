@@ -245,6 +245,8 @@ def echo_lines(lines, state):
         if "client connected" in line and not state.get("connected"):
             state["connected"] = True
             out.append("  Game          connected to the world server")
+        elif record and ' INFO earthd.osm_startup: OSM startup: ' in line:
+            out.append('  OSM buildings  ' + line.split('OSM startup: ',1)[1])
         elif state.get("tb") or (record and any(k in line for k in ECHO_LEVELS)):
             out.append("  server: " + (line[11:] if record else line))
     return out
@@ -1321,6 +1323,10 @@ def run(args):
     row("Game folder", user_dir + ("  (the Windows build, Proton)" if build == "proton" else "")
         + (f"  (Steam compatibility tool: {tool})" if tool else ""))       # (which was read: GitHub #56)
     running = game_alive()
+    if running and (os.environ.get('BNGE_OSM_STARTUP_CONFIG') or os.environ.get('BNGE_OSM_PRIMARY') == 'layercake'):
+        problem('Restart-based OSM refresh requires BeamNG.drive to be closed first.',
+                'Close the game and companion, then start BeamNG.Earth again.')
+        sys.exit(1)
     if not running:
         install.clear_reload_files(user_dir)
     reload_game = False

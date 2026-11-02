@@ -523,7 +523,13 @@ class OverlayStore:
                         raise BaselineMismatch(f"original baseline building/parts missing or changed: {fid}")
                 elif fid in buildings:
                     raise BaselineMismatch(f"addition now collides with baseline ID: {fid}")
-                buildings[fid] = deepcopy(entry.feature)
+                # Positive suppression entries are supplied only by the separate
+                # primary-source snapshot validator. The legacy v1 loader/merge
+                # still rejects deleted records; absence never creates one.
+                if entry.feature.status == "deleted":
+                    buildings.pop(fid, None)
+                else:
+                    buildings[fid] = deepcopy(entry.feature)
                 parts = {k: p for k, p in parts.items() if p.parent_id != fid}
                 parts.update({p.feature_id: deepcopy(p) for p in entry.parts})
         return tuple(buildings[k] for k in sorted(buildings)), tuple(parts[k] for k in sorted(parts))

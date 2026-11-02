@@ -144,9 +144,11 @@ class BuildingView:
     def relevant(self, key):
         return tuple(e for e in self.snapshot.entries if _intersects(e.bounds, key.bounds())) if self.active else ()
 
-    def dependency(self, keys):
+    def dependency(self, keys, *, render_bounds=None):
         keys = tuple(sorted(set(keys), key=str))
         entries = {e.feature.feature_id: e for k in keys for e in self.relevant(k)}
+        if render_bounds is not None:
+            entries = {fid:e for fid,e in entries.items() if _intersects(e.bounds,render_bounds)}
         if not entries:
             return Dependency()
         full, geo = [], []
@@ -154,6 +156,9 @@ class BuildingView:
             full.append([fid, bo.MergeResult((e.feature,), e.parts, ()).digest(), e.baseline_digest, e.bounds])
             geo.append([fid, bo.geometry_digest(e.feature.geometry),
                         [(p.feature_id, bo.geometry_digest(p.geometry)) for p in e.parts], e.bounds])
+            if e.feature.status == "deleted":
+                full[-1].append("suppressed")
+                geo[-1].append("suppressed")
         return Dependency(_hash(full), _hash(geo), tuple(sorted(entries)))
 
     def _validate(self, md, entry, kind):
@@ -180,7 +185,7 @@ class BuildingView:
                     if record.feature_id in target and bo._json(target[record.feature_id].__dict__) != bo._json(record.__dict__):
                         raise BaselineMismatch("neighbouring baseline cells disagree on an overlay original")
                     target[record.feature_id] = record
-                if layer == "buildings":
+                if layer == "buildings" and entry.feature.status != "deleted":
                     candidates = []
                     for i, other_id in enumerate(f.ids):
                         if str(other_id) == fid:
@@ -230,7 +235,8 @@ class BuildingView:
             if f is None:
                 raise BaselineMismatch("baseline buildings unavailable for rendering")
             remove = {e.feature.feature_id for e in entries if e.baseline_digest is not None}
-            present = [e for e in entries if _intersects(bo._bbox(e.feature.geometry), base.bounds)]
+            present = [e for e in entries if e.feature.status == "building" and
+                       _intersects(bo._bbox(e.feature.geometry), base.bounds)]
             token = self.dependency((base.key,)).revision
             layers = {"buildings": _combine(f, remove, [e.feature for e in present], base.key, base.frame, token,
                                            self.render_attrs)}

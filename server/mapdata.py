@@ -246,7 +246,7 @@ class MapData:
     release: the Overture release (overture.RELEASE)."""
 
     def __init__(self, cache_dir=DEFAULT_CACHE, fetcher=None, release=overture.RELEASE,
-                 threads=overture.DUCKDB_THREADS, building_overlays=None):
+                 threads=overture.DUCKDB_THREADS, building_overlays=None, building_snapshot=None):
         self.cache_dir = cache_dir
         self.fetcher = fetcher if fetcher is not None else netfetch.Fetcher()
         self.release = release
@@ -257,7 +257,9 @@ class MapData:
         overlay = os.environ.get("BNGE_BUILDING_OVERLAY_DIR") if building_overlays is None else building_overlays
         if overlay is None and os.environ.get("BNGE_OSM_BUILDINGS")=="on":
             overlay = os.path.join(cache_dir,"building-overlays")
-        if overlay:
+        if building_snapshot is not None:
+            self.pin_buildings(building_snapshot)
+        elif overlay:
             from buildingoverlaystore import OverlayStore
             from buildingrender import BuildingView
             self._building_store = overlay if isinstance(overlay, OverlayStore) else OverlayStore(overlay)
@@ -293,6 +295,13 @@ class MapData:
         view = self._building_context.get() or self._building_view
         return view is not None and view.active
 
+    def pin_buildings(self, snapshot):
+        """Startup only: freeze one revision before submitting any world jobs."""
+        from buildingrender import BuildingView
+        if self._building_view is not None:
+            raise RuntimeError('building snapshot was already selected')
+        self._building_view = BuildingView(None, self.release, snapshot=snapshot)
+
     def building_snapshot(self, snapshot):
         """Thread-local pinned view for one generation job; baseline and other jobs remain unchanged."""
         from contextlib import contextmanager
@@ -318,11 +327,11 @@ class MapData:
         view = self._building_context.get() or self._building_view
         return view.cell(self, base, kind) if view is not None and view.active else base
 
-    def building_dependencies(self, keys):
+    def building_dependencies(self, keys, *, render_bounds=None):
         """Local effective-building tokens; not a global pipeline version or invalidation operation."""
         from buildingrender import Dependency
         view = self._building_context.get() or self._building_view
-        return view.dependency(keys) if view is not None and view.active else Dependency()
+        return view.dependency(keys,render_bounds=render_bounds) if view is not None and view.active else Dependency()
 
     def _rails(self, key, layer, feats):
         """The roads layer's rail segments with OSM's railway tags (railtags.py), once per build of them."""

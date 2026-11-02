@@ -133,7 +133,7 @@ class TileRequest:
         import blockworker
         import revisit
         frame, box = self.geometry()
-        versions = blockworker.building_versions(md, frame, box)
+        versions = blockworker.building_versions(md, frame, box,kind='skyline' if self.kind.startswith('skyline') else None)
         return revisit.key("building-generation", self.wire(), versions), (versions or {}).get("building_overlay")
 
     def execute(self, out_dir, vfs_dir):

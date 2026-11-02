@@ -1,0 +1,22 @@
+{
+  "attribution": "© OpenStreetMap contributors, ODbL-1.0; extracted by bounded range reads on 2026-11-01",
+  "source": {
+    "etag": "\"77b2a651e741fc3e3dc73b1de33bda93-8813\"",
+    "size": 46201191041,
+    "last_modified": "2026-11-01T14:35:59Z",
+    "url": "https://data.openstreetmap.us/layercake/buildings.parquet"
+  },
+  "row": {
+    "id": 1572086438,
+    "type": "way",
+    "version": 2,
+    "timestamp": "2026-10-28T00:57:56Z",
+    "building": "house",
+    "building:levels": "3",
+    "roof:shape": "flat",
+    "geometry": {
+      "type": "Polygon",
+      "coordinates": [[[-9.5524776,30.4128906],[-9.5525223,30.412849],[-9.5524383,30.412782],[-9.5523625,30.4128526],[-9.5524281,30.4129049],[-9.5524592,30.412876],[-9.5524776,30.4128906]]]
+    }
+  }
+}

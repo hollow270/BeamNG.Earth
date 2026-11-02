@@ -1,9 +1,11 @@
 # Refresh before startup
 
 The newer [explicit Layercake building preparation](LAYERCAKE_BUILDINGS.md) is the
-current developer workflow. It selects freshness only on user request and reuses
+current worldwide workflow. It selects freshness only on user request and reuses
 saved data on normal startup. The saved-area/automatic workflow below is retained
-as historical implementation; `BNGE_OSM_PRIMARY=layercake` takes precedence.
+as historical implementation. The worldwide session ledger adds immutable choices
+for first-visit cells before generation; the invariants below describe the older
+fixed-at-startup mode, not a requirement to prepare each new place manually.
 
 This opt-in mode refreshes explicitly authorized saved areas before any world
 workers, saved-area preparation or game listener start. It uses the existing OSM

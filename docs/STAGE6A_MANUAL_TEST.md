@@ -171,7 +171,7 @@ These steps are for the **user to execute later**. Codex has not performed them.
    uses that same layout. `-bngeport` is read by this mod's existing `net.lua`.
    There is no automatic game launch script in the kit.
 4. On this first, mod-free startup, decline any migration/import prompt. Open the
-   developer console in **GE Lua** context and run `print(getUserPath())`. It must
+   developer console in **GE Lua** context and run `print(FS:getFileRealPath("/"))`. It must
    resolve to exactly `$stage6Profile` (slash/case normalization is fine). Check the
    game log header as well. If it differs, **stop and close the game**; do not copy
    the mod or alter another folder. The real engine's handling of the flag has not
@@ -201,7 +201,7 @@ These steps are for the **user to execute later**. Codex has not performed them.
    **STAGE 6A SYNTHETIC ONLY**, loopback **47623**, and the expected test profile.
    A port-in-use error is a blocker; do not connect to or kill an unrelated server.
    The normal `run/` tree is created only when this explicit launcher is run.
-7. Launch the game again with the same one-session arguments. Verify `getUserPath()`
+7. Launch the game again with the same one-session arguments. Verify `FS:getFileRealPath("/")`
    again. The test profile should contain only this mod; avoid BeamMP, multiplayer,
    repository downloads and external map/search actions during the test.
 

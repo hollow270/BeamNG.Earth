@@ -18,5 +18,5 @@ r.ioPopen = tostring(io and io.popen)
 r.osExecute = tostring(os and os.execute)
 r.jit = jit and jit.version or 'nil'
 r.BNGWebWSServer = type(BNGWebWSServer)
-r.FS_userPath = FS and FS.getUserPath and FS:getUserPath() or '?'
+r.FS_userPath = FS and FS:getFileRealPath('/') or '?'
 return jsonEncode(r)

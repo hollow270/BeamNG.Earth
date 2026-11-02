@@ -1,140 +1,166 @@
-# Explicit pre-game OSM building preparation
+# OSM-primary buildings v1 — BeamNG.drive 0.40.1.0
 
-This developer milestone uses the selected worldwide Layercake buildings GeoParquet
-source. It prepares a small Agadir neighbourhood, then uses the existing ordinary
-building generation pipeline. Roads, infrastructure, terrain, elevation and imagery
-keep their existing sources. There is no live activation or graphical update button.
+This is the maintained user guide. Historical Stage 6 and saved-area documents
+are evidence, not the current workflow. Roads, road widths, grading and terrain
+continue to use the original Overture inputs.
 
-## Explicit operation and normal startup
+## Enable once, then travel anywhere
 
-Use the application's Python environment with `server/requirements.txt` installed.
-Close the companion and game before preparation. This command only prepares data;
-it does not install a mod or launch an application:
+Use the normal companion application's Python environment (or its packaged
+executable) and your chosen download cache. Close the game and companion before
+changing configuration. Read the Layercake distribution's current usage policy
+and confirm that your intended usage is permitted. No public Overpass backend,
+endpoint rotation, credentials or planet download is involved.
 
 ```powershell
-$env:BNGE_OSM_PRIMARY = 'layercake'
-$osmCache = Join-Path $PWD '.venv\layercake-agadir\cache'
-python server/buildingprimary.py --cache-dir $osmCache --location agadir --confirm-source-policy
+python launcher.py --cache-dir 'D:\BeamNG-Earth-cache' --osm-buildings-enable --osm-source-policy-confirmed
+python launcher.py --cache-dir 'D:\BeamNG-Earth-cache' --no-beammp
 ```
 
-The confirmation flag records the caller's authorization to use the selected source
-under its applicable policy; it is not a substitute for permission from a provider.
-No public Overpass request is involved. The source is fixed to:
-`https://data.openstreetmap.us/layercake/buildings.parquet`.
+Enabling exits without installing or launching anything. It does NOT prepare a
+city. On normal launches, saved building data is reused without a freshness check.
+Teleport or drive using the existing map. Unknown geographic cells automatically
+retrieve supported OSM buildings from the worldwide Layercake distribution at
+`https://data.openstreetmap.us/layercake/buildings.parquet`, before their ordinary
+building geometry is generated. Known cells, including empty completed cells,
+are cache-first across restarts. The first unknown cell may select the source's
+publication; it does not refresh already accepted building identities nearby.
 
-On a subsequent application launch, keep `BNGE_OSM_PRIMARY=layercake` and configure
-the launcher with **the same cache directory**. Normal startup reads only saved
-building data and validates its original baseline. It never checks Layercake's
-current ETag, publication date, or data. This mode takes precedence over the earlier
-`BNGE_OSM_STARTUP_CONFIG` saved-area workflow and bypasses live activation. A fresh
-game process is required. Preparation is excluded by an OS lease while the companion
-is using the selected snapshot. Existing general streaming/collision safety remains.
+The existing launcher still manages normal application startup. For a non-Steam
+game, select its installation with the existing `--game-dir` option. Never use a
+Steam URI for a non-Steam installation. No new game UI button is required.
 
-The fixed developer neighbourhood is west/south/east/north
-`[-9.5552, 30.4119, -9.5516, 30.4136]`, including both supplied points. Internal z18
-partition IDs are reported; coverage remains the exact requested bbox, not a claim
-that every intersecting cell was fully fetched. This first bounded job is suitable
-for a later city queue, not an implementation of city-wide scheduling or a final UI.
+## Explicit freshness update, before the next session
 
-## Reader, ownership and persistence
+Close the game and companion. Select a place with the existing in-game map before
+closing, then use its saved position; alternatively provide latitude/longitude:
 
-- `layercakebuildings.py` reuses `osmtags.OsmTags` row-group metadata/candidate logic,
-  `overture.Reader`'s configured DuckDB/fsspec connection and range prefetching, and
-  `rangeread.RemoteFile`'s block cache and If-Match validation. DuckDB's HTTP and
-  auto-extension paths remain disabled. Reads use existing netfetch admission,
-  host policy, User-Agent, offline checks, budgets and circuit breakers.
-- A separate bounded HTTPS range transport prevents a server ignoring Range from
-  downloading the whole file. It closes responses on failure, rejects redirects
-  and content encoding, and limits reads while receiving. Socket/operation limits
-  are 30/45 seconds (OS DNS resolution has the usual platform limitations).
-- Each operation reserves at most 96 MiB of HTTP ranges, with at most 16 MiB per
-  range, a 32 MiB footer, 512 returned features, 128 KiB per geometry, the existing
-  merge geometry limits, and a 256 MiB DuckDB memory limit without disk spill.
-- Raw building blocks have conservative 256 MiB/4,096-entry admission and reserve
-  a full operation before fetching. Accepted history uses the existing 64 MiB,
-  128-object, 2,048-entry limits. Exhaustion is explicit; no evidence/history or raw
-  generations are automatically deleted. Long-term compaction is a later milestone.
-- `buildingprimary.py` reuses Stage 2 checksum, safe-path, OS-lock, fsync and replace
-  primitives. It writes immutable content objects and validates them before atomic
-  head publication at `<cache>/osm-primary/v1`. A previous manifest is retained;
-  orphan objects are not committed. Legacy overlay stores/kits are never modified.
-- The persistent request ledger reserves a ten-minute operation cooldown before
-  HTTP and retains Retry-After. Missing/corrupt reserved ledgers block further
-  refreshes; normal cached sessions remain usable.
-- One validated snapshot reaches the main MapData and every local rendering worker
-  and respawn. Newly prepared data applies on the next complete session only.
-- Existing conservative merge matching prefers typed OSM identities. Proven spatial
-  duplicates adopt the accepted OSM footprint. Independent Overture buildings are
-  retained; ambiguous overlaps block publication instead of inventing a match.
-- Building dependencies include accepted geometry/attributes, parents/parts and
-  suppressions. Near/far/skyline read the normal building accessor. Baseline readers
-  and road/terrain version inputs remain unchanged; no global cache version bump.
+```powershell
+python launcher.py --cache-dir 'D:\BeamNG-Earth-cache' --osm-buildings-update --user-dir 'D:\isolated-profile\current' --osm-radius-km 3 --osm-source-policy-confirmed
+# Or: --osm-center 30.412876 -9.5524592 --osm-radius-km 3
+python launcher.py --cache-dir 'D:\BeamNG-Earth-cache' --osm-buildings-status
+```
 
-## Geometry, parts and deletion limits
+The radius describes a bounding square's approximate half-size, not an exact
+circle. The default is 3 km; supported half-sizes are 0.1–10 km below 80 degrees
+latitude without crossing the dateline. These selection restrictions apply to
+manual regional updates; automatic acquisition uses the normal worldwide map
+cell grid. Existing renderer restrictions still reject polar/dateline footprints.
+No Agadir-specific production path or dozens of manually entered boxes remain.
 
-The observed source includes typed IDs, version, edit timestamp, geometry, bbox,
-building/part tags, floors, height, roof fields and material/colour fields. Only
-published attributes can be used; omitted source columns are not invented.
-The dataset Last-Modified is **publication time**, not OSM replication state.
+Progress shows the target bounds, pinned source ETag/publication, completed and
+total retrieval partitions, cache reuse, accepted revision, warnings and errors.
+A partial retrieval is NEVER reported as complete. Complete coverage with deferred
+features reports `complete_with_warnings`, `all_features_updated=false` and explicit
+per-feature/group reasons. It does not claim every source building updated.
 
-Ways and relations retain their complete WKB geometry and identities. A multipolygon
-relation with exactly one simple exterior is losslessly usable by the existing
-generator. Multiple exteriors and holes remain complete in the source result with
-unsupported diagnostics. They are not flattened or partially drawn.
+Failed/cancelled jobs retain the old published data. Run the SAME command after
+the persisted cooldown to resume verified partitions without downloading them
+again. A changed source publication starts a new pinned set; incompatible versions
+are never mixed. Publication of a full regional update is atomic, after baseline
+validation and cancellation checks. Accepted updates apply only in a fresh session.
 
-The observed schema has no parent association column. Part rows are retrieved, but
-unknown/orphan associations block acceptance. Complete externally validated parent/
-part sets use the existing atomic part path; tests cover it. This reader cannot
-claim that Layercake supplies all part-only objects or reconstruct missing relation
-membership. Existing parts cannot be silently removed or downgraded. Unsupported
-attributes/geometry or any merge conflict retain the previous accepted snapshot.
+## Consistency, ownership and fallback
 
-**Absence is not deletion.** Missing identities are reported only where their
-original footprints intersect the queried coverage; neighbouring baseline context
-outside that coverage is not falsely reported missing. No missing identity is
-automatically removed. Absence can reflect moved, omitted, retagged or deleted
-objects; the building-only file cannot distinguish those states reliably.
+Each geographic data cell's effective choice is durably fixed in a shared session
+ledger BEFORE any near/far/skyline dependency or geometry uses it. All local workers
+and respawns use that ledger. New areas extend the session's choices; they never
+replace active meshes/colliders. A cross-boundary building already chosen by a
+neighbour retains the same geometry. A new conflicting influence into a previously
+chosen fallback area is deferred for the session rather than changing that area.
+This can leave a boundary building on fallback until restart; the log reports
+`session_boundary_deferred`. Density-neighbour dependencies participate too.
 
-Positive identity-state evidence has a separate `Removal` interface (typed ID,
-newer version, timestamp, deleted/retagged state and authoritative source). Complete
-validated geographic context and an unambiguous original are required. Such evidence
-persists a suppression, removes the owned baseline building/parts, changes local
-cache dependencies and prevents an old source version resurrecting the footprint.
-The unit deletion scenario uses an **explicit synthetic authoritative-history proof**;
-no production history/deletion feed has been added or claimed. An eventual identity
-adapter must obtain and verify that evidence; a caller cannot derive it from an
-empty Layercake response. Positive proof handling does not establish physical
-demolition or resolve arbitrary split/merge histories.
+The normal building generator, corrected inside-vehicle collision hold and normal
+collision reloads are reused. There are no live activation transactions, cohort
+schedulers or special collision handoffs. Remote helper workers cannot safely share
+these local session choices, so snapshot-mode jobs use local workers.
 
-## Verification and next milestone
+OSM identities take precedence. Proven duplicate Overture footprints are replaced;
+independent Overture buildings remain. Floors, heights, supported roofs and ordinary
+way/relation exteriors use the existing normalization. Multiple exteriors, holes,
+unproven parent/part inventories and ambiguous matches are explicitly deferred.
+Prior valid geometry or ordinary Overture is retained. Known complete supported
+parent/part sets remain atomic; missing associations are never invented.
 
-The explicit source read found 76 real OSM buildings at ETag
-`"77b2a651e741fc3e3dc73b1de33bda93-8813"`, published `2026-11-01T14:35:59Z`.
-The supplied way/1572086438 is version 2, edited `2026-10-28T00:57:56Z`, with three
-floors and a flat roof. Its full real footprint is an attributed offline fixture.
-The user's second edit is not expected in this snapshot; its absence is not an error.
+An absent Layercake row is NOT a verified deletion. Previously accepted buildings
+are retained on absence. The existing positive identity-state suppression interface
+remains, with version/timestamp and ownership checks. No production OSM history feed
+has been added. Automatic deletion/retagging history is a remaining limitation.
 
-A data-only integration against real pinned Overture produced 62 additions, one
-replacement, zero conflicts and 79 ordinary native building specifications in the
-test box. There were 76 prepared OSM entries. This is not a BeamNG collision or
-engine validation. Focused tests exercise the actual Parquet reader using local
-Parquet bytes/mock HTTP, native generation, duplicate suppression, cache keys,
-two sessions, offline reuse, parts, invalid data, explicit suppression, atomic
-failure, persistent cooldowns and session exclusion. Existing restart/render suites
-are included; the full repository marathon is intentionally not run.
+An unavailable source, policy refusal, unsupported data, offline mode or failed
+retrieval uses Overture/previous accepted fallback. A failed first visit stays on
+that choice for the session, even if the network returns, preventing unsafe collider
+replacement. An uncompleted area can retry in a fresh session. Corrupt ownership or
+storage is not silently reset. Source publication time is not OSM replication time
+and cannot prove that a particular recent edit has propagated.
 
-Final focused result: **61 tests passed, zero failures/errors/skips**, including ten
-new primary-source cases, 23 render regressions and 28 restart regressions. The
-non-removable test guards recorded zero blocked external launch/network attempts.
-The final real-data replay passed with `offline=True`, no freshness check and the
-same 79 ordinary building specifications. Source inclusion audit: 351 package files;
-new modules/guide included, fixtures/development artifacts excluded. Diff checks pass.
+## Storage, limits and diagnostics
 
-Before an engine test: use an isolated profile/mod/companion and matching cache,
-verify production dependencies and packaging, then validate actual placement,
-appearance, LODs and collision in BeamNG. No kit is prepared by this milestone.
-The next small UI milestone is a pre-game companion action that invokes the same
-refresh operation, shows source publication/counts/conflicts, and enables play only
-after successful preparation or an explicit choice to retain saved data. Disable
-that action during gameplay. City scheduling, full part inventories, robust deletion
-history and safe history compaction remain separate work.
+Storage is separate from immutable Overture under `<cache>/osm-primary/v1`:
+
+- `objects`, `state.json`, `previous.json`: accepted manual regional snapshots.
+- `regions`: checksummed, resumable retrieval jobs and persistent request ledger.
+- `world/index.json`, `world/objects`: completed first-visit cells and immutable data.
+- `world/sessions`: bounded immutable choices for individual companion sessions.
+- `world/regions`: shared automatic-source jobs and persistent range admission.
+
+One network request runs at a time. Existing netfetch policies, offline controls,
+User-Agent, budgets, range/ETag validation and circuit breakers remain. Range requests
+are spaced at least one second apart, including across process restarts. Retry-After
+is persisted; other failures impose a shared cooldown. Explicit source checks have
+a ten-minute cooldown. Bodies are bounded while reading; each query retains the
+96 MiB network, 512-feature, geometry and 256 MiB DuckDB memory safeguards. Dense
+partitions subdivide; no target list is silently truncated.
+
+Regional preparation admits at most 4,096 jobs, 100,000 unique source features,
+50,000 accepted features including parts, 96 MiB per snapshot and 512 MiB retained
+snapshot history. Automatic persistent choices are bounded by 4,096 cells, 8,192
+objects/512 MiB and 1,024 retained session ledgers. A building generation read is
+bounded at 50,000 entries; previously travelled geometry is not accumulated in
+memory as a growing session-wide quota. Its immutable choices and full influence
+bounds remain in the ledger. The persistent typed-identity index admits 100,000 identities.
+That index prevents a newly visited area from implicitly moving/refreshing a
+building previously acquired elsewhere. Raw building ranges have a 2 GiB bound; saved retrieval jobs
+have a 256 MiB bound in each store. No history/evidence/object is silently deleted.
+Capacity errors retain valid references and are reported; uncertain ownership is
+never collected. Archive a closed disposable cache explicitly if these finite
+budgets are reached. This is worldwide location support, not an unlimited planet
+cache or a promise of instant loading.
+
+Mesh cache keys use local effective geometry, attributes, parent/part relationships
+and meaningful source identity. A publication timestamp/ETag change alone does not
+rebuild unchanged buildings. Unrelated tiles and road/terrain versions are unchanged.
+An Overture release change fails closed if original ownership can no longer validate;
+keep the old cache for evidence and prepare a compatible separate cache.
+
+Companion logs identify `earthd.osm_world`, cell keys, `world_first_visit`,
+`world_cached`, `world_fallback`, coverage, warnings and boundary deferrals. The
+checksummed world/session files retain exact choices for investigation. No status
+claim substitutes for physical collision verification.
+
+## One minimal engine acceptance (two places and a revisit)
+
+Use the separately prepared `buildings-v1/manual` profile/cache and matching packaged
+sources/mod, never your normal profile or historical Agadir kit. Exact commands and
+hashes are in that build's `manual/commands.ps1` and `verification.json`. Commands
+are human-operated; preparation does not launch the game or request external data.
+
+1. Enable worldwide acquisition in the fresh test cache, start the matching companion,
+   then launch `C:\270\games\BeamNG.drive\Bin64\BeamNG.drive.x64.exe` with that isolated
+   userpath and companion port. Decline profile migration. In **GE Lua** check:
+   `print(FS:getFileRealPath("/"))`. It must be the isolated profile's `current` folder.
+2. Use the existing map to visit Agadir near `30.412918583438707, -9.552353024797444`.
+   Wait for ordinary loading. Confirm `world_first_visit` or validated saved reuse,
+   inspect way/1572086438's footprint and slowly check its wall collision. Move a short
+   distance to check far appearance/LOD. Do not force a collision reload in the console.
+3. Visit a safe road near Paris `48.8566, 2.3522`, without preparing that city. Wait for
+   first-visit logs and supported buildings. If the selected spawn is inside a building,
+   move to an open road before assessing collision. Confirm near/far appearance.
+4. Return to Agadir. No new OSM freshness request should occur for completed cells;
+   geometry/collision should remain consistent. Close both test processes normally.
+   A restart at the same place must reuse saved cells without source selection/ranges.
+
+Send the short companion log, whether both places loaded, and the collision/revisit
+result. No repeated teleport marathon is needed. If there is a fallback or boundary
+warning, report it rather than treating it as success. Keep the isolated evidence.

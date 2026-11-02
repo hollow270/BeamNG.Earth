@@ -20,7 +20,7 @@ local function enc(v)
 end
 jsonEncode = enc
 FS = { directoryExists = function() return false end, directoryCreate = function() end,
-  getUserPath = function() return '/u/' end }
+  getFileRealPath = function(_, p) assert(p == '/'); return '/u/' end }
 
 -- 1) no engine at all: every hardware field missing, no error
 Engine = {}

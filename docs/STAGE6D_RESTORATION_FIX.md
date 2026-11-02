@@ -183,7 +183,7 @@ and normal online startup are outside this synthetic test.
    & $stage6dExe -userpath $stage6dParent -bngeport 47626
    ```
 
-   Decline migration/import. In **GE Lua**, `print(getUserPath())` must be exactly
+   Decline migration/import. In **GE Lua**, `print(FS:getFileRealPath("/"))` must be exactly
    `$stage6dProfile` (allow slash/case normalization). Stop otherwise. Exit the
    game before copying the mod. Do not change Steam options or normal folders.
 3. Copy only the new audited mod into the verified new profile:

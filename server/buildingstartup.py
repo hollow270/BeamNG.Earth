@@ -200,7 +200,9 @@ def _validated_snapshot(md,snapshot):
     # Fail before streaming if saved baseline/parts cannot be proved compatible.
     view=buildingrender.BuildingView(None,md.release,snapshot=snapshot)
     for entry in snapshot.entries if view.active else ():
-        context(md,entry.bounds,snapshot)
+        # Each persisted entry already carries its entire original/part influence.
+        # Do not scan all city entries for every entry during the startup barrier.
+        context(md,entry.bounds,replace(snapshot,entries=(entry,)))
         view._validate(md,entry,'demand')
     return deepcopy(snapshot)
 

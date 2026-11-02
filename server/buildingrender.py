@@ -36,6 +36,18 @@ def _hash(value):
     return hashlib.sha256(bo._json(value).encode()).hexdigest()
 
 
+def _render_identity(feature):
+    # Publication/check timestamps and an unchanged OSM element's version do
+    # not change a mesh. Preserve full provenance in storage/cells, but avoid
+    # rebuilding a city merely because the source published a newer Parquet file.
+    def source(s):
+        out={k:v for k,v in s.items() if k in ('dataset','property','licence','url')}
+        if 'record_id' in s:out['record_id']=bo.normalize_osm_id(s['record_id']) or s['record_id']
+        return out
+    return replace(feature,sources=tuple(source(s) for s in feature.sources),
+                   attribute_sources={k:tuple(source(s) for s in v) for k,v in feature.attribute_sources.items()})
+
+
 def _intersects(a, b):
     return a[0] <= b[2] and a[2] >= b[0] and a[1] <= b[3] and a[3] >= b[1]
 
@@ -153,7 +165,7 @@ class BuildingView:
             return Dependency()
         full, geo = [], []
         for fid, e in sorted(entries.items()):
-            full.append([fid, bo.MergeResult((e.feature,), e.parts, ()).digest(), e.baseline_digest, e.bounds])
+            full.append([fid, bo.MergeResult((_render_identity(e.feature),), tuple(_render_identity(p) for p in e.parts), ()).digest(), e.baseline_digest, e.bounds])
             geo.append([fid, bo.geometry_digest(e.feature.geometry),
                         [(p.feature_id, bo.geometry_digest(p.geometry)) for p in e.parts], e.bounds])
             if e.feature.status == "deleted":

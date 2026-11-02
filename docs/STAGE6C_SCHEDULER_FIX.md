@@ -200,7 +200,7 @@ unverified geographic/process-worker/frozen startup remain outside this fix.
    ```
 
    First launch without a mod, decline migration/import, and check
-   `print(getUserPath())` in **GE Lua**. It must be exactly the new `$stage6cProfile`
+   `print(FS:getFileRealPath("/"))` in **GE Lua**. It must be exactly the new `$stage6cProfile`
    (allow slash/case normalization). Otherwise stop. Exit before copying the mod.
    Do not edit persistent Steam options, startup files or normal user folders.
 3. After verification, stage the new mod only into that new profile:

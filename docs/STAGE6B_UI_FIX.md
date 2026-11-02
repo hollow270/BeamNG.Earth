@@ -181,7 +181,7 @@ These are **user actions for later**. Codex has not performed them.
    ```
 
    First launch this new profile **without a mod**, decline migration/import and
-   verify `print(getUserPath())` in **GE Lua** resolves exactly to `$stage6bProfile`.
+   verify `print(FS:getFileRealPath("/"))` in **GE Lua** resolves exactly to `$stage6bProfile`.
    If not, stop. Exit the game before copying anything. Use one-session flags; do
    not edit Steam options, `startup.ini`, the registry or normal user folders.
 3. Copy only `beamng_earth_stage6b.zip` into that verified new profile's `mods/`

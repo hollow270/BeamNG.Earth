@@ -1118,6 +1118,13 @@ def main():
                     help="where BeamNG.drive is installed, when it is not found in Steam's libraries (another "
                          "launcher, a folder of its own; kept for the next starts, 'default' forgets it)")
     ap.add_argument("--user-dir", help="BeamNG.drive user folder (default: found)")
+    ap.add_argument('--osm-buildings-update',action='store_true',
+                    help='prepare a regional OSM snapshot and exit; never starts/installs the game')
+    ap.add_argument('--osm-buildings-status',action='store_true',help='show saved regional preparation status and exit')
+    ap.add_argument('--osm-buildings-enable',action='store_true',help='enable automatic worldwide first-visit buildings and exit; no city preparation required')
+    ap.add_argument('--osm-center',type=float,nargs=2,metavar=('LAT','LON'),help='update centre; otherwise use --user-dir saved map location')
+    ap.add_argument('--osm-radius-km',type=float,default=3.,help='update bounding region half-size (0.1–10 km; default 3)')
+    ap.add_argument('--osm-source-policy-confirmed',action='store_true',help='confirm permission/policy for the Layercake data source')
     ap.add_argument("--proton", dest="build", action="store_const", const="proton",
                     help="Linux: the game is the Windows build under Proton")
     ap.add_argument("--native", dest="build", action="store_const", const="native",
@@ -1134,6 +1141,29 @@ def main():
     ap.add_argument("--no-terminal", action="store_true", help="Linux: no terminal window (log to a file)")
     ap.add_argument("extra", nargs=argparse.REMAINDER, help="after --: more options for the server")
     args = ap.parse_args()
+    if sum((args.osm_buildings_update,args.osm_buildings_status,args.osm_buildings_enable))>1:
+        ap.error('choose one OSM buildings action')
+    if args.osm_buildings_update or args.osm_buildings_status or args.osm_buildings_enable:
+        # Before install, Steam/process discovery, dialogs or any launch path.
+        # No app settings are written by this action.
+        sys.path.insert(0,os.path.join(ROOT,'server'))
+        import buildingregions
+        cache=args.cache_dir or apppaths.saved_cache_dir() or apppaths.default_cache_dir()
+        if cache.strip().lower()=='default': cache=apppaths.default_cache_dir()
+        if args.osm_buildings_enable:
+            import buildingworld,json
+            print(json.dumps(buildingworld.enable(cache,policy_confirmed=args.osm_source_policy_confirmed),indent=2))
+            return
+        if args.osm_buildings_update and args.osm_source_policy_confirmed:
+            import buildingworld
+            buildingworld.enable(cache,policy_confirmed=True)
+        flags=['--cache-dir',cache,'--radius-km',str(args.osm_radius_km)]
+        if args.osm_buildings_status: flags+=['--status']
+        if args.osm_center: flags+=['--center',*[str(v) for v in args.osm_center]]
+        if args.user_dir: flags+=['--user-dir',args.user_dir]
+        if args.osm_source_policy_confirmed: flags+=['--confirm-source-policy']
+        buildingregions.main(flags)
+        return
     if IS_WIN:
         windows_console()
     elif not (sys.stdout and sys.stdout.isatty()):
@@ -1323,7 +1353,12 @@ def run(args):
     row("Game folder", user_dir + ("  (the Windows build, Proton)" if build == "proton" else "")
         + (f"  (Steam compatibility tool: {tool})" if tool else ""))       # (which was read: GitHub #56)
     running = game_alive()
-    if running and (os.environ.get('BNGE_OSM_STARTUP_CONFIG') or os.environ.get('BNGE_OSM_PRIMARY') == 'layercake'):
+    selected_cache=args.cache_dir or apppaths.saved_cache_dir() or apppaths.default_cache_dir()
+    selected_cache=apppaths.default_cache_dir() if selected_cache.lower()=='default' else selected_cache
+    primary_files=os.path.join(selected_cache,'osm-primary','v1')
+    if running and (os.environ.get('BNGE_OSM_STARTUP_CONFIG') or os.environ.get('BNGE_OSM_PRIMARY') == 'layercake' or
+                    os.path.isfile(os.path.join(primary_files,'worldwide.json')) or
+                    os.path.isfile(os.path.join(primary_files,'regions','state.json'))):
         problem('Restart-based OSM refresh requires BeamNG.drive to be closed first.',
                 'Close the game and companion, then start BeamNG.Earth again.')
         sys.exit(1)

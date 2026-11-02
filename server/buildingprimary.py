@@ -1,4 +1,4 @@
-"""Developer-only explicit Layercake preparation, immutable cached sessions.
+"""Explicit Layercake preparation, immutable cached sessions.
 
 Uses the existing pure merge, baseline validator, atomic filesystem primitives,
 render adapter and normal generators. Separate storage never edits legacy overlays.
@@ -25,6 +25,13 @@ import mapcells
 import osmbuildings as osm
 
 log=logging.getLogger('earthd.osm_startup')
+
+# Regional snapshots, not individual retrieval jobs. Request/geometry/context limits
+# remain small. This separate bound permits a city while capping every worker's
+# copied session snapshot and the retained immutable history. Legacy stores retain
+# their original limits; no automatic history deletion is performed.
+REGIONAL_LIMITS=storage.Limits(max_entries=50000,max_file_bytes=96*1024*1024,
+                             max_total_bytes=512*1024*1024)
 
 
 @dataclass(frozen=True)
@@ -62,7 +69,7 @@ class Store:
         self.directory=Path(cache_dir).absolute()
         self.root=self.directory/'osm-primary'/'v1'
         self.objects=self.root/'objects'
-        self.limits=storage.Limits()
+        self.limits=REGIONAL_LIMITS
         self.lock_timeout=1.
         if '..' in self.root.parts: raise ValueError('unsafe cache path')
         for p in (self.root,*self.root.parents): self._no_link(p)
@@ -172,7 +179,7 @@ def contains(a,b):
     return b is not None and a[0]<=b[0] and a[1]<=b[1] and a[2]>=b[2] and a[3]>=b[3]
 
 
-def prepare(md, before, source):
+def prepare(md, before, source, *, limits=None):
     """Pure preparation over validated complete context; no network or publication."""
     validate_version(source.version)
     if source.complete is not True or source.issues:
@@ -248,8 +255,8 @@ def prepare(md, before, source):
         bounds=storage._union([bo._bbox(q.geometry) for q in (f,)+parts+originals]+[bo._bbox(old.geometry) if old else None,
                               entries[fid].bounds if fid in entries else None])
         entries[fid]=storage.Entry(f,parts,storage._fingerprint(old,originals) if old else None,bounds,source.version['last_modified'])
-    if len(entries)+sum(len(e.parts) for e in entries.values())>storage.Limits().max_entries:
-        raise storage.ResourceLimit('bounded pilot entry limit')
+    if len(entries)+sum(len(e.parts) for e in entries.values())>(limits or REGIONAL_LIMITS).max_entries:
+        raise storage.ResourceLimit('regional entry limit')
     known={i for f in full.buildings if storage._intersects(bo._bbox(f.geometry),source.bounds)
             for i in bo._identities(f)} | {i for e in before.entries
             if storage._intersects(e.bounds,source.bounds) for i in bo._identities(e.feature)}
@@ -258,7 +265,7 @@ def prepare(md, before, source):
                 counts=result.report()['counts'],suppressed=len(removed),
                 missing_unverified=sorted(known-returned),
                 partitions=[str(k) for k in mapcells.cells_for_bbox(source.bounds[1],source.bounds[0],
-                            source.bounds[3],source.bounds[2],z=18,max_cells=64)],
+                            source.bounds[3],source.bounds[2],max_cells=64)],
                 note='Missing identities are not verified deletions. Dataset publication time is not OSM replication time.')
     snapshot=replace(before,enabled=True,baseline_release=md.release,entries=tuple(entries[k] for k in sorted(entries)),
                      affected_bounds=storage._union([e.bounds for e in entries.values()]))
@@ -267,7 +274,7 @@ def prepare(md, before, source):
 
 def refresh(md, cache_dir, *, reader=None, bounds=None, wall=time.time):
     """One explicit developer request; no game operations and no startup caller."""
-    bounds=bounds or (-9.5552,30.4119,-9.5516,30.4136)
+    if bounds is None: raise ValueError('an explicit geographical area is required')
     store=Store(cache_dir)
     with store.session(), store._locked():
         before=store._load()
@@ -307,7 +314,7 @@ def cached(md,cache_dir):
     snapshot=Store(cache_dir).load()
     snapshot=buildingstartup._validated_snapshot(md,snapshot)
     report=dict(mode='layercake_cached',revision=snapshot.revision,enabled=snapshot.enabled,checked=False,
-                note='Saved validated buildings reused; no freshness request. Use the explicit developer refresh before play.')
+                note='Saved validated buildings reused; no freshness request. Updates apply only in a fresh session.')
     log.info('OSM startup: %s',json.dumps(report,sort_keys=True))
     return snapshot,report
 
@@ -316,17 +323,8 @@ def main():
     import argparse
     import mapdata
     import netfetch
-    p=argparse.ArgumentParser(description='Explicit PRE-GAME Layercake neighbourhood refresh; no application launches.')
-    p.add_argument('--cache-dir',required=True)
-    p.add_argument('--location',choices=('agadir',),required=True)
-    p.add_argument('--confirm-source-policy',action='store_true',required=True)
-    args=p.parse_args()
-    fetcher=netfetch.Fetcher(stats_dir=str(Path(args.cache_dir)/'netstats'))
-    md=mapdata.MapData(args.cache_dir,fetcher=fetcher,building_overlays=False)
-    try:
-        snapshot,report=refresh(md,args.cache_dir)
-        print(json.dumps(dict(report,revision=snapshot.revision),indent=2))
-    finally: md.close(); fetcher.close()
+    from buildingregions import main as regional_main
+    regional_main()
 
 
 if __name__=='__main__': main()

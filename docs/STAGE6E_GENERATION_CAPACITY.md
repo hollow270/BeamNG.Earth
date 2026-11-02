@@ -182,7 +182,7 @@ frozen and geographic/process-worker startup are outside this synthetic test.
    & $stage6eExe -userpath $stage6eParent -bngeport 47627
    ```
 
-   Decline migration/import. In GE Lua `print(getUserPath())` must exactly identify
+   Decline migration/import. In GE Lua `print(FS:getFileRealPath("/"))` must exactly identify
    `$stage6eProfile` (slash/case normalization allowed). Stop otherwise. Exit.
 3. Copy only the new audited mod into this verified new profile:
 

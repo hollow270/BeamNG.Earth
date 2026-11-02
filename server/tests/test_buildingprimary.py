@@ -227,7 +227,7 @@ class PrimaryTest(unittest.TestCase):
         class Changed:
             def select(self,**kw): raise lc.rangeread.Changed('412: pinned source replaced')
         with self.assertRaises(lc.rangeread.Changed):
-            primary.refresh(md,self.root/'primary',reader=Changed(),wall=lambda:1700)
+            primary.refresh(md,self.root/'primary',reader=Changed(),bounds=data.bounds,wall=lambda:1700)
         self.assertEqual(primary.Store(self.root/'primary').load().revision,first.revision)
 
     def test_actual_startup_pins_cached_snapshot_before_workers_without_refresh(self):

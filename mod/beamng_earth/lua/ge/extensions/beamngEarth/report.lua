@@ -177,7 +177,7 @@ end
 local function screenshot(rel)
   if type(createScreenshot2) ~= 'function' then return nil end
   local ok = pcall(createScreenshot2, { filename = rel .. 'screenshot', writeJPG = true, superSampling = 1 })
-  return ok and (FS:getUserPath() .. rel .. 'screenshot.jpg'):gsub('\\', '/') or nil
+  return ok and (FS:getFileRealPath('/') .. rel .. 'screenshot.jpg'):gsub('\\', '/') or nil
 end
 
 local function encode(t)
@@ -187,7 +187,7 @@ local function encode(t)
 end
 
 local function write(rel, data, quiet)
-  data.folder = (FS:getUserPath() .. rel):gsub('\\', '/')
+  data.folder = (FS:getFileRealPath('/') .. rel):gsub('\\', '/')
   writeFile(rel .. 'report.json', encode(data))
   local okH, hw = pcall(M.collectHardware)
   if not okH then hw = { error = tostring(hw) } end

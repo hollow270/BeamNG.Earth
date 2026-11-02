@@ -1523,6 +1523,11 @@ class Server:
 
     def geo_prebuilt(self, gx, gy):
         """Is geotile (gx, gy)'s road content in the revisit cache (no worker, no network)? -> its key or None."""
+        provider=getattr(self.mapdata,'_building_world',None)
+        if provider is not None:
+            import geotiles
+            tile=geotiles.geobox(gx,gy)
+            if not provider.ready(blockworker.building_cells(tile.frame,tile.box)):return None
         k = self.geo_content_key(gx, gy)
         return k if k is not None and os.path.exists(revisitmod._path(self.cache_dir, "roadsg", k)) else None
 
@@ -5562,7 +5567,10 @@ class Connection:
 
 
 async def main_async(args):
-    primary_mode=os.environ.get('BNGE_OSM_PRIMARY') == 'layercake'
+    import buildingregions
+    import buildingworld
+    worldwide=buildingworld.configured(args.cache_dir)
+    primary_mode=os.environ.get('BNGE_OSM_PRIMARY') == 'layercake' or buildingregions.configured(args.cache_dir) or worldwide
     startup_path=os.environ.get('BNGE_OSM_STARTUP_CONFIG')
     startup_config=None
     if startup_path and not primary_mode:
@@ -5604,6 +5612,9 @@ async def main_async(args):
             # the normal server-shutdown finally block has been reached.
             asyncio.current_task().add_done_callback(lambda task: primary_lease.close())
             frozen_buildings,startup_report=buildingprimary.cached(mapdata,args.cache_dir)
+            if worldwide:
+                frozen_buildings=buildingworld.start(args.cache_dir,frozen_buildings)
+                startup_report=dict(startup_report,worldwide=True,first_visit='automatic_before_generation',freshness='manual_only')
             mapdata.pin_buildings(frozen_buildings)
         except BaseException:
             primary_lease.close()
@@ -5647,7 +5658,9 @@ async def main_async(args):
         # compute sharing: far tiles to helpers (--peers) and, in a BeamMP group, split with the players on our anchor,
         # built with the same settings as these workers (peerwork.py)
         far_pool = peerworkmod.SharedFarPool(
-            far_pool, peerworkmod.parse_peers(args.peers),
+            # Helpers do not share this process family's immutable session ledger.
+            # Keep building-bearing jobs local rather than return baseline meshes.
+            far_pool, [] if primary_mode or startup_config is not None else peerworkmod.parse_peers(args.peers),
             {"roads": args.roads == "on", "grading": args.grading == "on" and args.roads == "on",
              "road_widths": args.road_widths == "on" and args.roads == "on", "airports": args.airports == "on",
              "sea": args.sea == "on", "roads_in_ground": roadsmod.ROADS_IN_GROUND}, None,

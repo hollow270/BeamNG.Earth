@@ -254,6 +254,7 @@ class MapData:
         self._building_context = ContextVar("building_snapshot", default=None)
         self._building_store = None
         self._building_view = None
+        self._building_world = None
         overlay = os.environ.get("BNGE_BUILDING_OVERLAY_DIR") if building_overlays is None else building_overlays
         if overlay is None and os.environ.get("BNGE_OSM_BUILDINGS")=="on":
             overlay = os.path.join(cache_dir,"building-overlays")
@@ -292,14 +293,19 @@ class MapData:
 
     @property
     def building_overlays_active(self):
+        if self._building_world is not None: return True
         view = self._building_context.get() or self._building_view
         return view is not None and view.active
 
     def pin_buildings(self, snapshot):
         """Startup only: freeze one revision before submitting any world jobs."""
         from buildingrender import BuildingView
-        if self._building_view is not None:
+        if self._building_view is not None or self._building_world is not None:
             raise RuntimeError('building snapshot was already selected')
+        from buildingworld import Session,Provider
+        if isinstance(snapshot,Session):
+            self._building_world=Provider(self,snapshot)
+            return
         self._building_view = BuildingView(None, self.release, snapshot=snapshot)
 
     def building_snapshot(self, snapshot):
@@ -324,13 +330,14 @@ class MapData:
         explicit per-job revision without changing that default or other threads.
         """
         base = self.cell(key, layers=layers, kind=kind)
-        view = self._building_context.get() or self._building_view
+        view = self._building_context.get() or (self._building_world.view((_key(key),)) if self._building_world is not None else self._building_view)
         return view.cell(self, base, kind) if view is not None and view.active else base
 
     def building_dependencies(self, keys, *, render_bounds=None):
         """Local effective-building tokens; not a global pipeline version or invalidation operation."""
         from buildingrender import Dependency
-        view = self._building_context.get() or self._building_view
+        keys=tuple(keys)
+        view = self._building_context.get() or (self._building_world.view(keys) if self._building_world is not None else self._building_view)
         return view.dependency(keys,render_bounds=render_bounds) if view is not None and view.active else Dependency()
 
     def _rails(self, key, layer, feats):

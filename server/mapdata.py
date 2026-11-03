@@ -132,6 +132,7 @@ LIDAR_CANOPY = {
 }
 # Short overlay wordings per provenance id (credits.py can take them when the map data is shown)
 CREDIT_LINES = {
+    "osm-buildings": "© OpenStreetMap contributors (OSM-only buildings)",
     "osm-building-overlay": "© OpenStreetMap contributors (building overlay)",
     "overture": overture.ATTRIBUTION,
     "esa-worldcover": "© ESA WorldCover project 2021 / Contains modified Copernicus Sentinel data (2021) "
@@ -242,6 +243,7 @@ def _raster_from(arrays):
 
 
 class MapData:
+    building_source_mode='osm-only-v1'
     """See the module docstring. fetcher: the server's netfetch.Fetcher (None: one of its own);
     release: the Overture release (overture.RELEASE)."""
 
@@ -261,10 +263,7 @@ class MapData:
         if building_snapshot is not None:
             self.pin_buildings(building_snapshot)
         elif overlay:
-            from buildingoverlaystore import OverlayStore
-            from buildingrender import BuildingView
-            self._building_store = overlay if isinstance(overlay, OverlayStore) else OverlayStore(overlay)
-            self._building_view = BuildingView(self._building_store, release)
+            log.warning('Legacy building overlays are not used by the OSM-only renderer; retained files are unchanged')
         self.raw_dir = os.path.join(cache_dir, "mapdata", "raw")
         self.overture = overture.Reader(self.raw_dir, self.fetcher, release, threads)
         self.rasters = maprasters.Rasters(self.raw_dir, self.fetcher, os.path.join(cache_dir, "dem", "lidarbc"))
@@ -293,29 +292,29 @@ class MapData:
 
     @property
     def building_overlays_active(self):
-        if self._building_world is not None: return True
-        view = self._building_context.get() or self._building_view
-        return view is not None and view.active
+        return True  # OSM-only empty/unavailable output also versions old building meshes
 
     def pin_buildings(self, snapshot):
         """Startup only: freeze one revision before submitting any world jobs."""
-        from buildingrender import BuildingView
+        from osmbuildingview import View
+        from osmbuildingcache import MODE
         if self._building_view is not None or self._building_world is not None:
             raise RuntimeError('building snapshot was already selected')
         from buildingworld import Session,Provider
         if isinstance(snapshot,Session):
             self._building_world=Provider(self,snapshot)
             return
-        self._building_view = BuildingView(None, self.release, snapshot=snapshot)
+        if snapshot.baseline_release!=MODE:raise ValueError('Legacy merged building snapshots are not renderable in OSM-only mode')
+        self._building_view = View(snapshot)
 
     def building_snapshot(self, snapshot):
         """Thread-local pinned view for one generation job; baseline and other jobs remain unchanged."""
         from contextlib import contextmanager
-        from buildingrender import BuildingView
+        from osmbuildingview import View
 
         @contextmanager
         def pinned():
-            view = BuildingView(None, self.release, snapshot=snapshot)
+            view = View(snapshot)
             token = self._building_context.set(view)
             try:
                 yield view
@@ -329,16 +328,22 @@ class MapData:
         The default view is pinned at construction. building_snapshot() supplies an
         explicit per-job revision without changing that default or other threads.
         """
-        base = self.cell(key, layers=layers, kind=kind)
+        from osmbuildingview import View
+        from osmbuildingcache import empty
+        key=_key(key)
         view = self._building_context.get() or (self._building_world.view((_key(key),)) if self._building_world is not None else self._building_view)
-        return view.cell(self, base, kind) if view is not None and view.active else base
+        return (view or View(empty())).cell(self,key,layers,kind)
 
     def building_dependencies(self, keys, *, render_bounds=None):
         """Local effective-building tokens; not a global pipeline version or invalidation operation."""
         from buildingrender import Dependency
         keys=tuple(keys)
         view = self._building_context.get() or (self._building_world.view(keys,preferred_bounds=render_bounds) if self._building_world is not None else self._building_view)
-        return view.dependency(keys,render_bounds=render_bounds) if view is not None and view.active else Dependency()
+        if view is None:
+            from osmbuildingview import View
+            from osmbuildingcache import empty
+            view=View(empty())
+        return view.dependency(keys,render_bounds=render_bounds)
 
     def _rails(self, key, layer, feats):
         """The roads layer's rail segments with OSM's railway tags (railtags.py), once per build of them."""

@@ -1,551 +1,419 @@
-"""Worldwide first-visit acquisition BEFORE ordinary building generation.
+"""Worldwide cache-first OSM-only buildings, frozen before ordinary generation.
 
-Each data cell's choice is frozen durably in a shared session before a cache key
-or mesh can use it. New cells may only add influences that do not alter previously
-chosen cells. Cross-cell conflicts keep the earlier choice or Overture fallback.
-Workers share an OS-locked ledger, immutable objects and the existing regional
-retrieval/merge primitives. No engine transactions, collider replacement or Lua RPC.
+No baseline lookup, spatial merge, active-mesh transaction or collision handoff.
+Every cell and every parent/part group has one immutable choice per session.
 """
 from dataclasses import dataclass,replace
 from collections import OrderedDict
-import logging
-import math
-import os
+import logging,math,os,re,time,uuid
 from pathlib import Path
-import re
-import time
-import uuid
 
-import buildingoverlay as bo
+import buildingoverlay as geom
 import buildingoverlaystore as fs
-import buildingprimary as primary
-import buildingregions as regions
-import buildingrender
+import buildingregions as jobs
 import layercakebuildings as lc
 import mapcells
+import osmbuildingcache as data
+from osmbuildingview import View
 
 log=logging.getLogger('earthd.osm_world')
-MAX_CELLS=4096
-MAX_OBJECTS=8192
-MAX_SESSIONS=1024
-WORLD_BYTES=512*1024**2
-READ_BUDGET_S=45.0
+DOWNLOAD_S=45.
+PROCESS_S=30.
+PUBLICATION_S=15.
+READ_BUDGET_S=DOWNLOAD_S+PROCESS_S+PUBLICATION_S
+MAX_OBJECTS=data.MAX_OBJECTS
+MAX_CELLS=data.MAX_CELLS
 
 
 def configured(cache):
-    return (Path(cache)/'osm-primary/v1/worldwide.json').is_file()
+    store=data.Store(cache)
+    path=store.root/'enabled.json'
+    if path.exists():
+        if store._read(path)!=dict(mode=data.MODE,source=lc.URL,policy_confirmed=True):raise fs.CorruptStorage('invalid OSM source permission')
+        return True
+    # Reuse authorization only. Never read/migrate the old merged geometry.
+    old=Path(cache)/'osm-primary/v1/worldwide.json'
+    if old.exists():
+        for p in (old,*old.absolute().parents):data.Store._no_link(p)
+        permission=object.__new__(data.Store);permission.root=old.parent;permission.limits=data.LIMITS
+        if permission._read(old)!=dict(version=1,source=lc.URL,policy_confirmed=True):raise fs.CorruptStorage('invalid legacy source permission')
+        return True
+    # This application's selected building backend is Layercake's published
+    # public Parquet/Range service (not an arbitrary public Overpass endpoint).
+    # Buildings-on first visits must work without a preparatory CLI action.
+    # --offline and --buildings off remain the ordinary network/content controls.
+    return True
 
 
 def enable(cache,*,policy_confirmed=False):
-    if policy_confirmed is not True: raise ValueError('confirm Layercake source policy before enabling automatic first visits')
-    store=primary.Store(cache)
+    if policy_confirmed is not True:raise ValueError('confirm the Layercake source policy')
+    store=data.Store(cache)
     with store.session(),store._locked():
-        store._atomic_write(store.root/'worldwide.json',store._document(dict(version=1,source=lc.URL,policy_confirmed=True)))
-    return dict(worldwide_enabled=True,freshness='manual_only',effective='next session')
+        store._atomic_write(store.root/'enabled.json',store._document(dict(mode=data.MODE,source=lc.URL,policy_confirmed=True)))
+    return dict(mode=data.MODE,worldwide_enabled=True,freshness='manual_only',effective='new session')
 
 
 @dataclass(frozen=True)
 class Session:
     identity:str
-    baseline:fs.Snapshot
+    enabled:bool
+    refresh:bool=False
 
 
-def _store(cache):
-    base=primary.Store(cache)
-    store=object.__new__(primary.Store)
-    store.directory=base.directory;store.root=base.root/'world';store.objects=store.root/'objects'
-    # Bounded publication of two validated dense-cell JSON objects can take a
-    # few seconds on Windows. This is independent of the 45 s query deadline.
-    store.limits=primary.REGIONAL_LIMITS;store.lock_timeout=15.
-    for path in (store.root,store.objects,store.root/'sessions',store.root/'claims'):
-        store._no_link(path);path.mkdir(exist_ok=True)
-    return store
+def _store(cache):return data.Store(cache)
+def lease_store(store,name,timeout):return store.lease(name,timeout)
+def _empty(release=None):return data.empty()
 
 
-def lease_store(store,name,timeout):
-    """A separate OS lease, never the world publication mutex."""
-    if name not in ('query-lane','query-network'):raise ValueError('unknown acquisition lease')
-    lease=object.__new__(primary.Store)
-    lease.directory=store.directory;lease.root=store.root/name;lease.limits=store.limits
-    lease.lock_timeout=max(.001,timeout)
-    store._no_link(lease.root);lease.root.mkdir(exist_ok=True)
-    return lease
-
-
-def start(cache,baseline):
-    config=primary.Store(cache)
-    value=config._read(config.root/'worldwide.json')
-    if value!=dict(version=1,source=lc.URL,policy_confirmed=True): raise fs.CorruptStorage('invalid worldwide source permission')
-    store=_store(cache)
+def start(cache,baseline=None,*,refresh=False):
+    store=data.Store(cache);enabled=configured(cache)
+    if refresh and not enabled:raise ValueError('OSM source permission required')
     with store._locked():
-        index=store.root/'index.json'
-        if not index.exists():
-            if (store.root/'initialized').exists() or any(store.objects.iterdir()):
-                raise fs.CorruptStorage('world index missing; retained ownership must not be guessed')
-            # Establish the empty valid index BEFORE its marker or any session
-            # can publish objects. A killed first write cannot reserve an invalid
-            # nonexistent index as though it had held prior data.
-            store._atomic_write(index,store._document(dict(release=baseline.baseline_release,cells={},influence={},identities={})))
+        store.index()  # detect missing/corrupt ownership before creating a session
+        if not (store.root/'index.json').exists():
+            store._atomic_write(store.root/'index.json',store._document(dict(mode=data.MODE,cells={},influence={},identities={})))
             store._atomic_write(store.root/'initialized',b'1\n')
-        sessions=list((store.root/'sessions').iterdir())
-        if len(sessions)>=MAX_SESSIONS: raise fs.ResourceLimit('retained session ledger capacity; archive explicitly')
-        identity=uuid.uuid4().hex
-        store._atomic_write(store.root/'sessions'/(identity+'.json'),store._document(dict(cells={},source=None,influence={})))
-    return Session(identity,baseline)
-
-
-def _empty(release):
-    return fs.Snapshot(None,True,release,(),(),(),(),None)
-
-
-def _write_object(store,snapshot,source,box,report):
-    payload=dict(baseline_release=snapshot.baseline_release,entries=[fs._entry_wire(e) for e in snapshot.entries],
-                 source=source,coverage=[list(box)],report=report)
-    digest=fs._hash(payload);path=store.objects/(digest+'.json')
-    if not path.exists():
-        body=store._document(payload);size=count=0
-        for p in store.objects.iterdir():
-            store._no_link(p);count+=1;size+=p.stat().st_size
-            if count>=MAX_OBJECTS: raise fs.ResourceLimit('world building object count capacity')
-        if size+len(body)>WORLD_BYTES: raise fs.ResourceLimit('world building object byte capacity')
-        store._atomic_write(path,body)
-    # Validate both new objects and a possibly damaged existing same-name object
-    # BEFORE any index/session publication can reference it.
-    _load_object(store,digest,snapshot.baseline_release)
-    return digest
-
-
-def _load_object(store,digest,release):
-    if not isinstance(digest,str) or not re.fullmatch('[0-9a-f]{64}',digest): raise fs.CorruptStorage('invalid world object identity')
-    value=store._read(store.objects/(digest+'.json'))
-    if fs._hash(value)!=digest: raise fs.CorruptStorage('world object hash mismatch')
-    if value['source'] is None:
-        if value['entries']: raise fs.CorruptStorage('unattributed world entries')
-        return _empty(release)
-    snapshot=store._decode(digest)
-    if snapshot.baseline_release!=release: raise fs.BaselineMismatch('world cache baseline changed')
-    return snapshot
+        if len(list((store.root/'sessions').iterdir()))>=data.MAX_SESSIONS:raise fs.ResourceLimit('OSM session capacity')
+        descriptor=Session(uuid.uuid4().hex,enabled,refresh)
+        store._atomic_write(store.root/'sessions'/(descriptor.identity+'.json'),store._document(dict(
+            mode=data.MODE,enabled=enabled,refresh=refresh,source=None,cells={},identities={},reports={})))
+    return descriptor
 
 
 class Provider:
-    def __init__(self,md,session,*,reader_factory=None,wall=time.time,sleep=time.sleep,runner=None):
-        self.md,self.session=md,session
-        self.store=_store(md.cache_dir)
-        self._default_reader_factory=lambda:lc.Reader(Path(md.cache_dir)/'mapdata/raw',md.fetcher,
-                                                      tolerant=True,raw_budget=regions.RAW_BYTES)
-        self.reader_factory=reader_factory or self._default_reader_factory
-        self.wall,self.sleep=wall,sleep
-        self.inline_reader=reader_factory is not None  # deterministic fixture hook; production is supervised
-        self.runner=runner
-        self.decoded=OrderedDict()
-        self.cell_views=OrderedDict()
+    def __init__(self,md,session,*,reader_factory=None,runner=None,wall=time.time,sleep=time.sleep):
+        if not isinstance(session,Session) or not re.fullmatch('[0-9a-f]{32}',session.identity):raise ValueError('invalid OSM session')
+        self.md,self.session=md,session;self.store=data.Store(md.cache_dir)
         self.path=self.store.root/'sessions'/(session.identity+'.json')
-        if not re.fullmatch('[0-9a-f]{32}',session.identity): raise ValueError('invalid session identity')
-
-    def object(self,digest):
-        if not isinstance(digest,str) or not re.fullmatch('[0-9a-f]{64}',digest):raise fs.CorruptStorage('invalid world object identity')
-        path=self.store.objects/(digest+'.json')
-        self.store._no_link(path)
-        stamp=path.stat()
-        signature=(stamp.st_size,stamp.st_mtime_ns)
-        got=self.decoded.get(digest)
-        if got is not None and got[0]==signature:
-            self.decoded.move_to_end(digest);return got[1]
-        snapshot=_load_object(self.store,digest,self.md.release)
-        self.decoded[digest]=(signature,snapshot)
-        while len(self.decoded)>8:self.decoded.popitem(last=False)
-        return snapshot
-
-    def _view(self,pinned,keys,heads):
-        # Avoid copying the whole travelled world into every tile's render view.
-        token=(keys[0],heads[str(keys[0])]) if len(keys)==1 else None
-        while self.cell_views and (len(self.cell_views)>8 or sum(v.cache_bytes for v in self.cell_views.values())>buildingrender.CELL_CACHE_BYTES):
-            self.cell_views.popitem(last=False)
-        if token in self.cell_views:
-            self.cell_views.move_to_end(token);return self.cell_views[token]
-        entries=tuple(pinned[k] for k in sorted(pinned) if any(fs._intersects(pinned[k].bounds,key.bounds()) for key in keys))
-        view=buildingrender.BuildingView(None,self.md.release,snapshot=replace(_empty(self.md.release),entries=entries))
-        if token is not None:self.cell_views[token]=view
-        return view
-
-    def _index(self):
-        path=self.store.root/'index.json'
-        if path.exists():
-            value=self.store._read(path)
-            if set(value)!={'release','cells','influence','identities'} or value['release'] not in (None,self.md.release) or len(value['cells'])>MAX_CELLS or set(value['influence'])!=set(value['cells']) or len(value['identities'])>regions.MAX_SOURCE_FEATURES:
-                raise fs.CorruptStorage('world index schema/baseline mismatch')
-            for identity,head in value['identities'].items():
-                if bo.normalize_osm_id(identity)!=identity or not isinstance(head,str) or not re.fullmatch('[0-9a-f]{64}',head):
-                    raise fs.CorruptStorage('world identity index mismatch')
-            if value['release'] is None:
-                if value['cells']:raise fs.CorruptStorage('unversioned world cache')
-                value['release']=self.md.release
-            for key in value['cells']:
-                mapcells.parse(key);fs._bounds(value['influence'][key])
-            return value
-        if (self.store.root/'initialized').exists(): raise fs.CorruptStorage('missing world index; acquisition blocked')
-        return dict(release=self.md.release,cells={},influence={},identities={})
-
-    def cached_entries(self,index,bounds):
-        entries={};source=None
-        for name,head in index['cells'].items():
-            if not fs._intersects(index['influence'][name],bounds):continue
-            snapshot=self.object(head)
-            for e in snapshot.entries:
-                if fs._intersects(e.bounds,bounds):entries.setdefault(e.feature.feature_id,e)
-            if snapshot.entries and snapshot.refreshes:source=snapshot.refreshes[0]['source']
-        return entries,source
-
-    def ready(self,keys):
-        """Non-fetching cache probe: never freeze a fallback just to inspect cache."""
-        state=self._state()  # atomic checksummed replacement
-        return all(str(k) in state['cells'] for k in keys)
+        self.reader_factory=reader_factory;self.runner=runner;self.wall=wall;self.sleep=sleep
+        self.decoded=OrderedDict()
+        self.errors={}
 
     def _state(self):
-        state=self.store._read(self.path)
-        try:
-            if set(state)!={'cells','source','influence'} or not isinstance(state['cells'],dict) or len(state['cells'])>MAX_CELLS or set(state['influence'])!=set(state['cells']):
-                raise ValueError()
-            if state['source'] is not None:primary.validate_version(state['source'])
-            for key,head in state['cells'].items():
-                mapcells.parse(key)
-                fs._bounds(state['influence'][key])
-                if not isinstance(head,str) or not re.fullmatch('[0-9a-f]{64}',head):raise ValueError()
-        except (ValueError,TypeError):raise fs.CorruptStorage('invalid pinned session ledger') from None
-        return state
+        value=self.store._read(self.path)
+        if 'reports' not in value:value['reports']={}  # earlier local prototype session, geometry unchanged
+        if set(value)!={'mode','enabled','refresh','source','cells','identities','reports'} or value['mode']!=data.MODE or \
+                value['enabled']!=self.session.enabled or value['refresh']!=self.session.refresh or \
+                len(value['cells'])>MAX_CELLS or len(value['identities'])>100000 or len(value['reports'])>MAX_CELLS:raise fs.CorruptStorage('invalid OSM session')
+        if value['source'] is not None:data.version(value['source'])
+        for key,head in value['cells'].items():mapcells.parse(key);self.store.digest(head)
+        for identity,head in value['identities'].items():
+            if geom.normalize_osm_id(identity)!=identity:raise fs.CorruptStorage('invalid OSM identity choice')
+            self.store.digest(head)
+        return value
+
+    def object(self,head):
+        self.store.digest(head);p=self.store.objects/(head+'.json');self.store._no_link(p)
+        stamp=p.stat();signature=(stamp.st_size,stamp.st_mtime_ns)
+        got=self.decoded.get(head)
+        if got is not None and got[0]==signature:self.decoded.move_to_end(head);return got[1]
+        value=self.store.object(head);self.decoded[head]=(signature,value)
+        while len(self.decoded)>1 and (len(self.decoded)>8 or sum(v[0][0] for v in self.decoded.values())>64*1024**2):
+            self.decoded.popitem(last=False)
+        return value
+
+    def ready(self,keys):return all(str(k) in self._state()['cells'] for k in keys)
 
     def _pin_source(self,version):
-        primary.validate_version(version)
+        data.version(version)
         with self.store._locked():
-            latest=self._state()
-            if latest['source'] is None:
-                latest['source']=version
-                self.store._atomic_write(self.path,self.store._document(latest))
-            elif latest['source']!=version:raise ValueError('session source version changed during acquisition')
-        return latest
+            state=self._state()
+            if state['source'] is not None and state['source']!=version:raise ValueError('session OSM source version changed')
+            state['source']=version;self.store._atomic_write(self.path,self.store._document(state))
+        return state
 
-    def _acquire(self,key,state,pinned,progress=lambda value:None):
-        jobs=regions.Jobs(self.store);ledger=jobs.read()
-        reader=None;box=key.bounds();results=[]
-        # Previously acquired geometry in neighbouring cells is cache-first even
-        # when those cells have not yet been visited in this particular session.
-        cached_index=self._index()
-        known,_=self.cached_entries(cached_index,box)
-        known.update(pinned);pinned=known
-        if self.md.fetcher.offline_flag: raise OSError('offline: Overture fallback frozen for this session')
-        if self.wall()<max(ledger['clock'],ledger['next_request']):
-            # Requests.admit waits for ordinary spacing; a long Retry-After must
-            # not tie up the renderer or be circumvented by a new cell/worker.
-            if max(ledger['clock'],ledger['next_request'])-self.wall()>2:
-                raise OSError('source cooldown: fallback frozen; retry in a fresh session')
-        try:
-            reader=self.reader_factory()
-            if hasattr(reader,'ranges'):
-                requests=regions.Requests(jobs,ledger,Path(self.md.cache_dir)/'mapdata/raw',self.wall,lambda:False,self.sleep)
-                reader.ranges.admit=requests.admit;reader.ranges.failed=requests.failed
-            if state['source'] is None:
-                version=reader.select(explicit=True)
-                primary.validate_version(version)
-                # Durable source pin BEFORE querying geometry, shared by workers.
-                state=self._pin_source(version)
-            else:
-                version=state['source'];reader.attach(version)
-            progress(dict(phase='source_selected',source=version))
-            if hasattr(reader,'prepare_region'):reader.prepare_region(box)
-            progress(dict(phase='parquet_staged',diagnostics=getattr(reader,'diagnostics',{})))
-            queue=regions.partition(box);index=0
-            while index<len(queue):
-                bounds=queue[index];result=jobs.load(version,bounds)
-                if result is None:
-                    if hasattr(reader,'ranges'):reader.ranges.used=0
-                    try:result=reader.query(bounds)
-                    except fs.ResourceLimit as error:
-                        if 'partition feature budget' not in str(error):raise
-                        if len(queue)+3>regions.MAX_JOBS:raise fs.ResourceLimit('cell retrieval job capacity')
-                        queue[index:index+1]=regions.split(bounds);continue
-                    if tuple(result.bounds)!=tuple(bounds) or result.version!=version:raise ValueError('source job identity changed')
-                    jobs.save_job(result)
-                results.append(result);index+=1
-            influence=fs._union([box]+[bo._bbox(f.geometry) for result in results for f in result.buildings+result.parts])
-            # A returned full footprint can extend past its retrieval cell. Its
-            # retained cached neighbours must participate in conflict checking.
-            context,_=self.cached_entries(cached_index,influence)
-            context.update(pinned);pinned=context
-            pinned.update((e.feature.feature_id,e) for e in self.session.baseline.entries if fs._intersects(e.bounds,influence))
-            # Known accepted buildings are never refreshed by a first visit to
-            # adjoining uncached space. Only explicit pre-game update may do that.
-            identities=set(cached_index['identities']) | {i for e in self.session.baseline.entries for i in bo._identities(e.feature)} | {i for e in pinned.values() for i in bo._identities(e.feature)}
-            filtered=[]
-            for result in results:
-                buildings=tuple(f for f in result.buildings if not set(bo._identities(f)) & identities)
-                ids={f.feature_id for f in buildings}
-                filtered.append(replace(result,buildings=buildings,parts=tuple(p for p in result.parts if p.parent_id in ids)))
-            before=replace(_empty(self.md.release),entries=tuple(e for e in pinned.values() if fs._intersects(e.bounds,influence)))
-            observed={i for result in results for f in result.buildings+result.parts for i in bo._identities(f)}
-            progress(dict(phase='merging',partitions=len(queue),observed=len(observed)))
-            saved,report,checks=regions.candidate(self.md,before,filtered,box,version,known_returned=observed)
-            for check in checks:check.validate(self.md)
-            prior={e.feature.feature_id:e for e in before.entries}
-            restored=[];entries=[]
-            for e in saved.entries:
-                old=prior.get(e.feature.feature_id)
-                if old is not None and fs._entry_wire(e)!=fs._entry_wire(old):
-                    restored.append((e.feature.feature_id,'cached_owner_requires_explicit_refresh'));e=old
-                entries.append(e)
-            if restored:
-                saved=replace(saved,entries=tuple(entries))
-                report.update(all_features_updated=False,deferred_count=report['deferred_count']+len(restored),
-                              deferred=(report['deferred']+restored)[:128])
-            counts=dict(addition=0,replacement=0,unchanged=0)
-            for e in saved.entries:
-                old=prior.get(e.feature.feature_id)
-                action='unchanged' if old is not None and fs._entry_wire(e)==fs._entry_wire(old) else \
-                       'addition' if e.baseline_digest is None else 'replacement'
-                counts[action]+=1
-            report['counts']=counts
-            report.update(mode='world_first_visit',partitions=len(queue),coverage_complete=True,
-                          cached_identities_reused=len(observed & identities),freshness_checked=False,
-                          source_diagnostics=getattr(reader,'diagnostics',{}))
-            progress(dict(phase='validated',entries=len(saved.entries)))
-            return saved,version,report
-        finally:
-            if reader is not None:reader.close()
-
-    def _claim_path(self,key):
-        return self.store.root/'claims'/(fs._hash([self.session.identity,str(key)])+'.json')
+    def _claim_path(self,key):return self.store.root/'claims'/(fs._hash([self.session.identity,str(key)])+'.json')
 
     def _claim(self,key):
         value=self.store._read(self._claim_path(key))
-        if set(value)!={'session','cell','token','status','owner','expires'} or \
-                value['session']!=self.session.identity or value['cell']!=str(key) or \
+        if set(value)!={'session','cell','token','status','owner','expires'} or value['session']!=self.session.identity or value['cell']!=str(key) or \
                 not isinstance(value['token'],str) or not re.fullmatch('[0-9a-f]{32}',value['token']) or \
                 value['status'] not in ('pending','chosen') or type(value['owner']) is not int or value['owner']<=0 or \
-                type(value['expires']) not in (int,float) or not math.isfinite(value['expires']) or value['expires']<0:
-            raise fs.CorruptStorage('invalid acquisition claim')
+                type(value['expires']) not in (int,float) or not math.isfinite(value['expires']):raise fs.CorruptStorage('invalid OSM claim')
         return value
 
     def claim_valid(self,key,token):
-        path=self._claim_path(key)
-        if not path.exists():return False
-        value=self._claim(key)
-        return value['token']==token and value['status']=='pending' and self.wall()<=value['expires']
+        return self._claim_path(key).exists() and (v:=self._claim(key))['status']=='pending' and v['token']==token and self.wall()<=v['expires']
 
-    def _pinned(self,state,keys):
-        manual_ids={i for e in self.session.baseline.entries for i in bo._identities(e.feature)}
-        entries={e.feature.feature_id:e for e in self.session.baseline.entries
-                 if any(fs._intersects(e.bounds,k.bounds()) for k in keys)}
-        for name,head in state['cells'].items():
-            if any(fs._intersects(state['influence'][name],k.bounds()) for k in keys):
-                for e in self.object(head).entries:
-                    if e.feature.feature_id not in entries and not set(bo._identities(e.feature)) & manual_ids:
-                        entries[e.feature.feature_id]=e
-        return entries
+    def _publish(self,key,token,snapshot,source,report):
+        # Immutable source object + index first; game/session choice remains a
+        # separate transaction. A killed parent cannot discard validated work.
+        with self.store._locked():
+            if not self.claim_valid(key,token):raise fs.StalePreview('OSM acquisition claim fenced')
+            if self._state()['source']!=source:raise fs.StalePreview('OSM source pin fenced')
+            index=self.store.index()
+            if str(key) in index['cells'] and not self.session.refresh:return index['cells'][str(key)]
+            if len(index['cells'])>=MAX_CELLS and str(key) not in index['cells']:raise fs.ResourceLimit('OSM cell capacity')
+            old_head=index['cells'].get(str(key));reused=0;accepted=[];owners={}
+            for entry in snapshot.entries:
+                owner=index['identities'].get(entry.feature.feature_id)
+                if owner is not None and not self.session.refresh:
+                    if owner not in owners:owners[owner]={e.feature.feature_id:e for e in self.object(owner)[0].entries}
+                    prior=owners[owner].get(entry.feature.feature_id)
+                    if prior is None:raise fs.CorruptStorage('cached OSM parent owner missing')
+                    entry=prior;reused+=1
+                elif not self.session.refresh and any(p.feature_id in index['identities'] for p in entry.parts):
+                    report=dict(report,issue_count=report['issue_count']+1,all_features_updated=False,
+                                issues=(report['issues']+[(entry.feature.feature_id,'part_identity_in_other_cached_parent')])[:128])
+                    continue
+                accepted.append(entry)
+            snapshot=replace(snapshot,entries=tuple(accepted))
+            report=dict(report,cached_osm_identities_reused=reused,all_features_updated=bool(report.get('all_features_updated')) and not reused)
+            ids={f.feature_id for e in snapshot.entries for f in (e.feature,)+e.parts}
+            if len(set(index['identities'])|ids)>100000:raise fs.ResourceLimit('persistent OSM identity capacity')
+            head=self.store.write(snapshot,source,key.bounds(),report)
+            if self.session.refresh and old_head is not None:
+                for entry in self.object(old_head)[0].entries:
+                    for f in (entry.feature,)+entry.parts:
+                        if f.feature_id not in ids and index['identities'].get(f.feature_id)==old_head:
+                            index['identities'].pop(f.feature_id,None)
+            for identity in ids:
+                if self.session.refresh:index['identities'][identity]=head
+                else:index['identities'].setdefault(identity,head)
+            index['cells'][str(key)]=head
+            index['influence'][str(key)]=fs._union([key.bounds()]+[e.bounds for e in snapshot.entries])
+            self.store._atomic_write(self.store.root/'index.json',self.store._document(index))
+            return head
 
-    def _cooldown(self):
-        # Caller owns query-lane and has joined its child. No request-ledger
-        # writer can still be alive; the publication mutex is not held here.
-        with lease_store(self.store,'query-network',1.)._locked():
-            jobs=regions.Jobs(self.store);ledger=jobs.read()
-            ledger.update(clock=max(ledger['clock'],self.wall()),next_request=max(ledger['next_request'],self.wall()+60))
-            jobs.save(ledger)
+    def _acquire(self,key,state,pinned=None,progress=lambda value:None,token=None):
+        if not self.session.enabled:raise OSError('OSM building retrieval not authorized')
+        if self.md.fetcher.offline_flag:raise OSError('offline: no cached OSM cell')
+        ledger=jobs.Jobs(self.store);request_state=ledger.read()
+        if max(request_state['clock'],request_state['next_request'])-self.wall()>2:raise OSError('OSM source cooldown')
+        reader=self.reader_factory() if self.reader_factory else lc.Reader(Path(self.md.cache_dir)/'mapdata/raw',self.md.fetcher,tolerant=True,raw_budget=jobs.RAW_BYTES)
+        try:
+            if hasattr(reader,'ranges'):
+                limits=jobs.Requests(ledger,request_state,Path(self.md.cache_dir)/'mapdata/raw',self.wall,lambda:False,self.sleep)
+                reader.ranges.admit=limits.admit;reader.ranges.failed=limits.failed
+            source=state['source']
+            if source is None:source=reader.select(explicit=True);self._pin_source(source)
+            else:reader.attach(source)
+            progress(dict(phase='source_selected',source=source))
+            if hasattr(reader,'prepare_region'):reader.prepare_region(key.bounds())
+            progress(dict(phase='parquet_staged',diagnostics=getattr(reader,'diagnostics',{})))
+            queue=jobs.partition(key.bounds());results=[];index=0
+            while index<len(queue):
+                bounds=queue[index];result=ledger.load(source,bounds)
+                if result is None:
+                    try:result=reader.query(bounds)
+                    except fs.ResourceLimit as e:
+                        if 'partition feature budget' not in str(e):raise
+                        if len(queue)+3>jobs.MAX_JOBS:raise fs.ResourceLimit('OSM cell partition capacity')
+                        queue[index:index+1]=jobs.split(bounds);continue
+                    if tuple(result.bounds)!=tuple(bounds) or result.version!=source:raise ValueError('OSM response identity changed')
+                    ledger.save_job(result)
+                results.append(result);index+=1
+            snapshot,report=data.normalize(results)
+            report.update(mode='osm_first_visit',partitions=len(queue),source=source,source_diagnostics=getattr(reader,'diagnostics',{}),freshness_checked=self.session.refresh)
+            progress(dict(phase='validated',entries=len(snapshot.entries),issues=report['issue_count']))
+            if token is None:raise ValueError('OSM claim required for publication')
+            head=self._publish(key,token,snapshot,source,report)
+            progress(dict(phase='published',head=head))
+            return head
+        finally:reader.close()
+
+    def _choose(self,key,error=None):
+        if self.ready((key,)):return
+        with self.store._locked():
+            state=self._state()
+            if str(key) in state['cells']:return
+            index=self.store.index();head=index['cells'].get(str(key))
+            if head is None:
+                known={};source=None
+                for name in sorted(index['cells']):
+                    if not fs._intersects(index['influence'][name],key.bounds()):continue
+                    saved,raw=self.object(index['cells'][name])
+                    for e in saved.entries:
+                        if fs._intersects(e.bounds,key.bounds()):known.setdefault(e.feature.feature_id,e);source=source or raw['source']
+                report=dict(mode='osm_cached_partial' if known else 'osm_unavailable',coverage_complete=False,
+                            error=str(error or 'OSM data unavailable')[:512])
+                snapshot=replace(data.empty(),entries=tuple(known[k] for k in sorted(known)))
+                head=self.store.write(snapshot,source,key.bounds(),report)
+                log.warning('OSM cell %s: %s',key,report)
+            else:log.info('OSM cell %s: osm_cached head=%s',key,head)
+            snapshot,raw=self.object(head)
+            for entry in snapshot.entries:
+                # Pin entire parent/part groups, never suppress a valid building
+                # simply because its footprint crosses an earlier cell.
+                owner=state['identities'].get(entry.feature.feature_id,head)
+                for f in (entry.feature,)+entry.parts:state['identities'].setdefault(f.feature_id,owner)
+            if len(state['identities'])>100000 or len(state['cells'])>=MAX_CELLS:raise fs.ResourceLimit('OSM session capacity')
+            state['cells'][str(key)]=head
+            state['reports'][str(key)]=dict(mode=raw['report'].get('mode','osm_cached'),issues=raw['report'].get('issue_count',0))
+            self.store._atomic_write(self.path,self.store._document(state))
+            if self._claim_path(key).exists():
+                claim=self._claim(key);claim['status']='chosen';self.store._atomic_write(self._claim_path(key),self.store._document(claim))
+            try:
+                reports=state['reports'].values()
+                summary=dict(mode=data.MODE,unavailable=sum(r['mode']=='osm_unavailable' for r in reports),
+                    partial=sum(r['mode']=='osm_cached_partial' for r in reports),unsupported=sum(bool(r['issues']) for r in reports))
+                self.store._atomic_write(self.store.root/'status'/(self.session.identity+'.json'),self.store._document(summary))
+            except OSError:log.warning('OSM status summary could not be written; geometry choice is already durable')
+
+    def note(self):
+        """Tiny, read-only advisory for the existing status text; never fetches."""
+        if not self.session.enabled:return 'OSM acquisition disabled; saved OSM only'
+        path=self.store.root/'status'/(self.session.identity+'.json')
+        if not path.exists():return ''
+        try:
+            value=self.store._read(path)
+            if value['mode']!=data.MODE or any(type(value[k]) is not int or not 0<=value[k]<=MAX_CELLS for k in ('unavailable','partial','unsupported')):
+                raise ValueError('invalid status counts')
+            parts=[]
+            if value['unavailable']:parts.append(f"{value['unavailable']} session cells unavailable")
+            if value['partial']:parts.append(f"{value['partial']} session cells use partial cached OSM")
+            if value['unsupported']:parts.append(f"unsupported records in {value['unsupported']} cells")
+            return 'OSM buildings: '+ '; '.join(parts) if parts else ''
+        except (OSError,ValueError,TypeError,KeyError):return 'OSM building status unavailable; inspect companion log'
 
     def _resolve(self,key,deadline):
         token=None
-        while True:
+        while not self.ready((key,)):
             with self.store._locked():
-                state=self._state()
-                if str(key) in state['cells']:return
-                if str(key) in self._index()['cells']:
-                    cached=True
-                else:
-                    cached=False;path=self._claim_path(key)
-                    if not path.exists() and time.monotonic()<deadline:
-                        if len(list(path.parent.iterdir()))>=MAX_OBJECTS:raise fs.ResourceLimit('acquisition claim capacity')
-                        token=uuid.uuid4().hex
-                        self.store._atomic_write(path,self.store._document(dict(session=self.session.identity,cell=str(key),
-                            token=token,status='pending',owner=os.getpid(),expires=self.wall()+max(0,deadline-time.monotonic()))))
-                    elif path.exists():
-                        claim=self._claim(key)
-                        if claim.get('status')!='pending':
-                            raise fs.CorruptStorage('chosen acquisition claim has no session choice')
-                        if self.wall()>claim['expires']:break
-                pinned=self._pinned(state,(key,))
-            if cached:
-                self._choose((key,));return
-            if token is not None:break
-            if time.monotonic()>=deadline:break
-            self.sleep(min(.05,max(0,deadline-time.monotonic())))
-        if token is None:
-            self._choose((key,),TimeoutError('acquisition read budget exhausted while awaiting owner'))
-            return
-        started=time.monotonic()
-        try:
-            with lease_store(self.store,'query-lane',deadline-time.monotonic())._locked():
-                # Another reader may have chosen a safe fallback while this
-                # acquisition was queued. Never overwrite that immutable choice.
                 if self.ready((key,)):return
-                if time.monotonic()>=deadline:raise TimeoutError('acquisition read budget exhausted in queue')
-                try:
-                    if self.inline_reader or self.reader_factory is not self._default_reader_factory:
-                        acquired=self._acquire(key,state,pinned)
-                    elif self.md.fetcher.offline_flag:
-                        raise OSError('offline: Overture fallback frozen for this session')
+                if str(key) in self.store.index()['cells'] and not self.session.refresh:break
+                path=self._claim_path(key)
+                claim=self._claim(key) if path.exists() else None
+                if claim is not None and claim['status']!='pending':raise fs.CorruptStorage('OSM chosen claim missing session choice')
+                expired=claim is not None and claim['expires']<self.wall()
+                if (not path.exists() or expired) and time.monotonic()<deadline:
+                    if not path.exists() and len(list(path.parent.iterdir()))>=MAX_OBJECTS:raise fs.ResourceLimit('OSM claim capacity')
+                    token=uuid.uuid4().hex
+                    self.store._atomic_write(path,self.store._document(dict(session=self.session.identity,cell=str(key),token=token,
+                        status='pending',owner=os.getpid(),expires=self.wall()+max(0,deadline-time.monotonic())+PUBLICATION_S)))
+                    break
+                if path.exists():
+                    claim=self._claim(key)
+                    if claim['status']!='pending':raise fs.CorruptStorage('OSM chosen claim missing session choice')
+                    if self.wall()>claim['expires']:break
+            if time.monotonic()>=deadline:break
+            self.sleep(.02)
+        error=None
+        if token is not None:
+            admitted=False
+            try:
+                if not self.session.enabled:raise OSError('OSM acquisition is not authorized; buildings unavailable')
+                if self.md.fetcher.offline_flag:raise OSError('offline: no complete cached OSM cell')
+                with self.store.lease('query-lane',deadline-time.monotonic())._locked():
+                    if self.ready((key,)):return
+                    if time.monotonic()>=deadline:raise TimeoutError('OSM acquisition queue deadline')
+                    admitted=True
+                    if self.reader_factory is not None:
+                        self._acquire(key,self._state(),progress=lambda p:log.info('OSM %s: %s',key,p),token=token)
                     else:
                         from buildingacquire import Runner
-                        request=dict(cache=str(self.md.cache_dir),release=self.md.release,offline=False,
-                            session=self.session,key=key,token=token,pinned=tuple(pinned.values()))
-                        def progress(value):log.info('OSM acquisition %s %.2fs: %s',key,time.monotonic()-started,value)
-                        acquired=(self.runner or Runner()).run(request,deadline,progress)
-                    if time.monotonic()>=deadline:raise TimeoutError('acquisition deadline before publication')
-                except (OSError,ValueError,RuntimeError) as error:
-                    acquired=error
-                    try:self._cooldown()
-                    except (OSError,ValueError):pass
-                self._choose((key,),acquired,token)
-        except fs.LockTimeout as error:
-            self._choose((key,),TimeoutError('acquisition lane deadline: '+str(error)))
+                        request=dict(cache=str(self.md.cache_dir),session=self.session,key=key,token=token,
+                                     release=data.MODE,offline=self.md.fetcher.offline_flag,pinned=())
+                        (self.runner or Runner()).run(request,deadline,lambda p:log.info('OSM %s: %s',key,p))
+            except (OSError,ValueError,RuntimeError) as e:
+                if not admitted and isinstance(e,(fs.LockTimeout,TimeoutError)):
+                    raise fs.LockTimeout('OSM acquisition queued; defer ordinary generation and retry') from e
+                error=e
+                self.errors[str(key)]=str(e)[:512]
+                # The request reservation already survives a killed query.
+                # Don't hold the metadata mutex or retry this session's choice.
+                log.warning('OSM acquisition %s: %s',key,str(e)[:512])
+        if token is None and not self.ready((key,)) and str(key) not in self.store.index()['cells']:
+            raise fs.LockTimeout('OSM acquisition pending; defer ordinary generation and retry')
+        self._choose(key,error)
 
     def view(self,keys,*,preferred_bounds=None):
         keys=tuple(sorted(set(keys)))
-        if any(k.z!=mapcells.ZOOM for k in keys):raise ValueError('world acquisition uses the ordinary map-data cell grid')
-        deadline=time.monotonic()+READ_BUDGET_S
-        order=keys
+        if any(k.z!=mapcells.ZOOM for k in keys):raise ValueError('OSM data-cell zoom required')
+        order=keys;deadline=time.monotonic()+READ_BUDGET_S
         if preferred_bounds is not None:
-            w,s,e,n=fs._bounds(preferred_bounds);cx,cy=(w+e)/2,(s+n)/2
-            order=sorted(keys,key=lambda key:((key.center()[1]-cx)*math.cos(math.radians(cy)))**2+(key.center()[0]-cy)**2)
+            w,s,e,n=fs._bounds(preferred_bounds);x,y=(w+e)/2,(s+n)/2
+            order=sorted(keys,key=lambda k:((k.center()[1]-x)*math.cos(math.radians(y)))**2+(k.center()[0]-y)**2)
         for key in order:self._resolve(key,deadline)
-        return self._commit(keys)
-
-    def _commit(self,keys,prepared=None,claim_token=None):
-        pinned,keys,heads=self._choose(keys,prepared,claim_token)
-        if pinned is None:pinned=self._pinned(self._state(),keys)
-        # Geometry conversion for rendering is private to this reader. It must
-        # never extend the shared publication critical section.
-        return self._view(pinned,keys,heads)
-
-    def _choose(self,keys,prepared=None,claim_token=None):
-        keys=tuple(sorted(set(keys)))
-        if any(k.z!=mapcells.ZOOM for k in keys):raise ValueError('world acquisition uses the ordinary map-data cell grid')
-        state=self._state()
-        if all(str(k) in state['cells'] for k in keys):
-            # Atomic ledger + immutable objects: ordinary cached reads need no
-            # exclusive writer mutex, including potentially costly decoding.
-            return None,keys,state['cells']
-        with self.store._locked():
-            state=self._state()
-            manual_ids={i for e in self.session.baseline.entries for i in bo._identities(e.feature)}
-            manual={e.feature.feature_id:e for e in self.session.baseline.entries
-                    if any(fs._intersects(e.bounds,key.bounds()) for key in keys)}
-            if all(str(k) in state['cells'] for k in keys):
-                return None,keys,state['cells']
-            index=self._index()
-            pinned=dict(manual)
-            frozen_keys={mapcells.parse(k) for k in state['cells']}
-            # Keep all choices durably, but materialize only their relevant full
-            # influences. Travelling elsewhere must not consume a cumulative
-            # in-memory building quota or reload the whole travelled world.
-            frozen={mapcells.parse(k):self.object(h) for k,h in state['cells'].items()
-                    if any(fs._intersects(state['influence'][k],key.bounds()) for key in keys)}
-            # Manual accepted snapshot always wins over older first-visit objects.
-            for snapshot in frozen.values():
-                for e in snapshot.entries:
-                    if e.feature.feature_id not in pinned and not set(bo._identities(e.feature)) & manual_ids:
-                        pinned[e.feature.feature_id]=e
-            for key in keys:
-                if key in frozen_keys:continue
-                if len(state['cells'])>=MAX_CELLS:raise fs.ResourceLimit('session geographic choice capacity')
-                name=str(key);digest=index['cells'].get(name)
-                report=dict(mode='world_cached',coverage_complete=True)
-                source=None
-                if digest:
-                    chosen=self.object(digest)
-                    raw=self.store._read(self.store.objects/(digest+'.json'));source=raw['source']
-                    report=dict(raw['report'],mode='world_cached',freshness_checked=False)
-                else:
-                    fallback,fallback_source=self.cached_entries(index,key.bounds())
-                    try:
-                        if len(index['cells'])>=MAX_CELLS:raise fs.ResourceLimit('persistent cell capacity')
-                        if isinstance(prepared,BaseException):raise prepared
-                        if prepared is None:raise TimeoutError('no acquisition result; fallback frozen')
-                        if claim_token is None or not self.claim_valid(key,claim_token):raise TimeoutError('acquisition result fenced')
-                        chosen,source,report=prepared
-                        if state['source']!=source:raise ValueError('acquisition source pin changed')
-                        identities={i for e in chosen.entries for f in (e.feature,)+e.parts for i in bo._identities(f)}
-                        if len(set(index['identities']) | identities)>regions.MAX_SOURCE_FEATURES:
-                            raise fs.ResourceLimit('persistent OSM identity capacity')
-                        digest=_write_object(self.store,chosen,source,key.bounds(),report)
-                        index['cells'][name]=digest
-                        index['influence'][name]=fs._union([key.bounds()]+[e.bounds for e in chosen.entries])
-                        for identity in identities:index['identities'].setdefault(identity,digest)
-                        self.store._atomic_write(self.store.root/'initialized',b'1\n')
-                        self.store._atomic_write(self.store.root/'index.json',self.store._document(index))
-                    except (OSError,ValueError,RuntimeError) as error:
-                        digest=None  # a failed index write must not select its uncommitted candidate
-                        source=fallback_source
-                        chosen=replace(_empty(self.md.release),entries=tuple(fallback[k] for k in sorted(fallback)))
-                        report=dict(mode='world_fallback',coverage_complete=False,error=str(error)[:512])
-                        log.warning('OSM first visit %s: %s',name,report)
-                accepted=dict(pinned);deferred=0
-                previous=regions.SpatialEntries(pinned.values())
-                for e in chosen.entries:
-                    fid=e.feature.feature_id
-                    if fid in pinned or set(bo._identities(e.feature)) & manual_ids:continue
-                    # This is the key no-live-replacement fence. An influence
-                    # touching previously rendered cells cannot be introduced.
-                    if any(fs._intersects(e.bounds,k.bounds()) for k in frozen_keys):
-                        deferred+=1;continue
-                    if any(fs._intersects(bo._bbox(e.feature.geometry),bo._bbox(old.feature.geometry)) and
-                           bo._overlap(e.feature.geometry,bo._validated(e.feature.geometry)[0],
-                                       old.feature.geometry,bo._validated(old.feature.geometry)[0])
-                           for old in previous.near(bo._bbox(e.feature.geometry)) if old.feature.status=='building'):
-                        deferred+=1;continue
-                    accepted[fid]=e
-                if len(accepted)+sum(len(e.parts) for e in accepted.values())>primary.REGIONAL_LIMITS.max_entries:
-                    accepted=dict(pinned)
-                    report=dict(mode='world_fallback',coverage_complete=False,error='building read entry capacity')
-                    log.warning('OSM first visit %s: %s',name,report)
-                local=replace(_empty(self.md.release),entries=tuple(accepted[fid] for fid in sorted(accepted) if fs._intersects(accepted[fid].bounds,key.bounds())))
-                report=dict(report,session_boundary_deferred=deferred,
-                            all_features_updated=bool(report.get('all_features_updated')) and deferred==0)
-                # Session object includes the already pinned neighbour decisions,
-                # so a respawned worker reconstructs the same cross-cell geometry.
-                session_source=source or state['source']
-                if local.entries and session_source is None:
-                    session_source=self.session.baseline.refreshes[0]['source']
-                if digest is not None and not deferred and \
-                        [fs._entry_wire(e) for e in local.entries]==[fs._entry_wire(e) for e in chosen.entries]:
-                    head=digest  # a session choice need not duplicate an immutable cache object
-                else:
-                    head=_write_object(self.store,local,session_source,key.bounds(),report)
-                state['cells'][name]=head
-                state['influence'][name]=fs._union([key.bounds()]+[e.bounds for e in local.entries])
-                self.store._atomic_write(self.path,self.store._document(state))
-                claim=self._claim_path(key)
-                if claim.exists():
-                    value=self.store._read(claim);value['status']='chosen'
-                    self.store._atomic_write(claim,self.store._document(value))
-                frozen[key]=local;frozen_keys.add(key);pinned=accepted
-                log.info('OSM cell %s: %s',name,report)
-            return pinned,keys,state['cells']
+        state=self._state();entries={};reports=[];lookups={}
+        for key in keys:
+            snapshot,raw=self.object(state['cells'][str(key)]);reports.append(raw['report'])
+            for entry in snapshot.entries:
+                identity=entry.feature.feature_id;owner=state['identities'][identity]
+                if owner not in lookups:lookups[owner]={e.feature.feature_id:e for e in self.object(owner)[0].entries}
+                selected=lookups[owner].get(identity)
+                if selected is None:raise fs.CorruptStorage('OSM identity owner missing')
+                if any(fs._intersects(selected.bounds,k.bounds()) for k in keys):entries[identity]=selected
+        if len(entries)+sum(len(e.parts) for e in entries.values())>data.MAX_FEATURES:raise fs.ResourceLimit('OSM render-read feature capacity')
+        return View(replace(data.empty(),entries=tuple(entries[k] for k in sorted(entries))),dict(cells=reports,errors=dict(self.errors)))
 
 
-def saved_entries(cache,bounds,release,ignore=()):
-    """Explicit offline refresh must also retain absent earlier first-visit data."""
-    store=_store(cache);entries={}
-    with store._locked():
-        path=store.root/'index.json'
-        if not path.exists():return ()
-        index=store._read(path)
-        if index['release'] is None and not index['cells']:return ()
-        if index['release']!=release:raise fs.BaselineMismatch('world cache baseline changed')
-        if len(index['cells'])>MAX_CELLS:raise fs.CorruptStorage('world index cell budget')
-        for key,head in index['cells'].items():
-            if not fs._intersects(mapcells.parse(key).bounds(),bounds):continue
-            for entry in _load_object(store,head,release).entries:
-                if entry.feature.feature_id in ignore:continue
-                if fs._intersects(entry.bounds,bounds):
-                    old=entries.get(entry.feature.feature_id)
-                    if old is not None and fs._entry_wire(old)!=fs._entry_wire(entry):
-                        raise fs.CorruptStorage('cached neighbouring cells disagree')
-                    entries[entry.feature.feature_id]=entry
-    return tuple(entries[k] for k in sorted(entries))
+def refresh(cache,keys,fetcher,*,reader_factory=None):
+    """Explicit source replacement only while the companion session lease is free."""
+    from types import SimpleNamespace
+    store=data.Store(cache)
+    with store.session():
+        with store._locked():index=store.index()
+        selected=set(keys);ids_by_cell={};inspected=0
+        def identities(name):
+            nonlocal inspected
+            if name not in ids_by_cell:
+                snapshot,_=store.object(index['cells'][name])
+                values={f.feature_id for e in snapshot.entries for f in (e.feature,)+e.parts}
+                inspected+=len(values)
+                if inspected>100000:raise fs.ResourceLimit('manual OSM identity closure capacity; previous data retained')
+                ids_by_cell[name]=values
+            return ids_by_cell[name]
+        # Refresh all cached copies of connected full footprints/parts together.
+        # No geometry comparison, baseline lookup or active-session mutation.
+        while True:
+            if len(selected)>256:raise fs.ResourceLimit('manual OSM cell closure capacity; previous data retained')
+            known=set().union(*(identities(str(k)) for k in selected if str(k) in index['cells']))
+            owners={index['identities'][i] for i in known if i in index['identities']}
+            extra={mapcells.parse(name) for name in index['cells'] if mapcells.parse(name) not in selected and
+                   (index['cells'][name] in owners or any(fs._intersects(index['influence'][name],k.bounds()) for k in selected)) and identities(name)&known}
+            if not extra:break
+            selected|=extra
+        with store._locked():store._atomic_write(store.root/'rollback.json',store._document(index))
+        session=start(cache,refresh=True)
+        provider=Provider(SimpleNamespace(cache_dir=cache,fetcher=fetcher),session,reader_factory=reader_factory)
+        reports=[]
+        for key in sorted(selected):reports.append(provider.view((key,)).report)
+        return dict(mode=data.MODE,checked=not provider.errors,errors=dict(provider.errors),reports=reports,
+                    cells=len(selected),effective='new session')
+
+
+def status(cache):
+    store=data.Store(cache)
+    with store._locked():index=store.index()
+    return dict(mode=data.MODE,worldwide_enabled=configured(cache),cached_cells=len(index['cells']),freshness='manual_only',
+                note='No Overture buildings. Missing source data is reported unavailable; cached OSM data is reused.')
+
+
+def rollback(cache):
+    store=data.Store(cache)
+    with store.session(),store._locked():
+        previous=store._read(store.root/'rollback.json')
+        if set(previous)!={'mode','cells','influence','identities'} or previous['mode']!=data.MODE or len(previous['cells'])>MAX_CELLS or set(previous['cells'])!=set(previous['influence']):
+            raise fs.CorruptStorage('invalid OSM rollback index')
+        for key,head in previous['cells'].items():mapcells.parse(key);store.object(head)
+        store._atomic_write(store.root/'index.json',store._document(previous))
+    return dict(mode=data.MODE,rolled_back=True,effective='new session')
+
+
+def main(argv=None):
+    import argparse,json,netfetch
+    p=argparse.ArgumentParser(description='OSM-only buildings: status or explicit next-session regional freshness')
+    p.add_argument('--cache-dir',required=True);p.add_argument('--status',action='store_true')
+    p.add_argument('--center',nargs=2,type=float);p.add_argument('--radius-km',type=float,default=3.)
+    p.add_argument('--user-dir');p.add_argument('--confirm-source-policy',action='store_true')
+    args=p.parse_args(argv)
+    if args.status:print(json.dumps(status(args.cache_dir),indent=2));return
+    if not args.confirm_source_policy:p.error('explicit source-policy confirmation required for freshness')
+    centre=args.center
+    if centre is None and args.user_dir:
+        path=Path(args.user_dir)/'settings/beamngEarth_lastpos.json'
+        for q in (path,*path.absolute().parents):data.Store._no_link(q)
+        with path.open('rb') as f:raw=f.read(16385)
+        if len(raw)>16384:raise ValueError('saved position exceeds size limit')
+        value=json.loads(raw);centre=(value['lat'],value['lon'])
+    if centre is None:p.error('supply --center LAT LON or an isolated --user-dir for manual freshness')
+    w,s,e,n=jobs.area(*centre,args.radius_km)
+    keys=mapcells.cells_for_bbox(s,w,n,e,max_cells=256)
+    enable(args.cache_dir,policy_confirmed=True)
+    fetcher=netfetch.Fetcher(stats_dir=str(Path(args.cache_dir)/'netstats'))
+    try:print(json.dumps(refresh(args.cache_dir,keys,fetcher),indent=2))
+    finally:fetcher.close()
+
+
+if __name__=='__main__':main()

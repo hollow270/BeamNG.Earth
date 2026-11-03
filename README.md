@@ -1,8 +1,9 @@
 # BeamNG.Earth
 
-This fork's opt-in development workflow for manual OSM building refresh is described
-in [Live OSM buildings (Stage 5B2)](docs/LIVE_OSM_BUILDINGS.md), including local
-configuration, tests and remaining Stage 6 engine verification.
+This fork uses [worldwide OSM-only building streaming](docs/LAYERCAKE_BUILDINGS.md):
+automatic first visits, persistent cache-first revisits and manual freshness for a
+new session. No Overture building fallback or live collider replacement is used.
+The fork targets BeamNG.drive 0.40.1.0; final real-engine acceptance is pending.
 
 A 1:1 scale, streamed Earth for [BeamNG.drive](https://www.beamng.com/): drive anywhere on the
 planet on real elevation data and satellite imagery, with distance-based level of detail and the
@@ -363,7 +364,7 @@ The repository contains only code; all map data is downloaded at runtime and cac
 - Canada: HRDEM (contains information licensed under the Open Government Licence - Canada, Natural Resources
   Canada); British Columbia: LidarBC terrain, surface models (tree heights) and orthophotos (contains
   information licensed under the Open Government Licence - British Columbia).
-- Roads, buildings, water and places: Overture Maps / OpenStreetMap contributors (lane counts, widths and speed limits from OpenStreetMap via OSM US Layercake); trees from a
+- Buildings: OpenStreetMap contributors via OSM US Layercake, exclusively. Roads, water and places: Overture Maps / OpenStreetMap contributors (lane counts, widths and speed limits from OpenStreetMap via OSM US Layercake); trees from a
   canopy height model; airports from OurAirports.
 - Oil wells and refineries: OpenStreetMap contributors (ODbL; the bundled `oil_wells.npz` and `refineries.npz`).
 - Highway signs: OpenStreetMap contributors (ODbL; exit and overhead destinations and mile references, rebuilt

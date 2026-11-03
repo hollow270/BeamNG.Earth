@@ -75,6 +75,7 @@ class PrimaryTest(unittest.TestCase):
         md.pin_buildings(snapshot)
         return md
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_real_agadir_identity_geometry_reaches_existing_native_mesh(self):
         raw=dict(FIXTURE['row']); raw['geometry']=wkb(raw['geometry'])
         data=lc.normalize([raw],(-9.5552,30.4119,-9.5516,30.4136),VERSION)
@@ -92,6 +93,7 @@ class PrimaryTest(unittest.TestCase):
         ring,_=bo._validated(FIXTURE['row']['geometry'])
         self.assertTrue(bo._inside((-9.5524592,30.412876),ring,boundary=True))
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_identity_replacement_spatial_duplicate_and_independent_fallback(self):
         duplicate=replace(fx.record('ml',x=110),sources=({'dataset':'Microsoft','record_id':'ml-1'},))
         other=replace(fx.record('other',x=180),sources=({'dataset':'Microsoft','record_id':'ml-2'},))
@@ -108,6 +110,7 @@ class PrimaryTest(unittest.TestCase):
             np.testing.assert_array_equal(v,view.cell(fx.CELL,layers=('roads',)).layers['roads'].to_arrays('')[k])
         self.assertEqual(md.versions(),view.versions())
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_two_sessions_height_geometry_and_local_cache_keys(self):
         md=self.md([fx.record()]); first=self.persist(md,source([row(height='20')]))
         a=self.view(md,first)
@@ -126,6 +129,7 @@ class PrimaryTest(unittest.TestCase):
         self.assertEqual(snapshot.revision,first.revision); self.assertFalse(report['checked'])
         self.assertEqual(snapshot,primary.Store(self.root/'primary').load())
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_missing_identity_is_not_deletion_but_positive_proof_suppresses_baseline(self):
         md=self.md([fx.record()]); first=self.persist(md,source([row()]))
         absent=source([])
@@ -146,6 +150,7 @@ class PrimaryTest(unittest.TestCase):
             self.persist(md,source([row()]),wall=3800)
         self.assertEqual(primary.Store(self.root/'primary').load().revision,again.revision)
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_parts_are_atomic_and_multipolygons_are_not_flattened(self):
         outer=fx.polygon(60,60,20,20); inner=fx.polygon(62,62,5,5)
         data=source([row(1,outer)])
@@ -230,6 +235,7 @@ class PrimaryTest(unittest.TestCase):
             primary.refresh(md,self.root/'primary',reader=Changed(),bounds=data.bounds,wall=lambda:1700)
         self.assertEqual(primary.Store(self.root/'primary').load().revision,first.revision)
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_actual_startup_pins_cached_snapshot_before_workers_without_refresh(self):
         import earthd
         md=self.md(); saved=self.persist(md,source([row()]))

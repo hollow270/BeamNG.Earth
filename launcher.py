@@ -1148,7 +1148,7 @@ def main():
         # Before install, Steam/process discovery, dialogs or any launch path.
         # No app settings are written by this action.
         sys.path.insert(0,os.path.join(ROOT,'server'))
-        import buildingregions
+        import buildingworld
         cache=args.cache_dir or apppaths.saved_cache_dir() or apppaths.default_cache_dir()
         if cache.strip().lower()=='default': cache=apppaths.default_cache_dir()
         if args.osm_buildings_enable:
@@ -1163,7 +1163,7 @@ def main():
         if args.osm_center: flags+=['--center',*[str(v) for v in args.osm_center]]
         if args.user_dir: flags+=['--user-dir',args.user_dir]
         if args.osm_source_policy_confirmed: flags+=['--confirm-source-policy']
-        buildingregions.main(flags)
+        buildingworld.main(flags)
         return
     if IS_WIN:
         windows_console()

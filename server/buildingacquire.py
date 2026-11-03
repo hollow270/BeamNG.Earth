@@ -20,12 +20,16 @@ class AcquisitionError(OSError):pass
 
 
 def _wire(result):
+    if isinstance(result,str):return dict(object=result)
     snapshot,source,report=result
     return dict(release=snapshot.baseline_release,entries=[fs._entry_wire(e) for e in snapshot.entries],
                 source=source,report=report)
 
 
 def _decode(value):
+    if set(value)=={'object'}:
+        from osmbuildingcache import Store
+        return Store.digest(value['object'])
     from buildingworld import _empty
     if set(value)!={'release','entries','source','report'} or len(value['entries'])>50000:
         raise AcquisitionError('invalid acquisition result')
@@ -36,24 +40,26 @@ def _decode(value):
 
 
 def _default(request,emit):
-    import mapdata,netfetch
+    import netfetch
+    from types import SimpleNamespace
     from buildingworld import Provider
     fetcher=netfetch.Fetcher(offline=request['offline'],stats_dir=os.path.join(request['cache'],'netstats'))
-    md=mapdata.MapData(request['cache'],fetcher=fetcher,release=request['release'],building_overlays=False)
+    md=SimpleNamespace(cache_dir=request['cache'],fetcher=fetcher)
     try:
         provider=Provider(md,request['session'])
         if not provider.claim_valid(request['key'],request['token']):raise AcquisitionError('acquisition claim fenced')
         state=provider._state()
-        return provider._acquire(request['key'],state,{e.feature.feature_id:e for e in request['pinned']},progress=emit)
-    finally:md.close();fetcher.close()
+        return provider._acquire(request['key'],state,progress=emit,token=request['token'])
+    finally:fetcher.close()
 
 
 def _worker(connection,request,deadline,task):
     import buildingworld as world
     parent=mp.parent_process();finished=threading.Event()
+    phase_deadline=[min(deadline,time.monotonic()+world.DOWNLOAD_S)]
     def watch():
         while not finished.wait(.05):
-            if time.monotonic()>=deadline or parent is not None and not parent.is_alive():
+            if time.monotonic()>=phase_deadline[0] or parent is not None and not parent.is_alive():
                 os._exit(124)  # this data-only child, never any unrelated process
     threading.Thread(target=watch,daemon=True,name='osm-query-watchdog').start()
     def send(value):
@@ -66,9 +72,12 @@ def _worker(connection,request,deadline,task):
         # killed and before this child's parent watchdog notices it.
         with world.lease_store(store,'query-network',max(.01,deadline-time.monotonic()))._locked():
             if time.monotonic()>=deadline:raise TimeoutError('acquisition deadline before network')
-            emit=lambda phase:send(dict(kind='phase',phase=phase))
+            def emit(phase):
+                if phase.get('phase')=='parquet_staged':phase_deadline[0]=min(deadline,time.monotonic()+world.PROCESS_S)
+                elif phase.get('phase')=='validated':phase_deadline[0]=min(deadline+world.PUBLICATION_S,time.monotonic()+world.PUBLICATION_S)
+                send(dict(kind='phase',phase=phase))
             result=(task or _default)(request,emit)
-            if time.monotonic()>=deadline:raise TimeoutError('acquisition deadline before result')
+            if time.monotonic()>=deadline+world.PUBLICATION_S:raise TimeoutError('publication deadline before result')
             send(dict(kind='result',value=_wire(result)))
     except BaseException as error:
         try:send(dict(kind='error',error=type(error).__name__+': '+str(error)[:512]))
@@ -85,6 +94,8 @@ class Runner:
         ctx=mp.get_context('spawn');read,write=ctx.Pipe(duplex=False)
         process=ctx.Process(target=_worker,args=(write,request,deadline,self.task),name='osm-building-acquire')
         phase={'phase':'starting'}
+        from buildingworld import DOWNLOAD_S,PROCESS_S,PUBLICATION_S
+        phase_deadline=min(deadline,time.monotonic()+DOWNLOAD_S)
         try:process.start()
         except BaseException:
             read.close();write.close();process.close()
@@ -94,19 +105,22 @@ class Runner:
             try:
                 if process.is_alive():process.terminate()
             except (OSError,ValueError):pass
-        timer=threading.Timer(max(.001,deadline-time.monotonic()),stop_owned)
+        timer=threading.Timer(max(.001,deadline+PUBLICATION_S-time.monotonic()),stop_owned)
         timer.daemon=True;timer.start()
         try:
-            while time.monotonic()<deadline:
-                if not read.poll(min(.05,max(0,deadline-time.monotonic()))):
+            while time.monotonic()<phase_deadline:
+                if not read.poll(min(.05,max(0,phase_deadline-time.monotonic()))):
                     if not process.is_alive():break
                     continue
                 try:message=json.loads(read.recv_bytes(MAX_REPLY))
                 except (EOFError,OSError):break
-                if message.get('kind')=='phase':phase=message['phase'];progress(phase)
+                if message.get('kind')=='phase':
+                    phase=message['phase'];progress(phase)
+                    if phase.get('phase')=='parquet_staged':phase_deadline=min(deadline,time.monotonic()+PROCESS_S)
+                    elif phase.get('phase')=='validated':phase_deadline=min(deadline+PUBLICATION_S,time.monotonic()+PUBLICATION_S)
                 elif message.get('kind')=='error':raise AcquisitionError(message['error'])
                 elif message.get('kind')=='result':
-                    if time.monotonic()>=deadline:break
+                    if time.monotonic()>=phase_deadline:break
                     return _decode(message['value'])
                 else:raise AcquisitionError('invalid acquisition message')
             raise TimeoutError('OSM acquisition deadline/worker exit; last phase='+str(phase)[:512])

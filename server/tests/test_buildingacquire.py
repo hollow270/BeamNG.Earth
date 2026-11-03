@@ -103,9 +103,12 @@ class AcquisitionTest(unittest.TestCase):
                 if p.is_alive():p.terminate();p.join(3)
             queue.close();queue.join_thread()
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_four_workers_stalled_query_does_not_hold_global_publication_lock(self):self.exercise(False)
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_forced_owner_termination_recovers_without_restarting_road_pool(self):self.exercise(True)
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_one_read_budget_covers_all_missing_cells_not_each_cell(self):
         md,descriptor,provider,key,cached=self.setup_world()
         provider.md.fetcher.offline_flag=True
@@ -114,6 +117,7 @@ class AcquisitionTest(unittest.TestCase):
         self.assertLess(time.monotonic()-tick,2)
         self.assertTrue(provider.ready(keys))
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_late_result_cannot_replace_frozen_fallback(self):
         md,descriptor,provider,key,cached=self.setup_world()
         token='a'*32
@@ -127,6 +131,7 @@ class AcquisitionTest(unittest.TestCase):
         self.assertEqual(provider._state()['cells'][str(key)],old)
         self.assertNotIn(str(key),provider._index()['cells'])
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_pin_source_preserves_concurrent_choices_and_rejects_version_change(self):
         md,descriptor,provider,key,cached=self.setup_world()
         provider.view((cached,));head=provider._state()['cells'][str(cached)]
@@ -135,6 +140,7 @@ class AcquisitionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'source version changed'):
             provider._pin_source(dict(VERSION,etag='"different"'))
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_corrupt_or_incomplete_claim_fails_closed_without_query(self):
         md,descriptor,provider,key,cached=self.setup_world()
         claim=dict(session=descriptor.identity,cell=str(key),token='a'*32,status='chosen',owner=os.getpid(),expires=time.time()+30)
@@ -143,6 +149,7 @@ class AcquisitionTest(unittest.TestCase):
             with mock.patch.object(provider,'_acquire',side_effect=AssertionError('must not query')), \
                     self.assertRaises(world.fs.CorruptStorage):provider.view((key,))
 
+    @unittest.skip('Historical OSM-primary merged/fallback contract; current OSM-only lifecycle is tested in test_osmonly')
     def test_render_view_never_holds_world_publication_mutex(self):
         md,descriptor,provider,key,cached=self.setup_world()
         original=provider._view

@@ -1,5 +1,9 @@
 # Refresh before startup
 
+**Historical design:** the active renderer is now
+[worldwide OSM-only buildings](LAYERCAKE_BUILDINGS.md). The baseline merge and
+Overture fallback described below are retained for recovery and are not active.
+
 The newer [explicit Layercake building preparation](LAYERCAKE_BUILDINGS.md) is the
 current worldwide workflow. It selects freshness only on user request and reuses
 saved data on normal startup. The saved-area/automatic workflow below is retained

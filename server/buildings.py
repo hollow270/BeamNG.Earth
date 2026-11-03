@@ -2271,6 +2271,14 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
     canopy, drawn by the mod from the stock levels' props: gasstations.tile_sites). min_size (min height m, min
     footprint m²): only buildings at least that tall or that large (the skyline tiles: skyline_tile), tested before
     any other work on a building."""
+    layers=tuple(layers)
+    if any(getattr(f,'_bnge_osm_only',False) for f in layers) and all(
+            f is None or not len(f.kind) or getattr(f,'_bnge_osm_only',False) for f in layers):
+        # OSM footprints/tags (or deterministic visual defaults) own these
+        # buildings. Unrelated infrastructure must not invent their heights,
+        # garage/bridge attributes or subtract passages from their footprints.
+        # The independent baseline road-context call retains its original inputs.
+        roads_xy=tunnels_xy=garages_xy=supports=bridges_xy=water_xy=decks=ml_roads_xy=ways_xy=None
     parts_of = _PartsOf(frame, part_layers)     # building id -> [(ring in the anchor frame, (own height, bottom))]
     seen = set()
     rings, attrs, looks, mins = [], [], [], []
@@ -3208,12 +3216,14 @@ def sky_items(frame, box, keys, md, ground, lamp_region=None, own=None):
     and lamps, each in one tile)."""
     x0, y0, x1, y1 = box
     # (and the roads: their street lamps, far_lamps)
-    if not all(md.has(k, "buildings") and md.has(k, "roads") for k in keys):
+    source_only=getattr(md,'building_source_mode',None)=='osm-only-v1'
+    required=('roads',) if source_only else ('buildings','roads')
+    if not all(all(md.has(k,layer) for layer in required) for k in keys):
         for k in keys:                      # (the background lane: never before what the player is near)
-            md.prefetch(k, layers=("buildings", "roads"))
+            md.prefetch(k, layers=required)
         return None
     cell = getattr(md, "building_cell", md.cell)
-    cds = [cell(k, layers=("buildings", "roads"), kind="background") for k in keys]
+    cds = [cell(k, layers=('buildings','building_parts','roads') if source_only else ("buildings", "roads"), kind="background") for k in keys]
     layers = [c.layers.get("buildings") for c in cds]
     items = tile_buildings(frame, x0, y0, x1, y1, layers, ground, min_size=(1e9, SKY_MIN_AREA_M2), own=own,
                            part_layers=[c.layers.get("building_parts") for c in cds])

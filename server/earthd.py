@@ -2504,8 +2504,10 @@ class Server:
         (--offline, or every imagery / DEM host unreachable), else the unreachable hosts and the
         tiles drawn without imagery. Hosts the world builds without (gravity, weather, search, routing, the update
         check) are not named: a player in a country that blocks SourceForge saw "Degraded" for good (GitHub #23)."""
+        provider=getattr(getattr(self,'mapdata',None),'_building_world',None)
+        building_note=provider.note() if provider is not None else ''
         if self.net.offline:
-            return netfetch.OFFLINE_TEXT
+            return netfetch.OFFLINE_TEXT+(' | '+building_note if building_note else '')
         parts = []
         down = self.net.unavailable_hosts(optional=False)
         if down:            # each with what it affects (netfetch.ROLES: the user, 2026-10-27)
@@ -2516,7 +2518,8 @@ class Server:
         if self.net.slow() is not None:     # (map data at a crawl: a new place's roads take minutes: GitHub #241;
             # no number in it: the note is re-sent whenever its text changes)
             parts.append("slow internet connection: new places take a few minutes to load")
-        return "Degraded: " + "; ".join(parts) if parts else ""
+        network_note="Degraded: " + "; ".join(parts) if parts else ""
+        return ' | '.join(p for p in (network_note,building_note) if p)
 
     def level_summary(self):
         """'L<level> <geometry ms>/<texture ms> <shape KB>/<texture KB>' medians, for the log."""
@@ -4080,7 +4083,7 @@ class Connection:
             if self.building_activation:
                 m.update(buildingActivation=1,buildingEpoch=self.building_epoch)
             if self.s.__dict__.get('_building_startup') is not None:
-                m.update(buildingControl=0,buildingControlReason='Buildings refresh before startup; live replacement is disabled.')
+                m.update(buildingControl=0,buildingControlReason='OSM-only buildings use a session-pinned cache; live replacement is disabled.')
             if live is not None:
                 m.update(live.hello(self,msg))
                 if self.__dict__.get("building_control_denied"):
@@ -5571,19 +5574,10 @@ class Connection:
 
 
 async def main_async(args):
-    import buildingregions
     import buildingworld
-    worldwide=buildingworld.configured(args.cache_dir)
-    primary_mode=os.environ.get('BNGE_OSM_PRIMARY') == 'layercake' or buildingregions.configured(args.cache_dir) or worldwide
-    startup_path=os.environ.get('BNGE_OSM_STARTUP_CONFIG')
+    import osmbuildingcache
+    primary_mode=args.buildings=='on' and args.roads=='on'
     startup_config=None
-    if startup_path and not primary_mode:
-        import buildingstartup
-        startup_config=buildingstartup.Config.read(startup_path)
-        if args.roads!='on' or args.buildings!='on':
-            raise ValueError('startup OSM buildings require roads and buildings enabled')
-    if primary_mode and (args.roads!='on' or args.buildings!='on'):
-        raise ValueError('primary OSM buildings require roads and buildings enabled')
     fmt = args.far_format
     if fmt == "cdae":
         v = cdae.engine_version(args.user_dir)
@@ -5604,32 +5598,21 @@ async def main_async(args):
     mapdata = (mapdatamod.MapData(args.cache_dir, fetcher=net,building_overlays=False if startup_config is not None or primary_mode else None)
                if "on" in (args.surface, args.roads, args.sea, args.trees) else None)
     frozen_buildings=None
-    startup_report=None
+    startup_report=dict(mode=osmbuildingcache.MODE,checked=False,enabled=False,
+                        note='Building meshes are disabled; live replacement remains disabled.')
     primary_lease=None
     if primary_mode:
         from contextlib import ExitStack
-        import buildingprimary
         primary_lease=ExitStack()
         try:
-            primary_lease.enter_context(buildingprimary.Store(args.cache_dir).session())
-            # Also release on failures during pool/listener construction, before
-            # the normal server-shutdown finally block has been reached.
+            primary_lease.enter_context(osmbuildingcache.Store(args.cache_dir).session())
             asyncio.current_task().add_done_callback(lambda task: primary_lease.close())
-            frozen_buildings,startup_report=buildingprimary.cached(mapdata,args.cache_dir)
-            if worldwide:
-                frozen_buildings=buildingworld.start(args.cache_dir,frozen_buildings)
-                startup_report=dict(startup_report,worldwide=True,first_visit='automatic_before_generation',freshness='manual_only')
+            frozen_buildings=buildingworld.start(args.cache_dir)
+            startup_report=buildingworld.status(args.cache_dir)
+            startup_report.update(first_visit='automatic_before_generation',checked=False)
             mapdata.pin_buildings(frozen_buildings)
         except BaseException:
             primary_lease.close()
-            mapdata.close(); net.close(); disk.close()
-            raise
-    elif startup_config is not None:
-        # Barrier: no listener, worker, saved-area job or streaming task exists yet.
-        try:
-            frozen_buildings,startup_report=buildingstartup.prepare(mapdata,args.cache_dir,startup_config)
-            mapdata.pin_buildings(frozen_buildings)
-        except BaseException:
             mapdata.close(); net.close(); disk.close()
             raise
     pacer.DUTY = args.background_duty
@@ -5717,11 +5700,8 @@ async def main_async(args):
                     sea=seacarvemod.SeaCarver(mapdata, args.cache_dir) if args.sea == "on" else None,
                     vegetation=(vegetationmod.Vegetation(mapdata, args.cache_dir) if args.trees == "on" else None))
     server.update_check = args.update_check == "on"
-    if startup_report is not None:
-        server._building_startup=startup_report
-    else:
-        import buildinglive
-        buildinglive.install_from_environment(server)
+    server._building_startup=startup_report
+    log.info('OSM buildings startup: %s',startup_report)
     server.geo_tiles = args.geo_tiles == "on"
     server.global_far = args.global_far == "on"
     server.lod_px = args.lod_px

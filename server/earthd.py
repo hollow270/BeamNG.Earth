@@ -85,6 +85,7 @@ import numpy as np  # noqa: E402
 from PIL import Image  # noqa: E402
 
 import blockworker  # noqa: E402
+import buildingwait
 import cache as cachemod  # noqa: E402
 import cdae  # noqa: E402
 import colormatch as colormatchmod  # noqa: E402
@@ -815,8 +816,10 @@ class Server:
             surface.gas_pads = True     # their forecourts painted asphalt (surface.Surface.fuel_pads)
         self.traffic = bool(traffic) and mapdata is not None   # the AI road graph around the player (navgraph.py)
         self.road_widths = (roadwidthmod.RoadWidths(
-            lambda key: mapdata.cell(key, layers=("buildings",), kind="demand").layers.get("buildings"),
-            roadwidthmod.store_dir(cache_dir, mapdata)).get
+            lambda key: mapdata.cached_building_cell(key).layers.get("buildings"),
+            roadwidthmod.store_dir(cache_dir, mapdata),
+            dependency=lambda key: mapdata.cached_building_dependencies((key,)).geometry_digest,
+            prepare=mapdata.prepare_buildings).get
             if road_widths and mapdata is not None else None)
         if vegetation is not None:      # trees kept off the roads' drawn widths (vegetation._mask_roads)
             vegetation.surface, vegetation.widths = surface, self.road_widths
@@ -2420,13 +2423,19 @@ class Server:
         if key in self.hm:
             self.hm.move_to_end(key)
             return self.hm[key]
-        fut = self.hm_inflight.get(key)
-        if fut is None:
-            loop = asyncio.get_running_loop()
-            fut = self.hm_inflight[key] = loop.run_in_executor(
-                self.hm_pool, self.make_heightmap, anchor, cx, cy, progress, lane, time.perf_counter())
-            fut.add_done_callback(lambda f: self._hm_done(key, f))
-        return await asyncio.shield(fut)
+        end=time.monotonic()+buildingwait.LIMIT
+        while True:
+            fut = self.hm_inflight.get(key)
+            if fut is None:
+                loop = asyncio.get_running_loop()
+                fut = self.hm_inflight[key] = loop.run_in_executor(
+                    self.hm_pool, self.make_heightmap, anchor, cx, cy, progress, lane, time.perf_counter())
+                fut.add_done_callback(lambda f: self._hm_done(key, f))
+            try:return await asyncio.shield(fut)
+            except Exception as error:
+                if not buildingwait.transient(error) or time.monotonic()>=end or self.anchors.get(anchor.id) is not anchor:raise
+                log.debug('terrain %s awaits immutable building inputs; retry scheduled',key)
+                await asyncio.sleep(buildingwait.DELAY)
 
     def _hm_done(self, key, fut):
         self.hm_inflight.pop(key, None)
@@ -3433,6 +3442,8 @@ class Connection:
         self.inflight = {}              # (anchorId, key) -> (asyncio future, Tile)
         self.prefetched = {}            # (anchorId, key) -> when its imagery prefetch was last asked for
         self.failed = set()
+        self.building_wait = buildingwait.Pending()
+        self.building_failed = set()
         self.dirty = False              # far_done owed once every group is emitted
         self.batch = [0.0, 0, 0]        # [start, tiles sent, swaps sent] of the current change, for the log
         self.prefetching = False
@@ -4540,6 +4551,7 @@ class Connection:
             return
         finally:
             self.refining.discard(key)
+        if self.active!=anchor.id or self.s.anchors.get(anchor.id) is not anchor:return
         self.s.hm_sent.append(key)
         log.info("anchor %d: graded first block in %.2f s after the request", anchor.id, time.perf_counter() - t0)
         self.send({"type": "terrain_refresh", "anchorId": anchor.id, **self.terrain_msg(key, info)})
@@ -4654,6 +4666,8 @@ class Connection:
         self.refined = {n for n in self.refined if len(n) == 4}
         self.node_changed = {n: t for n, t in self.node_changed.items() if len(n) == 4}
         self.failed.clear()
+        self.building_wait.clear()
+        self.building_failed.clear()
         self.block = self.pending_block = self.predicted_block = None
         if anchor.first_terrain is not None:
             self._set_block(aid, *anchor.first_terrain)
@@ -5333,6 +5347,7 @@ class Connection:
                 cls = 1
             return (cls, dist[k], t.level, t.key)
         self.queue = [todo[k] for k in sorted(range(len(todo)), key=prio)]
+        self.building_failed.intersection_update(self.desired)
         self.qi = 0
         self.failed.clear()
 
@@ -5342,7 +5357,8 @@ class Connection:
             t = self.queue[self.qi]
             self.qi += 1
             ck = self.ck(t.key)
-            if t.key not in self.sent and ck not in self.inflight and t.key in self.desired:
+            if (t.key not in self.sent and ck not in self.inflight and t.key in self.desired
+                    and t.key not in self.building_failed and not self.building_wait.delayed(ck)):
                 return t
         return None
 
@@ -5457,6 +5473,8 @@ class Connection:
         while True:
             # Clear before reading the state, so an update from here on wakes us again.
             self.wake.clear()
+            self.queue.extend(self.building_wait.ready(lambda ck:ck==self.ck(ck[1]) and ck[1] in self.desired
+                                                       and ck not in self.shown and ck[1] not in self.sent))
             anchor = self.s.anchors.get(self.active)
             # While a physics block builds in this process, one far tile at a time: they share the interpreter
             # (GIL), and three far workers made a block build 3-10x slower (landcover 1.4 s vs 0.1 s), too slow
@@ -5485,7 +5503,7 @@ class Connection:
             if anchor is not None:
                 self.emit_groups()
                 self.flush_old()
-            if (not self.inflight and self.dirty and anchor is not None
+            if (not self.inflight and not self.building_wait and not self.building_failed and self.dirty and anchor is not None
                     and len(self.groups) == len(self._blocked())):
                 self.dirty = False
                 n = sum(1 for k in self.desired if self.ck(k) in self.shown)
@@ -5515,7 +5533,7 @@ class Connection:
             if waker is None:
                 waker = asyncio.ensure_future(self.wake.wait())
             futs = [f for f, _ in self.inflight.values()]
-            done, _ = await asyncio.wait(futs + [waker], return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(futs + [waker],timeout=self.building_wait.timeout(),return_when=asyncio.FIRST_COMPLETED)
             if waker in done:
                 waker = None
             for ck in [ck for ck, (f, _) in self.inflight.items() if f.done()]:
@@ -5523,10 +5541,19 @@ class Connection:
                 if fut.cancelled():
                     continue
                 if fut.exception() is not None:
+                    if buildingwait.transient(fut.exception()) and ck==self.ck(t.key) and t.key in self.desired:
+                        if self.building_wait.defer(ck,t):
+                            log.debug('far tile %s waiting for OSM inputs; retry scheduled',t.key)
+                            continue
+                        self.status('Building input preparation did not finish; loading incomplete (see companion log)')
+                        self.building_failed.add(t.key)
+                    self.building_wait.finish(ck)
                     log.error("far tile %s of anchor %d failed: %r", t.key, ck[0], fut.exception(),
                               exc_info=fut.exception() if t.key not in self.failed else None)   # (its first)
                     self.failed.add(t.key)
                     continue
+                self.building_wait.finish(ck)
+                self.building_failed.discard(t.key)
                 if ck != self.ck(t.key) or t.key not in self.desired or ck in self.shown or t.key in self.sent:
                     continue            # superseded meanwhile; the file stays cached
                 # the server's latest record: a live retexture may have finished since this build

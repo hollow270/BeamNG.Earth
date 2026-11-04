@@ -72,6 +72,7 @@ def for_grader(cache_dir, grader, widths, wet):
     pc = PlanCache(os.path.join(cache_dir, "plans", run), f"w{int(widths is not None)}s{int(wet is not None)}")
     pc.persist = (cache_dir, (FRAMES, pc.signature,
                               md.versions() if md is not None and hasattr(md, "versions") else None))
+    pc.building_context=getattr(md,'building_context_revision',None) if widths is not None else None
     return pc
 
 
@@ -80,11 +81,26 @@ class PlanCache:
         self.dir = os.path.join(root, FRAMES, signature)
         self.signature = signature
         self.persist = None     # (cache dir, key parts) of the revisit cache's copy (for_grader), or None
+        self.building_context = None
+        self._contexts = {}
         self.stats = {"read": 0, "written": 0, "waited": 0, "wait_s": 0.0}
         self._lock = threading.Lock()
 
     def _path(self, key):
-        return os.path.join(self.dir, f"{int(key[0])}_{int(key[1])}_{int(key[2])}.npz")
+        token=self._context(key)
+        suffix='_'+token if token else ''
+        return os.path.join(self.dir, f"{int(key[0])}_{int(key[1])}_{int(key[2])}{suffix}.npz")
+
+    def _context(self,key):
+        if self.building_context is None:return ''
+        key=tuple(key)
+        with self._lock:
+            if key in self._contexts:return self._contexts[key]
+        import mapcells,hashlib
+        token=hashlib.sha256(str(self.building_context((mapcells.CellKey(*key),))).encode()).hexdigest()
+        with self._lock:
+            if len(self._contexts)>256:self._contexts.clear()
+            return self._contexts.setdefault(key,token)
 
     def load(self, key):
         """(plans, keeps, covers, opens) of cell key from the cache, or None."""
@@ -118,7 +134,8 @@ class PlanCache:
 
     def _revisit_key(self, key):
         import revisit
-        return revisit.key("plans", *self.persist[1], (int(key[0]), int(key[1]), int(key[2])))
+        parts=(*self.persist[1],(int(key[0]), int(key[1]), int(key[2])))
+        return revisit.key("plans",*parts,self._context(key)) if self.building_context is not None else revisit.key("plans",*parts)
 
     def _where(self, key):
         """revisit.where of cell key's plans (the map's cache view), or None."""

@@ -825,6 +825,8 @@ class _Planner:
             return got
         if failed is not None and time.monotonic() - failed < RETRY_S:
             return []               # offline: no block waits on the same failing fetch again
+        prepare=getattr(self.md,'prepare_building_context',None)
+        if prepare is not None and self.widths is not None:prepare((key,))
         shared, mine = (self.shared.claim(key) if self.shared is not None else (None, False))
         try:
             import revisit

@@ -4,9 +4,9 @@ Reuse checked paths, checksums, OS locks and fsync/replace from the existing sto
 An object is source data, not a game generation or collision ownership record.
 """
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass,replace
 from pathlib import Path
-import re
+import os,re,threading,time,logging
 
 import buildingoverlay as geom
 import buildingoverlaystore as fs
@@ -19,6 +19,20 @@ MAX_OBJECTS=8192
 MAX_CELLS=4096
 MAX_SESSIONS=1024
 LIMITS=fs.Limits(max_entries=MAX_FEATURES,max_file_bytes=96*1024**2,max_total_bytes=512*1024**2)
+
+
+@dataclass(frozen=True)
+class Prepared:
+    head:str
+    body:bytes
+
+
+def signature(path):
+    """Atomic-file identity, including replacement with equal-sized content."""
+    try:
+        s=path.stat()
+        return s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns
+    except FileNotFoundError:return None
 
 
 def version(value):
@@ -93,17 +107,66 @@ def normalize(results):
 class Store:
     _no_link=staticmethod(fs.OverlayStore._no_link)
     _safe=fs.OverlayStore._safe
-    _locked=fs.OverlayStore._locked
     _document=fs.OverlayStore._document
-    _atomic_write=fs.OverlayStore._atomic_write
     _read=fs.OverlayStore._read
+
+    @contextmanager
+    def _io_gate(self,path):
+        # Windows replacement cannot race open destination handles. Serialize
+        # byte reads against rename only, independently of the metadata writer
+        # mutex. JSON/geometry validation NEVER holds this gate. Fixed 32 stripes
+        # bound lock files regardless of sessions, cells or objects retained.
+        if os.name!='nt' or not hasattr(self,'directory'):
+            yield;return
+        stripe=int(fs._hash(str(path.relative_to(self.root)))[:4],16)%32
+        directory=self.root/'io'/str(stripe)
+        for p in (directory.parent,directory):self._no_link(p);p.mkdir(exist_ok=True)
+        gate=object.__new__(fs.OverlayStore);gate.root=directory;gate.directory=self.directory
+        gate.limits=self.limits;gate.lock_timeout=self.lock_timeout
+        with gate._locked():yield
+
+    @contextmanager
+    def _open_read(self,path):
+        with self._io_gate(path),path.open('rb') as f:yield f
+
+    def _replace(self,temporary,path):
+        with self._io_gate(path):os.replace(temporary,path)
+
+    def _atomic_write(self,path,body):
+        # Windows readers may briefly deny replacement while an immutable
+        # metadata document is open. Retry the atomic operation, never truncate
+        # the previous document or remove it to work around a sharing violation.
+        end=time.monotonic()+.25
+        while True:
+            try:return fs.OverlayStore._atomic_write(self,path,body)
+            except PermissionError as e:
+                if os.name!='nt' or getattr(e,'winerror',None) not in (5,32,33) or time.monotonic()>=end:raise
+                time.sleep(.005)
 
     def __init__(self,cache):
         self.directory=Path(cache).absolute();self.root=self.directory/'osm-buildings/v1'
         self.objects=self.root/'objects';self.limits=LIMITS;self.lock_timeout=15.
+        self._index_memo=None;self._memo_lock=threading.Lock();self._index_load_lock=threading.Lock()
+        self.lock_stats=dict(count=0,max_wait_s=0.,max_hold_s=0.);self._last_lock_note=0.
         for p in (self.root,*self.root.parents):self._no_link(p)
         for p in (self.root,self.objects,self.root/'sessions',self.root/'claims',self.root/'status'):
             self._no_link(p);p.mkdir(parents=True,exist_ok=True)
+
+    @contextmanager
+    def _locked(self):
+        tick=time.monotonic()
+        with fs.OverlayStore._locked(self):
+            acquired=time.monotonic()
+            try:yield
+            finally:
+                if hasattr(self,'lock_stats'):
+                    wait,hold=acquired-tick,time.monotonic()-acquired
+                    self.lock_stats['count']+=1
+                    self.lock_stats['max_wait_s']=max(self.lock_stats['max_wait_s'],wait)
+                    self.lock_stats['max_hold_s']=max(self.lock_stats['max_hold_s'],hold)
+                    if max(wait,hold)>.5 and acquired-self._last_lock_note>10:
+                        self._last_lock_note=acquired
+                        logging.getLogger('earthd.osm_world').warning('OSM metadata lock waited %.3f s; held %.3f s',wait,hold)
 
     @contextmanager
     def session(self):
@@ -117,10 +180,23 @@ class Store:
         return value
 
     def index(self):
+        # Concurrent planners share one checksum/schema validation for this
+        # immutable file identity. Writers still use their ordinary CAS fence.
+        with self._index_load_lock:return self._load_index()
+
+    def _load_index(self):
         path=self.root/'index.json'
+        self._safe(path)
         if not path.exists():
             if (self.root/'initialized').exists() or any(self.objects.iterdir()):raise fs.CorruptStorage('OSM index missing')
             return dict(mode=MODE,cells={},influence={},identities={})
+        stamp=signature(path)
+        with self._memo_lock:
+            memo=self._index_memo
+        if memo is not None and memo[0]==stamp:
+            value=memo[1]
+            return dict(value,cells=dict(value['cells']),identities=dict(value['identities']),
+                        influence={k:list(v) for k,v in value['influence'].items()})
         value=self._read(path)
         if not isinstance(value,dict) or set(value) not in ({'mode','cells'},{'mode','cells','influence'},{'mode','cells','influence','identities'}) or value['mode']!=MODE or not isinstance(value['cells'],dict) or len(value['cells'])>MAX_CELLS:
             raise fs.CorruptStorage('invalid OSM index')
@@ -140,7 +216,10 @@ class Store:
         for identity,head in value['identities'].items():
             if geom.normalize_osm_id(identity)!=identity:raise fs.CorruptStorage('invalid cached OSM identity')
             self.digest(head)
-        return value
+        if signature(path)==stamp:
+            with self._memo_lock:self._index_memo=(stamp,value)
+        return dict(value,cells=dict(value['cells']),identities=dict(value['identities']),
+                    influence={k:list(v) for k,v in value['influence'].items()})
 
     @staticmethod
     def digest(value):
@@ -149,6 +228,9 @@ class Store:
 
     def object(self,head):
         raw=self._read(self.objects/(self.digest(head)+'.json'))
+        return self._decode_object(head,raw)
+
+    def _decode_object(self,head,raw):
         if fs._hash(raw)!=head or set(raw)!={'mode','entries','source','bounds','report'} or raw['mode']!=MODE:
             raise fs.CorruptStorage('OSM object checksum/schema mismatch')
         if raw['source'] is not None:version(raw['source'])
@@ -174,15 +256,30 @@ class Store:
         if raw['entries'] and raw['source'] is None:raise fs.CorruptStorage('unattributed OSM data')
         return replace(empty(),entries=tuple(entries),affected_bounds=fs._union([e.bounds for e in entries])),raw
 
-    def write(self,snapshot,source,bounds,report):
+    def prepare(self,snapshot,source,bounds,report):
+        """Serialize and fully validate outside the metadata transaction."""
         payload=dict(mode=MODE,entries=[fs._entry_wire(e) for e in snapshot.entries],source=source,bounds=list(bounds),report=report)
-        head=fs._hash(payload);path=self.objects/(head+'.json')
+        head=fs._hash(payload);body=self._document(payload)
+        self._decode_object(head,payload)
+        return Prepared(head,body)
+
+    def write_prepared(self,prepared):
+        """Caller holds metadata lock: quota admission + atomic bytes only."""
+        if not isinstance(prepared,Prepared):raise ValueError('validated OSM object required')
+        path=self.objects/(self.digest(prepared.head)+'.json');body=prepared.body
         if not path.exists():
-            body=self._document(payload);files=list(self.objects.iterdir())
+            files=list(self.objects.iterdir())
             if len(files)>=MAX_OBJECTS:raise fs.ResourceLimit('retained OSM object count capacity')
             size=0
             for p in files:self._no_link(p);size+=p.stat().st_size
             if size+len(body)>self.limits.max_total_bytes:raise fs.ResourceLimit('retained OSM bytes capacity')
             self._atomic_write(path,body)
-        self.object(head)  # fail before any pointer can select damaged data
-        return head
+        else:
+            self._no_link(path)
+            with path.open('rb') as f:existing=f.read(self.limits.max_file_bytes+1)
+            if existing!=body:raise fs.CorruptStorage('OSM object bytes changed')
+        return prepared.head
+
+    def write(self,snapshot,source,bounds,report):
+        # Compatibility for fixtures/tools; production prepares before locking.
+        return self.write_prepared(self.prepare(snapshot,source,bounds,report))

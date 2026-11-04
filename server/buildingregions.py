@@ -142,10 +142,12 @@ class Requests:
     netfetch still applies endpoint policies, offline restrictions and host budgets.
     Exactly one request runs at a time; spacing also survives a process restart.
     """
-    def __init__(self,jobs,state,raw,wall,cancel,sleep):
+    def __init__(self,jobs,state,raw,wall,cancel,sleep,extra_raw=None):
         self.jobs,self.state,self.raw=jobs,state,Path(raw)/'osm-buildings'
         self.wall,self.cancel,self.sleep=wall,cancel,sleep
         self.used=0
+        self.extra_raw=Path(extra_raw) if extra_raw is not None else None
+        if self.extra_raw is not None and not self.extra_raw.is_relative_to(jobs.store.root):raise ValueError('source index quota path outside store')
 
     def admit(self,amount):
         if self.cancel(): raise InterruptedError('cancelled before request')
@@ -156,8 +158,10 @@ class Requests:
         self.used+=amount
         if self.used>OPERATION_BYTES: raise fs.ResourceLimit('regional operation network byte budget; resume later')
         size=count=0
-        if self.raw.exists():
-            for p in self.raw.rglob('*'):
+        roots=[self.raw]+([self.extra_raw] if self.extra_raw is not None else [])
+        for root in roots:
+            self.jobs.store._no_link(root)
+            for p in root.rglob('*'):
                 self.jobs.store._no_link(p);count+=1
                 if count>32768: raise fs.ResourceLimit('raw range cache entry budget')
                 if p.is_file(): size+=p.stat().st_size

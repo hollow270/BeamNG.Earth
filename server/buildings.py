@@ -2277,7 +2277,7 @@ def tile_buildings(frame, x0, y0, x1, y1, layers, elev, water=None, part_layers=
         # OSM footprints/tags (or deterministic visual defaults) own these
         # buildings. Unrelated infrastructure must not invent their heights,
         # garage/bridge attributes or subtract passages from their footprints.
-        # The independent baseline road-context call retains its original inputs.
+        # Building-dependent road context consumes these same OSM specs.
         roads_xy=tunnels_xy=garages_xy=supports=bridges_xy=water_xy=decks=ml_roads_xy=ways_xy=None
     parts_of = _PartsOf(frame, part_layers)     # building id -> [(ring in the anchor frame, (own height, bottom))]
     seen = set()
@@ -2893,17 +2893,18 @@ def _front_fence(spec, a, d, Le, f, A, D, L2, half, z, driveway, roads=None):
 def road_tile_items(frame, tx, ty, md, ground, decks=None, skip=frozenset(), effective=True):
     """tile_buildings of road tile (tx, ty), from the map cells under it. decks: the bridge decks near it
     [(xy (k, 2), z (k,))] in the anchor frame (roads.BridgeProfiles.parts): buildings they run through get a way.
-    skip: building ids left out (gas station canopies)."""
+    skip: building ids left out (gas station canopies). The legacy effective flag
+    is accepted for call compatibility; it cannot select another building source."""
     import roads
     box = roads.tile_bbox(tx, ty)
     x0, y0, x1, y1 = box
-    cell = getattr(md, "building_cell", md.cell) if effective else md.cell
+    cell = getattr(md, "building_cell", md.cell)
     cds = [cell(k, layers=("buildings", "building_parts", "roads", "infrastructure", "water"), kind="demand")
            for k in roads.cells_of_tile(frame, tx, ty, margin=0.0)]
     return tile_buildings(frame, x0, y0, x1, y1, [c.layers.get("buildings") for c in cds], ground,
                           own=box if hasattr(box, "owns") else None,
                           part_layers=[c.layers.get("building_parts") for c in cds],
-                          west_town=district_town(frame, tx, ty, md, effective=effective),
+                          west_town=district_town(frame, tx, ty, md),
                           roads_xy=road_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                           ways_xy=way_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
                           tunnels_xy=tunnel_lines(frame, [c.layers.get("roads") for c in cds], x0, y0),
@@ -2928,16 +2929,9 @@ POLES_COVERAGE = 0.30       # ... and its streets get wired wooden poles (furnit
 
 
 def road_context_items(frame, tx, ty, md, ground, **kw):
-    """(rendered buildings, baseline road context): overlays never change driveway/road inputs."""
+    """The same pinned OSM buildings for meshes and building-dependent road context."""
     rendered = road_tile_items(frame, tx, ty, md, ground, **kw)
-    active = getattr(md, "building_overlays_active", False)
-    if active:
-        import roads
-        keys = roads.cells_of_tile(frame, tx, ty, margin=DISTRICT_M)
-        active = md.building_dependencies(keys).revision is not None
-    baseline = road_tile_items(frame, tx, ty, md, ground, effective=False, **kw) \
-        if active else rendered
-    return rendered, baseline
+    return rendered, rendered
 
 
 def coverage(items, tile=256.0):
@@ -3558,7 +3552,7 @@ def district_town(frame, tx, ty, md, effective=True):
     dlon = DISTRICT_M / (111320.0 * math.cos(math.radians(lat)))
     cells = []
     for key in mapcells.cells_for_bbox(lat - dlat, lon - dlon, lat + dlat, lon + dlon):
-        dependency = md.building_dependencies((key,)).revision if effective and \
+        dependency = md.building_dependencies((key,)).revision if \
             getattr(md, "building_overlays_active", False) else None
         stats_key = (key, "building-overlay", dependency) if dependency is not None else key
         with _cell_lock_get():
@@ -3567,7 +3561,7 @@ def district_town(frame, tx, ty, md, effective=True):
             cells.append((stats_key, None))
             continue
         try:
-            cell = getattr(md, "building_cell", md.cell) if effective else md.cell
+            cell = getattr(md, "building_cell", md.cell)
             cells.append((stats_key, cell(key, layers=("buildings",), kind="demand").layers.get("buildings")))
         except Exception:           # not cached / unreadable: counts as empty
             if dependency is not None:

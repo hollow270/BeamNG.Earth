@@ -4,7 +4,7 @@ width for most streets, so every street of a class got the same default).
 
 First tried from aerial imagery (NAIP, 0.6 m): asphalt, concrete sidewalks and many roofs are the
 same light grey there (brightness ~0.6, saturation < 0.05), so cross-sections of one street read
-4-35 m. Building footprints (Overture) are exact and need no imagery: in a built-up street the
+4-35 m. Building footprints (the session's OpenStreetMap data) need no imagery: in a built-up street the
 buildings stand at the back of the sidewalks, so the distance between the building faces across the
 street is its right-of-way.
 
@@ -260,17 +260,48 @@ def store_dir(cache_dir, md):
     """The walls' folder for map data md (its release) under cache_dir, or None."""
     if not cache_dir or md is None:
         return None
-    return os.path.join(cache_dir, "roadwidth", f"v{WALLS_VERSION}", str(getattr(md, "release", "x")))
+    root=os.path.join(cache_dir, "roadwidth", f"v{WALLS_VERSION}", str(getattr(md, "release", "x")))
+    mode=getattr(md,'building_source_mode',None)
+    return os.path.join(root,mode) if mode else root
+
+
+def wall_cells(ll):
+    """Exact data-cell dependencies of the existing width measurement sampling."""
+    seg = np.hypot(np.diff(ll[:, 1]) * 111320.0, np.diff(ll[:, 0]) * 111320.0 * np.cos(np.radians(ll[:-1, 1])))
+    s = np.r_[0.0, np.cumsum(seg)]
+    t = np.r_[np.arange(0.0, s[-1], NEAR_STEP_M), s[-1]] if s[-1] > 0 else np.zeros(1)
+    lat, lon = np.interp(t, s, ll[:, 1]), np.interp(t, s, ll[:, 0])
+    dlat = (NEAR_M + NEAR_STEP_M / 2) / 111320.0
+    dlon = dlat / max(0.05, float(np.cos(np.radians(np.mean(lat)))))
+    return sorted(mapcells.cells_near_points(lat, lon, dlat, dlon), key=str)
+
+
+def measurement_cells(feats):
+    """Conservative superset of _measured_widths' land-road inputs, never ferries.
+
+    Include roads with mapped widths/lanes too: this avoids depending on urban
+    style or tagging readiness here, while covering every actual measurement.
+    """
+    import roads
+    keys=set()
+    for i,sp in enumerate(roads.road_specs(feats)):
+        if sp is None or sp.kind not in roads.BUILT or sp.cls not in roads.SIDEWALK_CLASSES or sp.cls in roads.MEASURE_SKIP:continue
+        a=feats.coord_off[feats.ring_off[feats.part_off[i]]]
+        b=feats.coord_off[feats.ring_off[feats.part_off[i+1]]]
+        if b>a:keys.update(wall_cells(np.asarray(feats.lonlat[a:b],np.float64)))
+    return keys
 
 
 class RoadWidths:
     """Measured street widths per road id, decided once per server run (thread-safe). cell_fn(key) ->
     the buildings Features of a map cell (None / raises when unavailable: the road keeps its default)."""
 
-    def __init__(self, cell_fn, store_dir=None):
+    def __init__(self, cell_fn, store_dir=None, dependency=None, prepare=None):
         """store_dir: the walls' files (the map data release's own folder), or None (none kept on disk)."""
         self.cell_fn = cell_fn
         self.store_dir = store_dir
+        self.dependency = dependency
+        self.prepare = prepare
         self.memo = {}                          # fid -> (carriageway, walk) or None
         self.walls = OrderedDict()              # cell key -> (frame, Walls), the WALL_CELLS last used
         self.combos = OrderedDict()             # cell keys -> (frame, Walls) of a road near cells' edges
@@ -296,6 +327,10 @@ class RoadWidths:
         frame = geodesy.EnuFrame(0.5 * (lat0 + lat1), 0.5 * (lon0 + lon1))
         path = (os.path.join(self.store_dir, str(key.z), str(key.x), f"{key.y}.npy")
                 if self.store_dir and hasattr(key, "z") else None)
+        if path and self.dependency is not None:
+            import hashlib
+            token=hashlib.sha256(str(self.dependency(key)).encode()).hexdigest()
+            path=os.path.join(os.path.dirname(path),token,f'{key.y}.npy')
         segs = _read_segs(path) if path else None
         if segs is None:
             parts, complete = [], True
@@ -340,13 +375,7 @@ class RoadWidths:
         Each road read the buildings of the 8 cells around its middle's too: ~75 cells of buildings for one road
         tile's planning on a first visit to a Pennsylvania town, 2026-10-27; a width needs the walls within REACH."""
         # (the cells along it: every NEAR_STEP_M of it; its box's cells were a grid of them for a long rural road)
-        seg = np.hypot(np.diff(ll[:, 1]) * 111320.0, np.diff(ll[:, 0]) * 111320.0 * np.cos(np.radians(ll[:-1, 1])))
-        s = np.r_[0.0, np.cumsum(seg)]
-        t = np.r_[np.arange(0.0, s[-1], NEAR_STEP_M), s[-1]] if s[-1] > 0 else np.zeros(1)
-        lat, lon = np.interp(t, s, ll[:, 1]), np.interp(t, s, ll[:, 0])
-        dlat = (NEAR_M + NEAR_STEP_M / 2) / 111320.0
-        dlon = dlat / max(0.05, float(np.cos(np.radians(np.mean(lat)))))
-        keys = sorted(mapcells.cells_near_points(lat, lon, dlat, dlon), key=str)
+        keys = wall_cells(ll)
         if len(keys) == 1:
             return self._walls(keys[0])
         ck = tuple(str(k) for k in keys)
@@ -380,6 +409,7 @@ class RoadWidths:
             if fid in self.memo:
                 return self.memo[fid]
         ll = np.asarray(lonlat, np.float64)
+        if self.prepare is not None:self.prepare(tuple(wall_cells(ll)))
         frame, walls = self._near_walls(ll)
         res = None
         if len(walls.segs):

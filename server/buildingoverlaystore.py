@@ -319,7 +319,8 @@ class OverlayStore:
                 f.write(data)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(tmp, path)
+            if hasattr(self,'_replace'):self._replace(tmp,path)
+            else:os.replace(tmp, path)
             if os.name != "nt":
                 fd = os.open(path.parent, os.O_RDONLY)
                 try:
@@ -343,7 +344,8 @@ class OverlayStore:
         def constant(value):
             raise ValueError(f"invalid JSON constant: {value}")
         try:
-            with self._safe(path).open("rb") as f:
+            safe=self._safe(path)
+            with (self._open_read(safe) if hasattr(self,'_open_read') else safe.open('rb')) as f:
                 data = f.read(self.limits.max_file_bytes + 1)
             if len(data) > self.limits.max_file_bytes:
                 raise ValueError("document exceeds limit")

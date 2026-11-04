@@ -239,14 +239,30 @@ class Vegetation:
         with self._lock:
             if k in self._mem:
                 return True
+        # Resolving the OSM dependency may acquire data: never do that from the
+        # event loop. The worker's cell() still reuses its revision-keyed disk cache.
+        if getattr(self.md,'building_source_mode',None)=='osm-only-v1':return False
         p = self._path(*k)
         return bool(p and os.path.exists(p))
 
     def _path(self, x, y):
         rel = getattr(self.md, "release", "x")
+        if self.dir and getattr(self.md,'building_source_mode',None)=='osm-only-v1':
+            import hashlib
+            n=1<<mapcells.ZOOM
+            keys=[mapcells.CellKey(mapcells.ZOOM,xx,yy) for xx in range(max(0,x-1),min(n,x+2))
+                  for yy in range(max(0,y-1),min(n,y+2))]
+            token=(self.md.cached_building_dependencies(keys).revision,self.md.building_context_revision(keys))
+            rel=os.path.join(str(rel),'osm-only-context-v1',hashlib.sha256(str(token).encode()).hexdigest())
         return os.path.join(self.dir, str(rel), str(x), f"{y}.npz") if self.dir else None
 
     def _load(self, x, y):
+        if self.dir and getattr(self.md,'building_source_mode',None)=='osm-only-v1':
+            n=1<<mapcells.ZOOM
+            keys=[mapcells.CellKey(mapcells.ZOOM,xx,yy) for xx in range(max(0,x-1),min(n,x+2))
+                  for yy in range(max(0,y-1),min(n,y+2))]
+            self.md.prepare_buildings(keys)
+            self.md.prepare_building_context(keys)
         p = self._path(x, y)
         fields = ("lon", "lat", "height", "radius", "kind", "group", "rank", "yaw", "scale")
         if p and os.path.exists(p):

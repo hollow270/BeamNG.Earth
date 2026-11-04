@@ -68,6 +68,7 @@ class View:
             f.__dict__['_bnge_osm_only']=True
             f.__dict__['overlay_provenance']={r.feature_id:dict(sources=deepcopy(r.sources),parent_id=r.parent_id) for r in records}
             out[layer]=f
+            base.stats[layer]=dict(s=0.0,hit=True)
         provenance=dict(id='osm-buildings',name='OpenStreetMap buildings',licence='ODbL-1.0',
                         attribution='© OpenStreetMap contributors',mode=MODE,revision=token)
         return replace(base,layers=out,versions=dict(base.versions,building_overlay=token),provenance=base.provenance+[provenance])

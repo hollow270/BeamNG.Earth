@@ -16,7 +16,8 @@ sources' own pixel grids, nothing from timing, threads or fetch order. CellData.
 it (the golden-hash tests and the deterministic generators can rely on it).
 
 Layers (LAYERS):
-  roads, connectors, buildings, water, land_use, infrastructure   Overture (overture.py)
+  buildings, building_parts                                      OpenStreetMap (buildingworld.py)
+  roads, connectors, water, land_use, infrastructure                Overture (overture.py)
   landcover                                                       ESA WorldCover 10 m (maprasters.py)
   canopy                                                          Meta/WRI CHMv2 1.2 m (maprasters.py)
 Vector features carry lon/lat (float64) and `en`, metres in the cell's local ENU frame (the
@@ -323,7 +324,7 @@ class MapData:
         return pinned()
 
     def building_cell(self, key, layers=("buildings", "building_parts"), kind="demand"):
-        """Rendering-only cell; cell() and versions() always retain their original baseline contracts.
+        """Pinned OSM buildings for every consumer, including road context and masks.
 
         The default view is pinned at construction. building_snapshot() supplies an
         explicit per-job revision without changing that default or other threads.
@@ -331,8 +332,45 @@ class MapData:
         from osmbuildingview import View
         from osmbuildingcache import empty
         key=_key(key)
+        if self._building_context.get() is None and self._building_world is not None:
+            self._building_world.prepare((key,))
+            return self._prepared_building_cell(key,layers,kind)
         view = self._building_context.get() or (self._building_world.view((_key(key),)) if self._building_world is not None else self._building_view)
         return (view or View(empty())).cell(self,key,layers,kind)
+
+    def _prepared_building_cell(self,key,layers,kind):
+        """Reuse immutable session inputs within the existing, bounded layer LRU.
+
+        A View validates and converts complete OSM footprints. Recreating it for
+        every road-width sample bypassed the ordinary decoded-layer cache and
+        repeatedly processed thousands of identical records. The session's cell
+        dependency includes its canonical identity owners and cannot change.
+        """
+        layers=tuple(layers);token=self._building_world.cached_revision((key,))
+        names=tuple(l for l in layers if l in ('buildings','building_parts'))
+        found={}
+        with self._mem_lock:
+            for layer in names:
+                cache_key=(str(key),'osm-session',token,layer)
+                got=self._mem.get(cache_key)
+                if got is not None:
+                    self._mem.move_to_end(cache_key);found[layer]=got
+        missing=tuple(l for l in names if l not in found)
+        if missing:
+            built=self._building_world.view_prepared((key,)).cell(self,key,missing,kind)
+            provenance=built.provenance[-1]
+            for layer in missing:
+                feature=built.layers[layer]
+                entry=(feature,provenance,_nbytes(_layer_arrays(feature)))
+                self._remember((str(key),'osm-session',token,layer),entry);found[layer]=entry
+        base=self.cell(key,layers=tuple(l for l in layers if l not in names),kind=kind)
+        for layer in names:
+            base.layers[layer]=found[layer][0];base.stats[layer]=dict(s=0.0,hit=True)
+        if names:
+            provenance=found[names[0]][1]
+            base.versions=dict(base.versions,building_overlay=provenance['revision'])
+            base.provenance.append(provenance)
+        return base
 
     def building_dependencies(self, keys, *, render_bounds=None):
         """Local effective-building tokens; not a global pipeline version or invalidation operation."""
@@ -344,6 +382,58 @@ class MapData:
             from osmbuildingcache import empty
             view=View(empty())
         return view.dependency(keys,render_bounds=render_bounds)
+
+    def prepare_buildings(self,keys,*,preferred_bounds=None,priority=0):
+        """Explicit worker preparation; cache identity/readiness never calls this."""
+        if self._building_context.get() is None and self._building_world is not None:
+            if priority:self._building_world.prepare(tuple(keys),preferred_bounds=preferred_bounds,priority=priority)
+            else:self._building_world.prepare(tuple(keys),preferred_bounds=preferred_bounds)
+
+    def cached_building_dependencies(self,keys):
+        from buildingrender import Dependency
+        if self._building_context.get() is None and self._building_world is not None:
+            token=self._building_world.cached_revision(tuple(keys))
+            return Dependency(token,token)
+        return self.building_dependencies(tuple(keys))
+
+    def cached_building_cell(self,key):
+        key=_key(key)
+        if self._building_context.get() is None and self._building_world is not None:
+            return self._prepared_building_cell(key,('buildings',),'demand')
+        return self.building_cell(key,layers=('buildings',))
+
+    def prepare_building_context(self,keys,*,acquire=True):
+        """Explicit worker barrier for the roads which can actually measure widths.
+
+        Water routes/railways and other unmeasured features never request buildings.
+        This uses the existing road records and does not change width calculations.
+        """
+        import roadwidth
+        keys=tuple(sorted({_key(key) for key in keys}));walls=set()
+        for key in keys:
+            f=self.cell(key,layers=('roads',)).layers.get('roads')
+            if f is not None:walls.update(roadwidth.measurement_cells(f))
+        if walls:
+            bounds=(min(k.bounds()[0] for k in keys),min(k.bounds()[1] for k in keys),
+                    max(k.bounds()[2] for k in keys),max(k.bounds()[3] for k in keys))
+            if acquire:self.prepare_buildings(tuple(walls),preferred_bounds=bounds)
+            else:self.cached_building_dependencies(tuple(walls))
+        identity=getattr(getattr(self._building_world,'session',None),'identity',None)
+        with self._lock:
+            memo=self.__dict__.setdefault('_prepared_contexts',{})
+            if len(memo)>256:memo.clear()
+            memo[identity,keys]=tuple(sorted(walls))
+
+    def building_context_revision(self, keys):
+        """Read-only input identity; never loads roads or acquires buildings."""
+        from buildingoverlaystore import LockTimeout
+        keys=tuple(sorted({_key(key) for key in keys}))
+        if self._building_context.get() is not None or self._building_world is None:
+            return self.cached_building_dependencies(keys).revision
+        identity=self._building_world.session.identity
+        with self._lock:walls=self.__dict__.get('_prepared_contexts',{}).get((identity,keys))
+        if walls is None:raise LockTimeout('road-width context not prepared; defer generation')
+        return self.cached_building_dependencies(walls).revision
 
     def _rails(self, key, layer, feats):
         """The roads layer's rail segments with OSM's railway tags (railtags.py), once per build of them."""
@@ -379,7 +469,8 @@ class MapData:
     def versions(self):
         rails = getattr(self, "rail_tags", None)
         lanes = getattr(self, "lane_tags", None)
-        return {"pipeline": VERSION, "overture": self.release, "worldcover": maprasters.WORLDCOVER_RELEASE,
+        return {"pipeline": VERSION, "overture": self.release, "building_context": "osm-only-context-v1",
+                "worldcover": maprasters.WORLDCOVER_RELEASE,
                 "canopy": maprasters.CHM_RELEASE, "rails": rails.known() if rails is not None else None,
                 "lanes": lanes.known() if lanes is not None else None,
                 "gradesep": (gradesep.VERSION, gradesep.MODE) if gradesep.TUNNELS else None}
@@ -413,12 +504,18 @@ class MapData:
     # --- one layer -------------------------------------------------------------------------------
     def has(self, key, layer):
         """True when the layer's file exists (not read: cheap enough for the event loop)."""
+        if layer in ('buildings','building_parts'):
+            return self._building_context.get() is not None or self._building_view is not None or \
+                (self._building_world.ready((_key(key),)) if self._building_world is not None else True)
         return os.path.exists(self.path(key, layer))
 
     def layer_provenance(self, key, layer):
         """The provenance dict of a cached layer file, None when it is not cached (or has none): only that entry of
         the file is read (np.load is lazy per array), and remembered per file (credits.feature_ids asks every second,
         from the event loop). Never fetches."""
+        if layer in ('buildings','building_parts'):
+            return dict(id='osm-buildings',name='OpenStreetMap buildings',licence='ODbL-1.0',
+                        attribution='© OpenStreetMap contributors')
         path = self.path(_key(key), layer)
         memo = self.__dict__.setdefault("_prov_memo", {})
         if path in memo:
@@ -463,6 +560,8 @@ class MapData:
 
     def _build(self, key, layer, kind):
         """(content arrays, provenance record or None) of one layer, from the sources."""
+        if layer in ('buildings','building_parts'):
+            raise ValueError('Overture building layers are disabled; use the pinned OSM accessor')
         if layer in VECTOR_LAYERS:
             # the roads' OpenStreetMap tags are read alongside Overture's (each half a fresh cell's wait)
             osm = self._osm_pool().submit(self._osm_cell, key, kind) if layer == "roads" else None
@@ -536,6 +635,12 @@ class MapData:
 
     def layer_arrays(self, key, layer, kind="demand"):
         """(arrays, hit) of one cell's layer: from the cache, or built and cached."""
+        if layer in ('buildings','building_parts'):
+            hit=self.has(key,layer)
+            cd=self.building_cell(key,layers=(layer,),kind=kind)
+            arrays=cd.layers[layer].to_arrays('')
+            arrays['provenance']=np.array(json.dumps(cd.provenance[-1]))
+            return arrays,hit
         if layer not in ALL_LAYERS:
             raise ValueError(f"unknown map layer {layer!r}; choose from {', '.join(ALL_LAYERS)}")
         key = _key(key)
@@ -651,6 +756,9 @@ class MapData:
     # --- cells -----------------------------------------------------------------------------------
     def cell(self, key, layers=LAYERS, kind="demand"):
         """CellData of one cell with the given layers (fetched / built / cached as needed)."""
+        layers=tuple(layers)
+        if any(layer in ('buildings','building_parts') for layer in layers):
+            return self.building_cell(key,layers=layers,kind=kind)
         key = _key(key)
         lat_c, lon_c = key.center()
         frame = geodesy.EnuFrame(lat_c, lon_c, 0.0)
@@ -766,7 +874,11 @@ class MapData:
 
         def run(k, key, layer):
             try:
-                self.layer_arrays(key, layer, kind)
+                if layer in ('buildings','building_parts') and self._building_world is not None:
+                    # Speculation cannot claim single cells ahead of a bounded
+                    # demand batch or freeze an unavailable session choice.
+                    self.cached_building_cell(key)
+                else:self.layer_arrays(key, layer, kind)
             except Exception as e:      # (the caller's own cell() of it raises, or builds it again)
                 log.debug("mapdata warm %s %s: %s: %s", key, layer, type(e).__name__, e)
             finally:
@@ -781,6 +893,10 @@ class MapData:
         is on disk; not loaded or mirrored (the session's cells keep the mirror). True when built now. Raises the
         sources' netfetch errors."""
         key = _key(key)
+        if layer in ('buildings','building_parts'):
+            hit=self.has(key,layer)
+            self.building_cell(key,layers=(layer,),kind='predownload')
+            return not hit
         path = self.path(key, layer)
         if os.path.exists(path):
             return False

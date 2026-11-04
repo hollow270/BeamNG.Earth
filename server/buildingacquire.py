@@ -39,7 +39,7 @@ def _decode(value):
     return snapshot,value['source'],value['report']
 
 
-def _default(request,emit):
+def _default(request,emit,deadline=None):
     import netfetch
     from types import SimpleNamespace
     from buildingworld import Provider
@@ -49,7 +49,7 @@ def _default(request,emit):
         provider=Provider(md,request['session'])
         if not provider.claim_valid(request['key'],request['token']):raise AcquisitionError('acquisition claim fenced')
         state=provider._state()
-        return provider._acquire(request['key'],state,progress=emit,token=request['token'])
+        return provider._acquire(request['key'],state,progress=emit,token=request['token'],batch=request.get('batch',()),deadline=deadline)
     finally:fetcher.close()
 
 
@@ -71,16 +71,16 @@ def _worker(connection,request,deadline,task):
         # The child's own lease also covers the brief interval after a parent is
         # killed and before this child's parent watchdog notices it.
         with world.lease_store(store,'query-network',max(.01,deadline-time.monotonic()))._locked():
-            if time.monotonic()>=deadline:raise TimeoutError('acquisition deadline before network')
+            if time.monotonic()>=deadline:raise fs.LockTimeout('preparation budget exhausted before network admission')
             def emit(phase):
-                if phase.get('phase')=='parquet_staged':phase_deadline[0]=min(deadline,time.monotonic()+world.PROCESS_S)
+                if phase.get('phase') in ('parquet_staged','cell_processing'):phase_deadline[0]=min(deadline,time.monotonic()+world.PROCESS_S)
                 elif phase.get('phase')=='validated':phase_deadline[0]=min(deadline+world.PUBLICATION_S,time.monotonic()+world.PUBLICATION_S)
                 send(dict(kind='phase',phase=phase))
-            result=(task or _default)(request,emit)
+            result=task(request,emit) if task is not None else _default(request,emit,deadline)
             if time.monotonic()>=deadline+world.PUBLICATION_S:raise TimeoutError('publication deadline before result')
             send(dict(kind='result',value=_wire(result)))
     except BaseException as error:
-        try:send(dict(kind='error',error=type(error).__name__+': '+str(error)[:512]))
+        try:send(dict(kind='error',code=type(error).__name__,error=type(error).__name__+': '+str(error)[:512]))
         except (OSError,ValueError):pass
     finally:
         finished.set();connection.close()
@@ -116,13 +116,20 @@ class Runner:
                 except (EOFError,OSError):break
                 if message.get('kind')=='phase':
                     phase=message['phase'];progress(phase)
-                    if phase.get('phase')=='parquet_staged':phase_deadline=min(deadline,time.monotonic()+PROCESS_S)
+                    if phase.get('phase') in ('parquet_staged','cell_processing'):phase_deadline=min(deadline,time.monotonic()+PROCESS_S)
                     elif phase.get('phase')=='validated':phase_deadline=min(deadline+PUBLICATION_S,time.monotonic()+PUBLICATION_S)
-                elif message.get('kind')=='error':raise AcquisitionError(message['error'])
+                elif message.get('kind')=='error':
+                    if message.get('code') in ('LockTimeout','StalePreview'):raise fs.LockTimeout(message['error'])
+                    raise AcquisitionError(message['error'])
                 elif message.get('kind')=='result':
                     if time.monotonic()>=phase_deadline:break
                     return _decode(message['value'])
                 else:raise AcquisitionError('invalid acquisition message')
+            # A caller's aggregate preparation budget includes waiting for the
+            # query lane and other cells. Exhausting it is a deferral, not proof
+            # that this cell's source failed: do not freeze a partial choice.
+            if phase_deadline==deadline and phase.get('phase')!='validated':
+                raise fs.LockTimeout('OSM preparation budget exhausted; retry pending inputs')
             raise TimeoutError('OSM acquisition deadline/worker exit; last phase='+str(phase)[:512])
         finally:
             timer.cancel();read.close()

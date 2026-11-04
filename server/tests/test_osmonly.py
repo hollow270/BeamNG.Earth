@@ -88,8 +88,7 @@ class OSMOnlyTest(unittest.TestCase):
 
     def test_empty_source_never_returns_overture_and_versions_empty_mesh(self):
         p,r=self.provider();self.pin(p)
-        original=self.md.cell(fx.CELL,layers=('buildings',)).layers['buildings']
-        self.assertEqual(original.ids.tolist(),['overture-sentinel'])
+        self.assertEqual([f.feature_id for f in self.md.originals],['overture-sentinel'])
         effective=self.md.building_cell(fx.CELL).layers['buildings']
         self.assertEqual(len(effective),0)
         self.assertIsNotNone(self.md.building_dependencies((fx.CELL,)).revision)
@@ -291,19 +290,121 @@ class OSMOnlyTest(unittest.TestCase):
         report=world.refresh(self.md.cache_dir,(fx.CELL,),self.md.fetcher,reader_factory=lambda:Reader(fail=True))
         self.assertFalse(report['checked']);new,r=self.provider();self.assertEqual(new.view((fx.CELL,)).snapshot.entries,old.entries)
 
-    def test_road_baseline_and_terrain_versions_are_unchanged(self):
-        p,r=self.provider(source_features());before=self.md.versions();baseline=self.md.cell(fx.CELL,layers=('buildings','roads')).digest()
+    def test_original_road_records_and_terrain_source_versions_are_unchanged(self):
+        p,r=self.provider(source_features());before=self.md.versions();baseline=self.md.cell(fx.CELL,layers=('roads',)).digest()
         self.pin(p);self.md.building_cell(fx.CELL,layers=('buildings','roads'))
         self.assertEqual(self.md.versions(),before)
-        self.assertEqual(self.md.cell(fx.CELL,layers=('buildings','roads')).digest(),baseline)
+        self.assertEqual(self.md.cell(fx.CELL,layers=('roads',)).digest(),baseline)
 
-    def test_empty_osm_render_does_not_remove_original_road_context(self):
-        before=buildings.road_tile_items(fx.FRAME,0,0,self.md,fx.ground,effective=False)
+    def test_empty_osm_also_removes_building_dependent_road_context(self):
         p,r=self.provider();self.pin(p)
         rendered,road_context=buildings.road_context_items(fx.FRAME,0,0,self.md,fx.ground)
         self.assertFalse(rendered)
-        self.assertTrue(before)
-        self.assertEqual(fx.mesh_fingerprint(before),fx.mesh_fingerprint(road_context))
+        self.assertIs(road_context,rendered)
+        self.assertFalse(buildings.centres(road_context,0,0))
+        self.assertEqual(buildings.coverage(road_context),0.)
+
+    def test_road_context_uses_the_same_osm_specs_without_a_second_generation(self):
+        p,r=self.provider(source_features());self.pin(p)
+        original=buildings.road_tile_items
+        with mock.patch.object(buildings,'road_tile_items',wraps=original) as generate:
+            rendered,context=buildings.road_context_items(fx.FRAME,0,0,self.md,fx.ground)
+        self.assertEqual(generate.call_count,1);self.assertTrue(context);self.assertIs(context,rendered)
+        self.assertEqual([s.seed for s,_,_ in context],[s.seed for s,_,_ in rendered])
+
+    def test_every_cell_entrypoint_ignores_retained_overture_building_files(self):
+        # A retained baseline file must never be served, including low-level warm /
+        # saved-area access. Keep the sentinel to catch accidental cache reads.
+        self.md._store(self.md.path(fx.CELL,'buildings'),self.md._build(fx.CELL,'buildings','demand'))
+        p,r=self.provider(source_features());self.pin(p)
+        build=self.md._build
+        def only_other_sources(key,layer,kind):
+            self.assertNotIn(layer,('buildings','building_parts'))
+            return build(key,layer,kind)
+        with mock.patch.object(self.md,'_build',side_effect=only_other_sources), \
+             mock.patch.object(self.md.overture,'query',side_effect=AssertionError('Overture building query')):
+            self.assertFalse(self.md.has(fx.CELL,'buildings'),'a retained baseline file is not OSM readiness')
+            self.assertEqual(self.md.warm(((fx.CELL,'buildings'),)),1)
+            cd=self.md.cell(fx.CELL,layers=('buildings','building_parts','roads'))
+            self.assertEqual(cd.layers['buildings'].ids.tolist(),['osm:way:1'])
+            arrays,_=self.md.layer_arrays(fx.CELL,'buildings')
+            self.assertEqual(fx.mg.Features.from_arrays('buildings',arrays,'').ids.tolist(),['osm:way:1'])
+            self.assertTrue(self.md.prefetch(fx.CELL,layers=('buildings','building_parts')))
+            self.assertFalse(self.md.predownload(fx.CELL,'buildings'))
+        with self.assertRaises(ValueError):mapdata.MapData._build(self.md,fx.CELL,'buildings','demand')
+
+    def test_production_mapdata_never_queries_overture_buildings(self):
+        fetch=netfetch.Fetcher(offline=True,transport=object());self.addCleanup(fetch.close)
+        md=mapdata.MapData(str(self.root/'production'),fetcher=fetch);self.addCleanup(md.close)
+        snapshot,_=cache.normalize((lc.Snapshot(fx.CELL.bounds(),source_features(),(),sample.VERSION),))
+        md.pin_buildings(snapshot)
+        with mock.patch.object(md.overture,'query',side_effect=AssertionError('Overture building query')):
+            self.assertEqual(md.cell(fx.CELL,layers=('buildings',)).layers['buildings'].ids.tolist(),['osm:way:1'])
+            self.assertEqual(md.cell_at(*fx.CELL.center(),layers=('buildings',)).layers['buildings'].ids.tolist(),['osm:way:1'])
+            self.assertTrue(md.prefetch(fx.CELL,layers=('buildings','building_parts')))
+            self.assertEqual(md.layer_provenance(fx.CELL,'buildings')['id'],'osm-buildings')
+
+    def test_photo_mask_and_legacy_effective_flag_cannot_bypass_osm(self):
+        p,r=self.provider();self.pin(p)
+        self.assertIsNone(buildings.photo_mask(fx.FRAME,0,0,256,32,self.md))
+        self.assertFalse(buildings.road_tile_items(fx.FRAME,0,0,self.md,fx.ground,effective=False))
+        world.refresh(self.md.cache_dir,(fx.CELL,),self.md.fetcher,
+                      reader_factory=lambda:Reader(source_features(),version=dict(sample.VERSION,etag='\"context-update\"')))
+        p,r=self.provider(source_features());self.md._building_world=p
+        self.assertTrue(buildings.photo_mask(fx.FRAME,0,0,256,32,self.md).any())
+
+    def test_width_wall_cache_uses_osm_revision_and_never_reads_legacy_walls(self):
+        import roadwidth
+        legacy=self.root/'walls';legacy_path=legacy/str(fx.CELL.z)/str(fx.CELL.x)/(str(fx.CELL.y)+'.npy')
+        roadwidth._write_segs(str(legacy_path),fx.np.array([[0,0,100,100]],fx.np.float32))
+        p,r=self.provider();self.pin(p)
+        def widths():return roadwidth.RoadWidths(lambda key:self.md.cell(key,layers=('buildings',)).layers['buildings'],
+                    str(legacy),dependency=lambda key:self.md.building_dependencies((key,)).geometry_digest)
+        self.assertEqual(len(widths()._walls(fx.CELL)[1].segs),0)
+        world.refresh(self.md.cache_dir,(fx.CELL,),self.md.fetcher,
+                      reader_factory=lambda:Reader(source_features(),version=dict(sample.VERSION,etag='\"context-update\"')))
+        p,r=self.provider(source_features());self.md._building_world=p
+        self.assertGreater(len(widths()._walls(fx.CELL)[1].segs),0)
+        self.assertGreater(len(list(legacy.rglob('*.npy'))),1)
+
+    def test_context_plan_keys_are_local_revision_bound(self):
+        import plancache
+        self.md.street=True
+        p,r=self.provider();self.pin(p)
+        def plan_cache():
+            self.md.prepare_building_context((fx.CELL,))
+            plans=plancache.PlanCache(str(self.root/'plans'),'w1s0')
+            plans.building_context=self.md.building_context_revision
+            plans.persist=(str(self.root/'cache'),('frames','w1s0',self.md.versions()))
+            return plans
+        a=plan_cache();path=a._path(tuple(fx.CELL));key=a._revisit_key(tuple(fx.CELL))
+        world.refresh(self.md.cache_dir,(fx.CELL,),self.md.fetcher,
+                      reader_factory=lambda:Reader(source_features(),version=dict(sample.VERSION,etag='\"context-update\"')))
+        p,r=self.provider(source_features());self.md._building_world=p
+        b=plan_cache();self.assertNotEqual(path,b._path(tuple(fx.CELL)))
+        self.assertNotEqual(key,b._revisit_key(tuple(fx.CELL)))
+        self.assertEqual(b._path(tuple(fx.CELL)),plan_cache()._path(tuple(fx.CELL)))
+
+    def test_context_semantics_exclude_old_derived_artifacts_without_changing_sources(self):
+        versions=self.md.versions();self.assertEqual(versions['building_context'],'osm-only-context-v1')
+        self.assertEqual(versions['overture'],fx.RELEASE)
+
+    def test_vegetation_cached_masks_use_osm_context_and_ready_never_fetches(self):
+        import vegetation
+        p,r=self.provider();self.pin(p)
+        plant=vegetation.Vegetation(self.md,str(self.root/'plants'))
+        with mock.patch.object(self.md,'building_context_revision',side_effect=AssertionError('event-loop fetch')):
+            self.assertFalse(plant.ready(tuple(fx.CELL)))
+        def prepared_path():
+            keys=[mapcells.CellKey(fx.CELL.z,fx.CELL.x+dx,fx.CELL.y+dy) for dx in (-1,0,1) for dy in (-1,0,1)]
+            self.md.prepare_buildings(keys);self.md.prepare_building_context(keys)
+            return plant._path(fx.CELL.x,fx.CELL.y)
+        a=prepared_path()
+        world.refresh(self.md.cache_dir,(fx.CELL,),self.md.fetcher,
+                      reader_factory=lambda:Reader(source_features(),version=dict(sample.VERSION,etag='\"context-update\"')))
+        p,r=self.provider(source_features());self.md._building_world=p
+        b=prepared_path()
+        self.assertNotEqual(a,b)
 
     def test_validated_result_after_download_budget_gets_publication_phase(self):
         descriptor=world.start(self.md.cache_dir);self.md.fetcher.offline_flag=False

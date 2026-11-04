@@ -35,6 +35,7 @@ import staging
 import surface as surfacemod
 import terraincache
 import xproc
+import buildingwait
 
 log = logging.getLogger("earthd.blockworker")
 
@@ -64,8 +65,10 @@ class _State:
         self.fra = fra.Crossings(cache_dir, net) if roads else None     # (the US's level crossings' devices)
         self.grading = bool(grading) and self.md is not None
         self.widths = (roadwidthmod.RoadWidths(
-            lambda key: md.cell(key, layers=("buildings",), kind="demand").layers.get("buildings"),
-            roadwidthmod.store_dir(cache_dir, md)).get
+            lambda key: md.cached_building_cell(key).layers.get("buildings"),
+            roadwidthmod.store_dir(cache_dir, md),
+            dependency=lambda key: md.cached_building_dependencies((key,)).geometry_digest,
+            prepare=md.prepare_buildings).get
             if road_widths and self.md is not None else None)
         self.surface = surfacemod.Surface(md) if surface else None
         if self.surface is not None:    # gas station forecourts painted asphalt (--gas-stations on)
@@ -243,10 +246,16 @@ def _warm_loop():
                     _s.cv.wait()
         try:
             t0 = time.perf_counter()
+            # Speculative road-plan warming must not monopolize first-visit
+            # acquisition ahead of the player's actual terrain/building jobs.
+            md=job[0].md
+            if getattr(md,'_building_world',None) is not None:
+                md.prepare_building_context((job[1],),acquire=False)
             job[0].warm(job[1])
             log.debug("road plans ahead: %s in %.2f s", job[1], time.perf_counter() - t0)
-        except Exception:
-            log.exception("road plans ahead for %s", job[1])
+        except Exception as error:
+            if buildingwait.transient(error):log.debug("road plans ahead %s await building inputs",job[1])
+            else:log.exception("road plans ahead for %s", job[1])
             with _s.cv:
                 _s.want = [w for w in _s.want if w[1] != job[1]]
 
@@ -511,9 +520,10 @@ def _stack_watch(what):
 def _roads_tile_cached(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, sidewalks, lift, buildings, left_hand, mph, q,
                        gas_stations, buried, lamp_region, country=None):
     import revisit
+    prepare_building_inputs(_s.md,geodesy.EnuFrame(lat,lon),roadsmod_tile_bbox(tx,ty),buildings or gas_stations)
     k = revisit.key("roads", round(float(lat), 7), round(float(lon), 7), zoom, tx, ty, bool(sidewalks), float(lift),
                     bool(buildings), bool(left_hand), bool(mph), None if q is None else float(q), bool(gas_stations),
-                    building_versions(_s.md, geodesy.EnuFrame(lat, lon), roadsmod_tile_bbox(tx, ty), buildings),
+                    building_versions(_s.md, geodesy.EnuFrame(lat, lon), roadsmod_tile_bbox(tx, ty), buildings or gas_stations),
                     float(buried), lamp_region, country)
     wh = _where_enu(lat, lon, *roadsmod_tile_bbox(tx, ty),
                     sidewalks=bool(sidewalks), lift=float(lift), buildings=bool(buildings),
@@ -541,8 +551,18 @@ def building_versions(md, frame, box, enabled=True, kind=None):
     versions = md.versions() if md is not None else None
     if not enabled or not getattr(md, "building_overlays_active", False):
         return versions
-    dependency = md.building_dependencies(building_cells(frame, box),render_bounds=building_render_bounds(frame,box,kind))
+    cached=getattr(md,'cached_building_dependencies',None)
+    dependency = cached(building_cells(frame,box,kind)) if cached is not None else \
+        md.building_dependencies(building_cells(frame, box,kind),render_bounds=building_render_bounds(frame,box,kind))
     return dict(versions, building_overlay=dependency.revision) if dependency.revision is not None else versions
+
+
+def prepare_building_inputs(md,frame,box,enabled=True,kind=None):
+    prepare=getattr(md,'prepare_buildings',None)
+    if enabled and prepare is not None:
+        options=dict(preferred_bounds=building_render_bounds(frame,box,kind))
+        if kind in ('bldfar','skyline','bldsky'):options['priority']=1 if kind=='bldfar' else 2
+        prepare(building_cells(frame,box,kind),**options)
 
 
 def building_render_bounds(frame, box, kind=None):
@@ -558,17 +578,13 @@ def building_render_bounds(frame, box, kind=None):
     return float(lo.min()),float(la.min()),float(lo.max()),float(la.max())
 
 
-def building_cells(frame, box):
-    """The shared cell footprint of rendering/cache dependencies, including density neighbours."""
-    import buildings
+def building_cells(frame, box,kind=None):
+    """Exactly the rendering read envelope, including density only where used."""
     import mapcells
-    x0, y0, x1, y1 = box
-    margin = buildings.DISTRICT_M
-    la, lo, _ = frame.enu_to_geodetic(np.array([x0-margin, x1+margin, x0-margin, x1+margin]),
-                                     np.array([y0-margin, y0-margin, y1+margin, y1+margin]), 0.0)
-    if float(np.max(lo) - np.min(lo)) > 180:
+    w,s,e,n=building_render_bounds(frame,box,kind)
+    if e-w>180:
         return ()  # overlay storage does not support antimeridian selections
-    return mapcells.cells_for_bbox(float(np.min(la)), float(np.min(lo)), float(np.max(la)), float(np.max(lo)))
+    return mapcells.cells_for_bbox(s,w,n,e)
 
 
 def roadsmod_tile_bbox(tx, ty):
@@ -1033,7 +1049,7 @@ def _geo_content_key(key, zoom, buildings, left_hand, mph, gas_stations, buried,
     data = _s.md if md is None else md
     if hasattr(data, "versions"):
         versions = data.versions()
-        if buildings and getattr(data, "building_overlays_active", False):
+        if (buildings or gas_stations) and getattr(data, "building_overlays_active", False):
             import geotiles
             z, gx, gy = geotiles.parse(key)
             tile = geotiles.geobox(gx, gy, z)
@@ -1052,7 +1068,9 @@ def prebuild_geo(gx, gy, zoom, scratch, buildings, left_hand, mph, gas_stations,
     is in the cache after (built now or before), else None (something it read was missing: tried again later)."""
     import geotiles
     import revisit
-    tile_key = geotiles.geobox(gx, gy).key
+    tile=geotiles.geobox(gx,gy)
+    prepare_building_inputs(_s.md,tile.frame,tile.box,buildings or gas_stations)
+    tile_key = tile.key
     k = _geo_content_key(tile_key, zoom, buildings, left_hand, mph, gas_stations, buried, lamp_region, country)
     path = revisit._path(_s.cache_dir, "roadsg", k)
     if not os.path.exists(path):
@@ -1078,6 +1096,7 @@ def _geo_content(gx, gy, zoom, out_dir, vfs_dir, buildings, left_hand, mph, gas_
     import geotiles
     import revisit
     tile = geotiles.geobox(gx, gy)
+    prepare_building_inputs(_s.md,tile.frame,tile.box,buildings or gas_stations)
     names = geo_names(tile.key)
     k = _geo_content_key(tile.key, zoom, buildings, left_hand, mph, gas_stations, buried, lamp_region, country)
     got = revisit.load(_s.cache_dir, "roadsg", k)
@@ -1379,6 +1398,9 @@ def roads_geo(aid, lat, lon, zoom, gx, gy, gzoom, out_dir, vfs_dir, sidewalks, l
     fuel pads) or None, "skin": (vfs path, info) or None, "exact": {what: vfs path}, "stages": {...}}."""
     watch = _stack_watch(f"road geotile {gx}_{gy}")
     try:
+        import geotiles
+        tile=geotiles.geobox(gx,gy)
+        prepare_building_inputs(_s.md,tile.frame,tile.box,buildings or gas_stations)
         out = {"content": None, "skin": None, "exact": {}, "stages": {}}
         t0 = time.perf_counter()
         c0 = time.process_time()
@@ -1519,6 +1541,7 @@ def far_buildings_tile(aid, lat, lon, zoom, tx, ty, out_dir, vfs_dir, lamp_regio
     import buildings as buildingsmod
     import revisit
     frame = geodesy.EnuFrame(lat, lon)
+    prepare_building_inputs(_s.md,frame,roadsmod_tile_bbox(tx,ty),kind='bldfar')
     k = revisit.key("bldfar", round(float(lat), 7), round(float(lon), 7), zoom, tx, ty,
                     building_versions(_s.md, frame, roadsmod_tile_bbox(tx, ty)), lamp_region)
     return _revisit_tile("bldfar", k, aid, tx, ty, out_dir, vfs_dir, f"bldfar_{aid}_{tx}_{ty}.json",
@@ -1539,6 +1562,7 @@ def skyline_tile(aid, lat, lon, zoom, ux, uy, out_dir, vfs_dir, lamp_region=None
     u = buildingsmod.SKY_UNIT
     sx0, sy0, _, _ = roadsmod_tile_bbox(ux * u, uy * u)
     _, _, sx1, sy1 = roadsmod_tile_bbox(ux * u + u - 1, uy * u + u - 1)
+    prepare_building_inputs(_s.md,frame,(sx0,sy0,sx1,sy1),kind='skyline')
     k = revisit.key("bldsky", round(float(lat), 7), round(float(lon), 7), zoom, ux, uy,
                     building_versions(_s.md, frame, (sx0, sy0, sx1, sy1),kind='skyline'), lamp_region)
     return _revisit_tile("bldsky", k, aid, ux, uy, out_dir, vfs_dir, f"bldsky_{aid}_{ux}_{uy}.json",
@@ -1706,6 +1730,7 @@ def far_geo(kind, gx, gy, gzoom, out_dir, vfs_dir, lamp_region=None):
     import revisit
     z = far_geo_zoom(kind)
     tile = geotiles.geobox(gx, gy, z)
+    prepare_building_inputs(_s.md,tile.frame,tile.box,kind!='brfar',kind=kind)
     names = far_geo_names(kind, tile.key)
     k = revisit.key(kind, "g", tile.key, int(gzoom),
                     building_versions(_s.md, tile.frame, tile.box, kind != "brfar",kind=kind), lamp_region)

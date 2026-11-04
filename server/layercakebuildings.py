@@ -22,6 +22,7 @@ import buildingoverlay as bo
 from buildingoverlaystore import ResourceLimit, _bounds
 from buildingoverlaystore import OverlayStore
 import mapgeom
+import mapcells
 import netfetch
 import osmbuildings as osm
 import osmtags
@@ -137,19 +138,24 @@ class Snapshot:
 
 class Reader(osmtags.OsmTags):
     """Reuse row-group planning, range cache and DuckDB configuration from osmtags."""
-    def __init__(self, raw_dir, fetcher, *, transport=None, tolerant=False, raw_budget=256*1024*1024):
+    def __init__(self, raw_dir, fetcher, *, transport=None, tolerant=False, raw_budget=256*1024*1024,index_dir=None):
         self.ranges = RangeFetcher(fetcher, transport)
         super().__init__(str(raw_dir), self.ranges, URL)
         self.selected = None
         self.tolerant = tolerant
         self.raw_budget = raw_budget
+        self.index_dir=Path(index_dir).absolute() if index_dir is not None else None
         self._ctx = None
         self._schema = None
         self._region = None
+        self._source_index = None
+        self._prepared_index = None
+        self._stage_span = 3000
         self.query_lock = threading.RLock()
         self.diagnostics = dict(remote_scans=0,local_queries=0)
 
     def close(self):
+        if self._prepared_index is not None:self._prepared_index.close();self._prepared_index=None
         if self._ctx is not None:
             self._ctx[0].close();self._ctx=None
         self._reader.close()
@@ -172,8 +178,11 @@ class Reader(osmtags.OsmTags):
         root=Path(self.raw_dir)/'osm-buildings'
         for p in (root,*root.absolute().parents): OverlayStore._no_link(p)
         size=count=0
-        if root.exists():
-            for p in root.rglob('*'):
+        roots=[root]
+        if self.index_dir is not None and not self.index_dir.is_relative_to(root.absolute()):roots.append(self.index_dir)
+        for directory in roots:
+            for p in (directory,*directory.absolute().parents):OverlayStore._no_link(p)
+            for p in directory.rglob('*'):
                 OverlayStore._no_link(p)
                 count+=1
                 if count>32768: raise ResourceLimit('raw building cache entry limit')
@@ -216,13 +225,75 @@ class Reader(osmtags.OsmTags):
         staging table has a separate 50,000-row/256 MiB admission, no spill, and
         lives only in the supervised acquisition process. No planet mirror.
         """
+        self._prepare_region(bounds,3000)
+
+    def prepare_cells(self,keys):
+        """One scan for at most one aligned 2x2 group; existing row/RAM limits.
+
+        A dense group falls back to its first cell, never truncates its rows.
+        Other requested cells remain pending for a later bounded acquisition.
+        """
+        keys=tuple(keys)
+        if not keys or len(set(keys))!=len(keys) or len(keys)>4 or any(k.z!=mapcells.ZOOM for k in keys) or \
+                len({(k.x//2,k.y//2) for k in keys})!=1:raise ValueError('invalid source cell batch')
+        bounds=(min(k.bounds()[0] for k in keys),min(k.bounds()[1] for k in keys),
+                max(k.bounds()[2] for k in keys),max(k.bounds()[3] for k in keys))
+        try:self._prepare_region(bounds,6000)
+        except ResourceLimit as error:
+            if len(keys)==1 or 'source staging feature capacity' not in str(error):raise
+            self._connection()[0].execute('DROP TABLE IF EXISTS lc_region')
+            self._region=None;self._empty_region=False
+            self.prepare_region(keys[0].bounds());keys=keys[:1]
+            self.diagnostics['batch_reduced']='source staging feature capacity'
+        self.diagnostics['batch_cells']=len(keys)
+        return keys
+
+    def _prepare_region(self,bounds,span):
         bounds=_bounds(bounds)
         if max((bounds[2]-bounds[0])*111320*math.cos(math.radians((bounds[1]+bounds[3])/2)),
-               (bounds[3]-bounds[1])*111320)>3000:raise ResourceLimit('source staging region exceeds one data cell')
+               (bounds[3]-bounds[1])*111320)>span:raise ResourceLimit('source staging region exceeds bounded cells')
         with self.query_lock:
             if self._region is not None:raise ValueError('source staging region already chosen')
+            self._stage_span=span
+            from buildingsourcecache import Index,Unavailable
+            tick=time.monotonic()
+            index=self._prepared_index or Index(self)
+            try:
+                groups=index.prepare(bounds)
+            except Unavailable as error:
+                index.close();self._prepared_index=None
+                self.diagnostics['index_deferred']=str(error)
+            except BaseException:
+                index.close();self._prepared_index=None
+                raise
+            else:
+                self._source_index=index;self._prepared_index=index;self._indexed_groups=groups;self._region=tuple(bounds)
+                self.diagnostics['stage_seconds']=round(time.monotonic()-tick,3)
+                self.diagnostics['last_query_seconds']=self.diagnostics['stage_seconds']
+                return
             self._query(bounds,stage=True)
             self._region=tuple(bounds)
+
+    def next_region(self,bounds):
+        """Sequential bounded cells in one supervised request; no larger table."""
+        with self.query_lock:
+            self._region=None;self._source_index=None;self._empty_region=False
+            if self._ctx is not None:self._ctx[0].execute('DROP TABLE IF EXISTS lc_region')
+        self.prepare_region(bounds)
+
+    @staticmethod
+    def _projection(schema):
+        wanted={'id','geometry','bbox','version','timestamp','osm_type','type','building_id','parent_id'}|set(TAGS)
+        columns=sorted((wanted&schema)-{'geometry','bbox'});expressions=[]
+        for c in columns:
+            value=f'CAST("{c}" AS VARCHAR)' if c=='timestamp' else f'"{c}"'
+            limit=4096 if c in TAGS else 128
+            expressions.append(f'CASE WHEN length(CAST("{c}" AS VARCHAR)) <= {limit} THEN {value} END AS "{c}"')
+        too_big=' OR '.join(f'length(CAST("{c}" AS VARCHAR)) > 4096' for c in columns if c in TAGS) or 'false'
+        expressions.extend((f'({too_big}) AS _oversized_attributes',
+                            '(octet_length(geometry) > 131072) AS _oversized_geometry',
+                            'CASE WHEN octet_length(geometry) <= 131072 THEN geometry END AS geometry'))
+        return columns+['_oversized_attributes','_oversized_geometry','geometry'],','.join(expressions)
 
     def query(self,bounds):
         with self.query_lock:return self._query(bounds)
@@ -231,8 +302,17 @@ class Reader(osmtags.OsmTags):
         bounds = _bounds(bounds)
         if self.selected is None: raise ValueError('select a source version explicitly first')
         if max((bounds[2]-bounds[0])*111320*math.cos(math.radians((bounds[1]+bounds[3])/2)),
-               (bounds[3]-bounds[1])*111320) > (3000 if stage else 2000):
+               (bounds[3]-bounds[1])*111320) > (self._stage_span if stage or self._region is not None else 2000):
             raise ResourceLimit('developer refresh requires bounded internal partitions')
+        if self._source_index is not None and not stage:
+            if not (self._region[0]<=bounds[0]<=bounds[2]<=self._region[2] and self._region[1]<=bounds[1]<=bounds[3]<=self._region[3]):
+                raise ValueError('query outside staged source region')
+            tick=time.monotonic()
+            rows=self._source_index.read(self._indexed_groups,bounds,MAX_FEATURES+1)
+            self.diagnostics['local_queries']+=1
+            self.diagnostics['last_query_seconds']=round(time.monotonic()-tick,3)
+            if len(rows)>MAX_FEATURES:raise ResourceLimit('building partition feature budget exceeded')
+            return normalize(rows,bounds,self.selected,tolerant=self.tolerant)
         remote = self._remote[1]
         con, proto, errors = self._connection()
         tick=time.monotonic()
@@ -274,28 +354,15 @@ class Reader(osmtags.OsmTags):
                                for rg in candidates)
             w,s,e,n = bounds
             box = f'bbox.xmin <= {e!r} AND bbox.xmax >= {w!r} AND bbox.ymin <= {n!r} AND bbox.ymax >= {s!r}'
-            columns = sorted((wanted & schema)-{'geometry','bbox'})
             # Core WKB conversion; no extension install, HTTPFS or DuckDB sockets.
             try: con.execute('SET enable_geoparquet_conversion=false')
             except Exception: pass
-            expressions=[]
-            for c in columns:
-                # Bound variable-width values in SQL BEFORE fetchall allocates
-                # Python objects. Oversized tags are explicitly deferred, never
-                # silently accepted with shortened attributes.
-                value=f'CAST("{c}" AS VARCHAR)' if c=='timestamp' else f'"{c}"'
-                limit=4096 if c in TAGS else 128
-                expressions.append(f'CASE WHEN length(CAST("{c}" AS VARCHAR)) <= {limit} THEN {value} END AS "{c}"')
-            too_big=' OR '.join(f'length(CAST("{c}" AS VARCHAR)) > 4096' for c in columns if c in TAGS) or 'false'
-            expressions.append(f'({too_big}) AS _oversized_attributes')
-            expressions.append('(octet_length(geometry) > 131072) AS _oversized_geometry')
-            geometry='CASE WHEN octet_length(geometry) <= 131072 THEN geometry END AS geometry'
-            projection=f'{",".join(expressions)}, {geometry}'
+            names,projection=self._projection(schema)
             scan=f'''SELECT {projection}{', bbox' if stage else ''}
                 FROM read_parquet({uri}, file_row_number=true) WHERE ({only}) AND {box}
                 LIMIT {50001 if stage else MAX_FEATURES+1}'''
             self.diagnostics['remote_scans']+=1
-            self._names=columns+['_oversized_attributes','_oversized_geometry','geometry']
+            self._names=names
             if stage:
                 con.execute('CREATE TEMP TABLE lc_region AS '+scan)
                 count=con.execute('SELECT count(*) FROM lc_region').fetchone()[0]
@@ -304,7 +371,7 @@ class Reader(osmtags.OsmTags):
                 return
             rows = con.execute(scan).fetchall()
             if len(rows)>MAX_FEATURES: raise ResourceLimit('building partition feature budget exceeded')
-            return normalize([dict(zip(columns+['_oversized_attributes','_oversized_geometry','geometry'],r)) for r in rows],bounds,self.selected,tolerant=self.tolerant)
+            return normalize([dict(zip(names,r)) for r in rows],bounds,self.selected,tolerant=self.tolerant)
         except Exception:
             if errors: raise errors[0]
             raise

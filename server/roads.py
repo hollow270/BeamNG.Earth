@@ -1512,14 +1512,18 @@ def road_specs(feats, urban_fn=None, widths=None, left_hand=False):
     got = memo.get(k)
     if got is None:             # (the measured widths on the specs without them: those are asked for too, _bridge_reach)
         extra = (widths is not None, bool(left_hand))
-        if urban_fn is None:    # (the land cover's are the server's own: not shared, cell_facts)
+        # Generic road facts have no building-revision identity. Revisioned OSM
+        # measurements remain in the immutable session's in-memory memo; their
+        # wall/plan caches have their own explicit dependency keys.
+        shared = urban_fn is None and getattr(getattr(widths, '__self__', None), 'dependency', None) is None
+        if shared:    # (the land cover's are the server's own: not shared, cell_facts)
             got = _specs_from(_facts_load(feats, "specs", extra), len(feats))
         if got is None:
             import revisit
             f0 = revisit.faults()
             got = (_road_specs(feats, urban_fn, left_hand) if widths is None else
                    _measured_widths(feats, road_specs(feats, urban_fn, None, left_hand), widths))
-            if urban_fn is None and revisit.faults() == f0:
+            if shared and revisit.faults() == f0:
                 _facts_store(feats, "specs", extra, [None if sp is None else _spec_json(sp) for sp in got])
         got = memo.setdefault(k, got)
     return list(got)
@@ -7373,6 +7377,7 @@ class GeoTracker:
         self.stuck_said = set()
         self.car = set()
         self.empty = set()      # (anchor tiles' interface: progress)
+        self.input_wait = set() # incomplete OSM preparation is not delivered road content
         self.stats = {"content": 0, "skins": 0, "exact": 0, "exact_base": 0, "anchors": 0,
                       "content_cpu": 0.0, "skin_cpu": 0.0}
 
@@ -7383,7 +7388,8 @@ class GeoTracker:
     def progress(self):
         """(done, wanted) of the tiles round the car: done = content and this anchor's skin sent, or waiting for a
         retry."""
-        done = sum(1 for k in self.car if (k in self.sent and k in self.skins) or k in self.retry)
+        done = sum(1 for k in self.car if (k in self.sent and k in self.skins)
+                   or (k in self.retry and k not in self.input_wait))
         return done, len(self.car)
 
     def ready_tiles(self, frame, x, y, r):
@@ -7456,6 +7462,7 @@ class GeoTracker:
                 old = min(a for a in self.frames if a != aid)
                 del self.frames[old]
             self.skins, self.retry, self.fails, self.started, self.stuck_said = set(), {}, {}, {}, set()
+            self.input_wait.clear()
             self.need = {}
             self.stats["anchors"] += 1
         if self.pool is None:
@@ -7471,6 +7478,7 @@ class GeoTracker:
             for a, b, d in geotiles.tiles_near(frame, f[0], f[1], min(SEND_M, f[2] + TILE / 2)):
                 others.setdefault((a, b), d)
         wanted = set(car) | set(seen) | set(others)
+        self.input_wait.intersection_update(wanted | self.building)
         start = {(a, b) for a, b, _ in geotiles.tiles_near(frame, x, y, SEND_M)} if ground_busy else wanted
         now = time.monotonic()
         jobs = []
@@ -7552,6 +7560,13 @@ class GeoTracker:
         try:
             res = fut.result()
         except Exception as e:
+            import buildingwait
+            if buildingwait.transient(e):
+                if aid==self.aid:
+                    self.retry[key]=time.monotonic()+TILE_RETRY_S;self.input_wait.add(key)
+                log.debug('road geotile %s awaiting OSM inputs; retry scheduled',key)
+                return
+            self.input_wait.discard(key)
             kind = f"{type(e).__name__}: {e}"[:200]
             fails = self.fails[key] = self.fails.get(key, 0) + 1
             if kind not in _FAILS_SEEN and not isinstance(e, (OSError, TimeoutError)):
@@ -7567,6 +7582,7 @@ class GeoTracker:
         if res is None:
             self.retry[key] = time.monotonic() + TILE_RETRY_S
             return
+        self.input_wait.discard(key)
         self.fails.pop(key, None)
         gkey = geotiles.key(*key)
         s = getattr(conn, "s", None)

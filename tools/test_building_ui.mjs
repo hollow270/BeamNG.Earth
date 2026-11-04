@@ -128,4 +128,26 @@ await renderCheck(async () => {
   const panel = await mountBuildingPanel({ ...review, restoration: { mode: {}, code: [], message: {} } }, box)
   try { assert.deepEqual(panel.errors, []); assert.equal(panel.commands.length, 0) } finally { panel.close() }
 })
+await renderCheck(async () => {
+  const progress = { required: 312, acknowledged: 96, pending: 216, blocked: 0, components: 22, remaining_components: 15, oversized: 0 }
+  const panel = await mountBuildingPanel({ ...review, state: 'activation_deferred', progress, deferred_overflow: true,
+    deferred: [{ kind: 'far_geo', key: 'g17_1_1', reason: 'Waiting for complete group' }] }, box)
+  try {
+    assert.deepEqual(panel.errors, [])
+    assert.match(panel.text(), /96 \/ 312 current targets acknowledged; 216 pending/)
+    assert.match(panel.text(), /At least 1 dependent targets deferred/)
+    assert.equal(panel.commands.length, 0, 'partial progress never accepts or retries automatically')
+    await panel.update({ ...review, progress: { ...progress, acknowledged: 312, pending: 0, remaining_components: 0 }, state: 'activated' })
+    assert.match(panel.text(), /312 \/ 312 current targets acknowledged; 0 pending/)
+    assert.equal(panel.commands.length, 0)
+  } finally { panel.close() }
+})
+for (const progress of ['bad', {}, { required: 312, acknowledged: 400, pending: 0 },
+  { required: 313, acknowledged: 0, pending: 312, blocked: 0, components: 1, remaining_components: 1, oversized: 0 }]) {
+  check(() => {
+    const normalized = model.normalizeBuildingStatus({ progress })
+    assert.equal(normalized.progress, null)
+    assert.ok(normalized.data_warning)
+  })
+}
 console.log(`${checks} UI checks passed (bridge validation, four Vue compilations and real Vue runtime rendering/events).`)

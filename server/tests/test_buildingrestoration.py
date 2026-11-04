@@ -152,7 +152,10 @@ class RestorationTest(unittest.TestCase):
             game=LuaGame(); game.lua.globals().nearSeed('0_0',True)
             await self.activate_game(await self.accept(await self.preview()),game)
             road=game.lua.globals().roadId(); old=self.packets()[-1]['targets'][0]['slots']['bldcol'][0]
-            saved=manual.tree(self.store.root); revision=self.store.load().revision
+            # Reading Windows' locked coordination file from the asyncio thread
+            # races the authority's periodic store validation. Snapshot the same
+            # complete tree between operations on its owning I/O worker instead.
+            saved,revision=await self.service._work(lambda:(manual.tree(self.store.root),self.store.load().revision))
             manager=self.service.authority; original=manager.activate
             def failed_overlay(*args,**kwargs):
                 if not isinstance(manager.store,live._BaselineView):
@@ -172,7 +175,7 @@ class RestorationTest(unittest.TestCase):
                 self.assertFalse(self.service.current['activated_enabled'])
                 self.assertEqual(self.service.current['restoration']['mode'],'baseline')
                 self.assertTrue(self.store.load().enabled); self.assertEqual(self.store.load().revision,revision)
-                self.assertEqual(manual.tree(self.store.root),saved)
+                self.assertEqual(await self.service._work(lambda:manual.tree(self.store.root)),saved)
                 self.assertEqual(game.lua.globals().roadId(),road)
                 self.assertEqual(game.lua.globals().shapeCount(old),0)
                 new=packet['targets'][0]['slots']['bldcol'][0]

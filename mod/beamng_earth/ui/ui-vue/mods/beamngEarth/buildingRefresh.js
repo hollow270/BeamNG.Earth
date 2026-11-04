@@ -79,8 +79,18 @@ export function normalizeBuildingStatus(value) {
     accepted_state: text(raw.accepted_state), activated_enabled: raw.activated_enabled,
     held_slots: count(raw.held_slots), operation_pending: raw.operation_pending === true,
     command_pending: raw.command_pending === true, command_id: raw.command_id,
-    preview: null, error: null, resources: null, restoration: null,
+    preview: null, error: null, resources: null, restoration: null, progress: null,
+    deferred_overflow: raw.deferred_overflow === true,
     deferred: rows(raw.deferred, r => ({ kind: text(r.kind), key: text(r.key), reason: text(r.reason) })),
+  }
+  if (raw.progress != null) {
+    if (!object(raw.progress)) malformed = true
+    else {
+      const keys = ["required", "acknowledged", "pending", "blocked", "components", "remaining_components", "oversized"]
+      const p = Object.fromEntries(keys.map(k => [k, count(raw.progress[k], true)]))
+      if (keys.some(k => !Number.isSafeInteger(raw.progress[k]) || raw.progress[k] < 0 || raw.progress[k] > 512) || p.acknowledged + p.pending !== p.required || p.blocked > p.pending || p.oversized > p.blocked || p.remaining_components > p.components) malformed = true
+      else out.progress = p
+    }
   }
   if (raw.error != null) out.error = { message: text(object(raw.error) ? raw.error.message : raw.error, "Invalid error response"),
     retry_after: object(raw.error) && typeof raw.error.retry_after === "number" && Number.isFinite(raw.error.retry_after) ? Math.max(0, Math.min(86400, raw.error.retry_after)) : 0 }

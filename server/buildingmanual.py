@@ -18,6 +18,7 @@ import buildingoverlay as bo
 from buildingoverlaystore import StalePreview, ResourceLimit, _fingerprint, _intersects
 import buildingspatial
 import buildingtargets
+import buildinginfluence
 import netfetch
 import osmbuildings as osm
 
@@ -50,7 +51,8 @@ class Workflow:
 
     def _discover(self, bounds):
         world=self.discovery_context.get() or self.server
-        return buildingtargets.discover(world,bounds,current_only=bool(getattr(world,"building_current_targets",False)))
+        return buildingtargets.discover(world,bounds,current_only=bool(getattr(world,"building_current_targets",False)),
+            max_targets=buildinginfluence.MAX_TARGETS,influence=buildinginfluence.Coverage((bounds,)))
 
     @contextmanager
     def _operation(self, manual):
@@ -204,12 +206,33 @@ class Workflow:
             context = self._context(bounds,snapshot)
             self.store.compose(snapshot,context.buildings,baseline_parts=context.parts,
                                baseline_release=self.md.release,bounds=context.bounds)
-            targets = self._discover(context.bounds)
+            world=self.discovery_context.get() or self.server
+            if not getattr(world,'building_current_targets',False):
+                # Preserve the existing small offline registry API. Live controls
+                # always use cohorts; oversized offline inventories use them too.
+                try: legacy=buildingtargets.discover(world,context.bounds)
+                except ResourceLimit: legacy=None
+                if legacy is not None:
+                    if legacy.status!='discovered': return dict(status=legacy.status,discovery=legacy.report(),prepared=False)
+                    result=self.server.refresh_building_overlays(legacy.requests,expected_state=state,replace_requests=True)
+                    return dict(status='prepared' if snapshot.enabled else 'prepared_baseline',prepared=True,
+                                discovery=legacy.report(),result=result)
+            import buildingretention
+            from pathlib import Path
+            coverage=buildingretention.retained_influence(Path(self.server.cache_dir)/'building-generations').with_snapshot(snapshot)
+            coverage=coverage.union(buildinginfluence.Coverage((context.bounds,)))
+            targets = buildinginfluence.discover(world,coverage)
             if targets.status!="discovered":
                 return dict(status=targets.status,discovery=targets.report(),prepared=False)
-            result = self.server.refresh_building_overlays(targets.requests,expected_state=state,replace_requests=True)
+            plan=buildinginfluence.Plan(targets.requests,coverage)
+            conn=next(iter(world.connections))
+            chosen,_,progress=plan.choose(set(),conn)
+            if not chosen:
+                return dict(status='deferred',prepared=False,discovery=targets.report(),progress=progress)
+            result = self.server.refresh_building_overlays(chosen,expected_state=state,replace_requests=True,
+                priority=tuple(r.slot for r in chosen),cohort=plan.document())
             return dict(status="prepared" if snapshot.enabled else "prepared_baseline",prepared=True,
-                        discovery=targets.report(),result=result)
+                        discovery=targets.report(),result=result,progress=progress)
         except Exception as e:
             return dict(status="pending",prepared=False,error=self._error(e))
 

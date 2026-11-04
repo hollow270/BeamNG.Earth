@@ -31,18 +31,23 @@ class Discovery:
                     count=len(self.requests), relevant_slots=list(self.relevant), targets=[r.wire() for r in self.requests])
 
 
-def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections=8, max_cells=512, current_only=False):
-    w,s,e,n = _bounds(bounds)
-    try:
-        area = set(mapcells.cells_for_bbox(s,w,n,e,max_cells=max_cells))
-    except ValueError as e:
-        raise ResourceLimit("target discovery area exceeds cell budget") from e
+def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections=8, max_cells=512, current_only=False,
+             influence=None):
+    # The legacy cell query remains available to existing offline API callers.
+    # Live cohorts supply the shared, durable source influence explicitly.
+    area=set()
+    if influence is None:
+        w,s,e,n = _bounds(bounds)
+        try:
+            area = set(mapcells.cells_for_bbox(s,w,n,e,max_cells=max_cells))
+        except ValueError as e:
+            raise ResourceLimit("target discovery area exceeds cell budget") from e
     connections = list(islice(iter(server.connections),max_connections+1))
     if len(connections) > max_connections:
         raise ResourceLimit("too many active connections for one manual refresh")
     anchors = {c.active:server.anchors[c.active] for c in connections
                if getattr(c,"active",None) in server.anchors}
-    retained = registered_requests(Path(server.cache_dir)/"building-generations",limit=max_targets)
+    retained = registered_requests(Path(server.cache_dir)/"building-generations",limit=128)
     candidates, retired, relevant, visited = {}, [], set(), 0
     lift = None
     if getattr(server,"near_visual",None) is not None:
@@ -81,11 +86,11 @@ def discover(server, bounds, *, max_targets=128, max_keys=16384, max_connections
         if current_only:
             from buildingactivation import _live
             if not any(_live(c,req) for c in connections): return
-        affected = bool(area.intersection(blockworker.building_cells(*req.geometry())))
+        affected = influence.affects(req) if influence is not None else bool(area.intersection(blockworker.building_cells(*req.geometry())))
         if current_only and not affected: return
         if affected:
             relevant.add(semantic(req))
-        if retained_target or affected:
+        if affected or retained_target and influence is None:
             candidates[semantic(req)] = req
             if len(candidates) > max_targets:
                 raise ResourceLimit("automatic generation target budget exceeded; no targets were silently omitted")

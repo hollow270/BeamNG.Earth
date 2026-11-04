@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import time
 
 import buildingactivation as activation
+import buildinginfluence as influence
 import buildingrefresh as regeneration
 import buildingtargets
 from buildingoverlaystore import ResourceLimit, StalePreview, _intersects, _union
@@ -190,6 +191,11 @@ class Service:
         self.authority, self.facade, self.mirror = None,None,None
         self.pending = {}
         self.coverage = set()
+        self.influence=influence.Coverage()
+        self.dirty_targets=False
+        self.cohort_queue=()
+        self.cohort_fence=None
+        self.near_credit=3
         self.busy = False
         self.closed = False
         self.last_command = float("-inf")
@@ -215,6 +221,8 @@ class Service:
         self.release_queue={}
         self.drain_task=None
         self.completed_state=None
+        self.completed_stream=None
+        self.completed_render=None
         self.last_scan=float("-inf")
         self.client_id=None
         self.activation_states=OrderedDict()
@@ -278,8 +286,10 @@ class Service:
                      fetch_reason="Offline: local retry is available; fetching OSM is disabled." if offline else "")
         if authorized:
             state.update(accepted_state=self.state_token,enabled=bool(self.snapshot and self.snapshot.enabled),
-                can_rollback=bool(self.snapshot and self.snapshot.history),deferred=list(self.pending.values())[:128])
-            if self.pending and state["state"]=="activated":
+                can_rollback=bool(self.snapshot and self.snapshot.history),deferred=list(self.pending.values())[:128],
+                deferred_overflow=self.dirty_targets or bool(getattr(self.mirror,'pending_overflow',False)))
+            if (self.pending or state['deferred_overflow'] or self.completed_state!=self.state_token or
+                    self.completed_stream!=_stream_signature(conn) or self.completed_render!=_render_signature(self.server,conn)) and state["state"]=="activated":
                 state.update(state="activation_deferred",game_activated=False,
                     detail="Additional dependent tiles need local preparation; the last acknowledged revision remains visible.")
         return state
@@ -291,6 +301,9 @@ class Service:
 
     def _set(self,state,**values):
         self.current.update(state=state,game_activated=state=="activated",**values)
+        if state=='activated' and self.owner is not None:
+            self.completed_stream=_stream_signature(self.owner)
+            self.completed_render=_render_signature(self.server,self.owner)
         self.publish()
 
     def command(self,conn,msg):
@@ -361,7 +374,7 @@ class Service:
         token=workflow.discovery_context.set(world)
         try:
             import buildingretention
-            guards=buildingretention.retained_guards(Path(self.server.cache_dir)/'building-generations')
+            guards=buildingretention.retained_influence(Path(self.server.cache_dir)/'building-generations')
             result=fn(world,facade)
             snapshot,state=workflow.store.load_state()
             stale=[m for m in output if m.get('type') in ('building_activate','building_activate_batch') and
@@ -373,7 +386,7 @@ class Service:
                             detail='Accepted data changed before the buffered activation could be sent.')
             routing=None
             if self.authority is not None:
-                routing=dict(holds=dict(self.authority.holds),guards=set(self.authority.guards),
+                routing=dict(holds=dict(self.authority.holds),guards=set(self.authority.guards),influence=self.authority.influence,
                     bindings={k:deepcopy(v) for k,v in self.authority.bindings.items() if k[0]==id(facade)},
                     transactions={k:dict(state=t["state"],state_token=t["state_token"],requests=deepcopy(t["requests"]),targets=[dict(kind=r["kind"],key=r["key"]) for r in t["targets"]])
                                   for k,t in self.authority.transactions.items() if t["conn"] is facade})
@@ -387,24 +400,24 @@ class Service:
         previous_state=self.state_token
         frozen,world,frame=self._capture(conn)
         rendering=_render_signature(world,frozen)
+        streaming=_stream_signature(conn)
         before=dict(frozen.slot_holds)
         result,output,snapshot,state,routing,updated,guards=await self._work(self._worker,frozen,world,fn)
         self.snapshot,self.state_token=snapshot,state
+        if previous_state!=state:
+            self.failed_signature=None
+            self.current.pop('progress',None)
+            self.completed_state=None
+            self.current['game_activated']=False
+            if self.current['state']=='activated': self.current['state']='activation_deferred'
         self.current["accepted_revision"]=snapshot.revision
-        import blockworker
-        bounds=[e.bounds for e in snapshot.entries]
-        self.coverage=set()
-        self.coverage.update(guards)
-        for box in bounds:
-            w,s,e,n=box
-            self.coverage.update(map(str,mapcells.cells_for_bbox(s,w,n,e,max_cells=512)))
-        if len(self.coverage)>512:
-            raise ResourceLimit("active overlay coverage exceeds budget")
-        if self.authority is not None:
-            self.coverage.update(self.authority.guards)
+        self.influence=guards.with_snapshot(snapshot)
+        if routing is not None: self.influence=self.influence.union(routing['influence'])
+        self.coverage=self.influence.cells()
         activation_output=any(m.get('type') in ('building_activate','building_activate_batch') for m in output)
+        sensitive=activation_output or isinstance(result,dict) and 'progress' in result
         current=not self.closed and not self.revoked and conn in self.server.connections and _frame(conn)==frame and conn is self.owner and \
-                (not activation_output or rendering==_render_signature(self.server,conn))
+            (not sensitive or rendering==_render_signature(self.server,conn) and streaming==_stream_signature(conn))
         if current:
             for n,v in updated.slot_holds.items():
                 if before.get(n)!=v: conn.slot_holds[n]=v
@@ -432,11 +445,13 @@ class Service:
             if previous_state!=self.state_token: self.publish(conn)
         elif output and self.authority is not None:
             # No queued command crossed the socket; this is positive non-delivery evidence.
-            await self._work(self._abandon_unsent,output)
-            self.mirror=None
+            same_world=not self.closed and not self.revoked and conn is self.owner and conn in self.server.connections and \
+                _frame(conn)==frame and rendering==_render_signature(self.server,conn)
+            await self._work(self._abandon_unsent,output,same_world)
+            if not same_world: self.mirror=None
         return result,current
 
-    def _abandon_unsent(self,output):
+    def _abandon_unsent(self,output,preserve_bindings=False):
         abandoned={}
         for m in output:
             t=self.authority.transactions.get(m.get("transaction"))
@@ -446,14 +461,22 @@ class Service:
                 for owner in t["owners"]: self.server.matslots.release(owner)
                 t["state"]="retired"
                 abandoned[id(t["conn"])]=t["conn"]
-        for conn in abandoned.values(): self.authority.context_changed(conn)
+        if preserve_bindings:
+            # Streaming additions can invalidate the unsent cohort without
+            # invalidating independently acknowledged components in this frame.
+            if abandoned: self.authority._save()
+        else:
+            for conn in abandoned.values(): self.authority.context_changed(conn)
 
     def _routing(self,conn,routing):
         if routing is None: return
+        self.dirty_targets=self.dirty_targets or bool(getattr(self.mirror,'pending_overflow',False))
         mirror=object.__new__(activation.Manager)
         mirror.s=self.server
         mirror.holds=routing["holds"]
         mirror.guards=routing["guards"]|self.coverage
+        mirror.influence=self.influence
+        mirror.binding_fence=self._binding_fence(conn)
         mirror.bindings={(id(conn),k[1],k[2]):v for k,v in routing["bindings"].items()}
         mirror.transactions={k:dict(v,conn=conn) for k,v in routing["transactions"].items()}
         mirror.pending_targets=self.pending
@@ -461,6 +484,10 @@ class Service:
         for _,kind,key in mirror.bindings:
             self.pending.pop(kind+":"+key,None)
         self.applied={k:v["content"] for k,v in mirror.bindings.items()}
+
+    def _binding_fence(self,conn):
+        return (self.state_token,False if self.fallback_frame==(self.state_token,_frame(conn)) else
+                bool(self.snapshot and self.snapshot.enabled),_frame(conn),_render_signature(self.server,conn))
 
     def filter_message(self,conn,msg):
         if conn is not self.owner or msg.get("type") not in ("roads_tile","roads_exact","bldfar_tile","bldsky_tile"):
@@ -474,8 +501,10 @@ class Service:
         if self.mirror is None and self.coverage:
             mirror=object.__new__(activation.Manager)
             mirror.s=self.server; mirror.holds={}; mirror.guards=self.coverage
+            mirror.influence=self.influence
             mirror.bindings={}; mirror.transactions={}; mirror.pending_targets=self.pending
             self.mirror=mirror
+        if self.mirror is not None: self.mirror.binding_fence=self._binding_fence(conn)
         return self.mirror.filter_message(conn,msg) if self.mirror is not None else msg
 
     def _drop_boot_messages(self):
@@ -569,17 +598,33 @@ class Service:
 
     def _regions(self):
         if self.snapshot is None: return []
-        regions=[e.bounds for e in self.snapshot.entries] or [r["info"]["bounds"] for r in self.snapshot.refreshes]
-        changed=self.snapshot.affected_bounds
-        if changed is not None and (not regions or tuple(_union(regions))!=tuple(changed)):
-            # Rollback can bound widely separated old regions with one huge box.
-            # Retained cell fences supply separate affected components after restart.
-            guarded=[mapcells.CellKey(*map(int,k.split('/'))).bounds() for k in self.coverage]
-            clipped=[(max(b[0],changed[0]),max(b[1],changed[1]),min(b[2],changed[2]),min(b[3],changed[3]))
-                     for b in guarded if _intersects(b,changed)]
-            clipped=[b for b in clipped if b[0]<b[2] and b[1]<b[3]]
-            regions.extend(clipped or [changed])
-        return regions
+        coverage=self.influence.with_snapshot(self.snapshot)
+        return list(coverage.regions)+[mapcells.CellKey(*map(int,k.split('/'))).bounds() for k in coverage.legacy_cells]
+
+    def _plan(self,world,c,*,baseline=False):
+        """Authority-thread derivation; RAM progress is never restart evidence."""
+        import buildingretention
+        snapshot,state=self.server._manual_building_workflow().store.load_state()
+        if state!=self.state_token: raise regeneration.StaleGeneration('accepted state changed during influence planning')
+        coverage=buildingretention.retained_influence(Path(world.cache_dir)/'building-generations')
+        if self.authority is not None: coverage=coverage.union(self.authority.influence)
+        coverage=coverage.with_snapshot(snapshot)
+        if baseline: snapshot=replace(snapshot,enabled=False)
+        discovery=influence.discover(world,coverage)
+        plan=influence.Plan(discovery.requests,coverage)
+        done=set()
+        with self.server.mapdata.building_snapshot(snapshot):
+            for req in plan.requests:
+                binding=self.authority.bindings.get((id(c),req.kind,activation._key(req))) if self.authority else None
+                if binding and binding.get('validated_state')==state and binding.get('validated_enabled')==snapshot.enabled and \
+                        binding.get('validated_frame')==_frame(c) and binding['identity']==req.inputs(self.server.mapdata)[0]:
+                    done.add(req.slot)
+                    binding['validated_render']=_render_signature(world,c)
+        fence=(state,_frame(c),snapshot.enabled,_render_signature(world,c))
+        if fence!=self.cohort_fence:
+            self.cohort_queue=(); self.cohort_fence=fence; self.near_credit=3
+        chosen,self.cohort_queue,progress=plan.choose(done,c,self.cohort_queue,prefer_near=self.near_credit>0)
+        return plan,chosen,progress,snapshot
 
     def _restoration(self,conn,code,message,*,mode='waiting'):
         trackers={}
@@ -596,7 +641,8 @@ class Service:
             pending=next((t for t in self.mirror.transactions.values() if t["state"] in ("scheduled","deferred","installing")),None)
             if pending:
                 def resume(w,c):
-                    transaction=next(t for t in self.authority.transactions.values() if t["conn"] is c and t["state"] in ("scheduled","deferred","installing"))
+                    transaction=next((t for t in self.authority.transactions.values() if t["conn"] is c and t["state"] in ("scheduled","deferred","installing")),None)
+                    if transaction is None: return None  # an ACK raced the previous routing snapshot
                     if transaction["state_token"]==self.state_token:
                         original=self.authority.store
                         if not transaction['overlay_enabled']: self.authority.store=_BaselineView(original)
@@ -605,8 +651,10 @@ class Service:
                     self.authority.cancel_if_stale(c)
                     return self.authority.status(transaction["transaction"])
                 state,current=await self.call(conn,resume)
-                if current: self._activation_state(state)
-                return
+                if state is not None:
+                    if current: self._activation_state(state)
+                    return
+                if not current: return
         regions=self._regions()
         if not regions:
             self.completed_state=self.state_token
@@ -618,12 +666,6 @@ class Service:
                 self._set('activation_deferred',error=None,restoration=self._restoration(conn,'trackers_settling',
                     'Waiting for the new anchor and building trackers to agree.'))
                 return
-        near=getattr(conn,'roads',None)
-        if near is not None and (getattr(near,'building',()) or getattr(near,'futs',()) or
-                set(getattr(near,'car',()))-set(getattr(near,'sent',()))-set(getattr(near,'empty',()))):
-            self._set('activation_deferred',error=None,restoration=self._restoration(conn,'near_streaming',
-                'Waiting for ordinary road streaming before restoring buildings.'))
-            return
         self._set("preparing",error=None)
         retention_report={}
         frame=_frame(conn)
@@ -631,24 +673,17 @@ class Service:
             import buildingretention
             def reclaim(required):
                 return buildingretention.make_room(world,self.authority,required=required,report=retention_report)
-            requests={}
-            for bounds in regions:
-                discovery=buildingtargets.discover(world,bounds,current_only=True)
-                for req in discovery.requests:
-                    if req.slot in discovery.relevant and activation._live(c,req): requests[req.slot]=req
-            if len(requests)>128: raise ResourceLimit("live target registry exceeds 128 entries")
-            if not requests: return None
+            plan,chosen,progress,snapshot=self._plan(world,c,baseline=baseline)
+            if not chosen:
+                return dict(progress=progress,complete=not progress['pending'],enabled=snapshot.enabled,revision=snapshot.revision)
+            requests={r.slot:r for r in chosen}
             import blockworker
             cells=set()
             for request in requests.values(): cells.update(blockworker.building_cells(*request.geometry()))
             if len(cells)>512: raise ResourceLimit("local building dependency warming exceeds quota")
             for key in sorted(cells):
                 self.server.mapdata.cell(key,layers=("buildings","building_parts","roads"))
-            def priority(req):
-                tracker=activation._tracker(c,req.kind)
-                return (0 if req.kind.startswith("near") and (req.x,req.y) in getattr(tracker,"car",()) else
-                        1 if req.kind.startswith("near") else 2 if req.kind.startswith("far") else 3,req.slot)
-            order=tuple(r.slot for r in sorted(requests.values(),key=priority))
+            order=tuple(r.slot for r in chosen)
             if baseline:
                 coordinator=self.server.__dict__.get('_building_refresh')
                 if coordinator is None: raise activation.Rejected('no validated catalog is available for baseline recovery')
@@ -656,11 +691,12 @@ class Service:
                     original=coordinator.store
                     coordinator.store=_BaselineView(original)
                     try:
-                        prepared=coordinator.refresh(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order,reclaim=reclaim)
+                        prepared=coordinator.refresh(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order,reclaim=reclaim,cohort=plan.document())
                     finally: coordinator.store=original
             else:
-                prepared=self.server.refresh_building_overlays(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order,reclaim=reclaim)
+                prepared=self.server.refresh_building_overlays(tuple(requests.values()),expected_state=self.state_token,replace_requests=True,priority=order,reclaim=reclaim,cohort=plan.document())
             return dict(prepared,
+                        progress=progress,
                         live_requests=[r.wire() for r in requests.values()])
         try: result,current=await self.call(conn,prepare)
         except Exception:
@@ -670,10 +706,23 @@ class Service:
                 self.current['resources']=retention_report
             raise
         if not current: self._set("superseded"); return
+        self.dirty_targets=False
         self.current['resources']=retention_report
         if result is None:
             self.completed_state=self.state_token
             self._set("accepted",detail="Accepted locally; no visible dependent tiles yet."); return
+        self.current['progress']=result['progress']
+        if 'complete' in result:
+            if result['complete']:
+                self.completed_state=self.state_token
+                self._set('activated' if result['progress']['required'] else 'accepted',
+                    activated_revision=result['revision'],activated_enabled=result['enabled'],
+                    detail='All current building components are acknowledged.' if result['progress']['required'] else 'No visible dependent targets.')
+            else:
+                self._set('activation_deferred',detail='Coupled targets are waiting for ordinary near streaming or exceed a bounded cohort limit.',
+                    restoration=self._restoration(conn,'cohort_capacity' if result['progress']['oversized'] else 'near_streaming',
+                        'No unsafe partial component was scheduled.'))
+            return
         self._set("prepared",publication=result["publication"])
         if any(req["kind"].startswith("near") and not any((req["x"],req["y"]) in getattr(getattr(conn,"roads",None),name,())
                 for name in ("sent","empty")) for req in result["live_requests"]):
@@ -705,11 +754,19 @@ class Service:
         if state=="activating" and "old collision retirement" in (result.get("detail") or ""):
             state="retiring"
         values=dict(detail=result.get("detail"),held_slots=result.get("held_slots",0))
+        if 'progress' in result: values['progress']=result['progress']
         if state=="activated":
             values.update(activated_revision=result["revision"],activated_enabled=result["overlay_enabled"])
-            self.completed_state=self.state_token
+            progress=result.get('progress')
+            partial=bool(progress and progress['pending'])
+            self.completed_state=None if partial else self.state_token
             self.failed_signature=None
-            if not result['overlay_enabled'] and self.snapshot and self.snapshot.enabled:
+            if partial:
+                state='activation_deferred'
+                values['detail']=f"{progress['acknowledged']} of {progress['required']} targets acknowledged; remaining components are queued."
+                if result.get('deferred_admission'):
+                    values['detail']+=f" {result['deferred_admission']} prepared targets deferred by slot/byte admission."
+            elif not result['overlay_enabled'] and self.snapshot and self.snapshot.enabled:
                 cause=(self.current.get('restoration') or {}).get('code')
                 self.current['restoration']=self._restoration(self.owner,'baseline_active',
                     'Original building baseline is active. Saved overlays remain enabled; retry locally to restore them.',mode='baseline')
@@ -769,7 +826,14 @@ class Service:
                 original=manager.store
                 if transaction is not None and not transaction['overlay_enabled']:
                     manager.store=_BaselineView(original)
-                try: return manager.acknowledge(c,msg)
+                try:
+                    pending=transaction is not None and transaction['state'] in ('scheduled','deferred','installing')
+                    result=manager.acknowledge(c,msg)
+                    if result['state']=='activated':
+                        if pending:
+                            self.near_credit=max(0,self.near_credit-1) if any(r['kind'].startswith('near') for r in transaction['requests'].values()) else 3
+                        _,_,result['progress'],_=self._plan(world,c,baseline=not transaction['overlay_enabled'])
+                    return result
                 finally: manager.store=original
             state,current=await self.call(conn,acknowledge)
             if current: self._activation_state(state)
@@ -853,7 +917,8 @@ class Service:
                         await self.call(conn,lambda w,c:self.authority.cancel_if_stale(c))
                         self._set("superseded",detail="Accepted data changed; the older handoff is being cancelled or retired safely.")
                     retry=self.restore_transient and self.restore_attempts<3 and time.monotonic()>=self.restore_retry_at
-                    if (self.pending or self.completed_state!=self.state_token and self._regions()) and not active and not self.inflight_ack and (signature!=self.failed_signature or retry):
+                    if (self.pending or self.dirty_targets or getattr(self.mirror,'pending_overflow',False) or
+                            (self.completed_state!=self.state_token or self.completed_stream!=signature[3] or self.completed_render!=signature[4]) and self._regions()) and not active and not self.inflight_ack and (signature!=self.failed_signature or retry):
                         self.busy=True
                         self.failed_signature=signature
                         try:

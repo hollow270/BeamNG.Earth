@@ -16,7 +16,7 @@ import zipfile
 
 REPO=Path(__file__).resolve().parents[1]
 REQUIRED_SERVER=('buildingoverlay','buildingoverlaystore','osmbuildings','buildingmanual','buildingbaseline',
-                 'buildingtargets','buildingspatial','buildingrender','buildingrefresh','buildingactivation',
+                 'buildingtargets','buildinginfluence','buildingspatial','buildingrender','buildingrefresh','buildingactivation',
                  'buildingretention','buildinglive','earthd','mapdata','buildings','blockworker','netfetch','matslots','protocol')
 REQUIRED_LUA=('core','roads','settings','net','governor','buildingactivation','buildingadapter','buildingui','buildinginventory')
 REQUIRED_UI=('index.js','EarthMap.vue','EarthBuildingRefresh.vue','buildingRefresh.js','earthSettingsStore.js','EarthSettingsPage.vue','EarthSettingsBody.vue')

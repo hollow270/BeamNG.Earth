@@ -44,7 +44,8 @@
     <p>Accepted revision: <span :title="status.accepted_revision">{{ revisionText(status.accepted_revision) }}</span><br>
        Activated revision: <span :title="status.activated_revision">{{ status.activated_enabled === false ? 'Original Overture baseline' : status.activated_revision ? revisionText(status.activated_revision) : 'Not confirmed for the current view' }}</span></p>
     <p v-if="status.state !== 'activated'">Saved data and prepared meshes are not confirmation that the game has activated them.</p>
-    <details v-if="status.deferred?.length" open><summary>{{ status.deferred.length }} dependent targets deferred</summary><ul><li v-for="row in status.deferred" :key="row.kind + row.key">{{ row.kind }} {{ row.key }}: {{ row.reason }}</li></ul></details>
+    <p v-if="status.progress">{{ status.progress.acknowledged }} / {{ status.progress.required }} current targets acknowledged; {{ status.progress.pending }} pending, {{ status.progress.blocked }} blocked. {{ status.progress.remaining_components }} / {{ status.progress.components }} building groups remain.</p>
+    <details v-if="status.deferred?.length" open><summary>{{ status.deferred_overflow ? 'At least ' : '' }}{{ status.deferred.length }} dependent targets deferred</summary><ul><li v-for="row in status.deferred" :key="row.kind + row.key">{{ row.kind }} {{ row.key }}: {{ row.reason }}</li></ul></details>
     <p v-if="status.resources?.uncertain?.length" class="building-warning">Some resources are retained because their release cannot be proven. {{ status.resources.uncertain.length }} retention notes.</p>
     <details v-if="status.resources"><summary>Resource inspection</summary>
       <p>Held activation slots: {{ status.resources.held }}. Reclaimed generations: {{ status.resources.removed_generations.length }}; pooled files: {{ status.resources.reclaimed_slots.length }}; released sessions: {{ status.resources.released_sessions.length }}.</p>

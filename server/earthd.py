@@ -1245,7 +1245,7 @@ class Server:
                                      lambda la, lo: self.ground(anchor.frame, la, lo, self.dem.sample(la, lo, zoom)),
                                      self.out_dir, self.vfs_dir, aid, self.lamp_region(anchor))
 
-    def refresh_building_overlays(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=(), reclaim=None):
+    def refresh_building_overlays(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=(), reclaim=None, cohort=None):
         """Manual Stage 4B preparation; never writes/sends live session resources (Stage 5).
 
         requests: bounded buildingrefresh.TileRequest objects, retained for later local refreshes.
@@ -1265,7 +1265,7 @@ class Server:
                 coordinator = self._building_refresh = buildingrefresh.Coordinator(
                     os.path.join(self.cache_dir, "building-generations"), self.mapdata,
                     self.mapdata._building_store, submit)
-        return coordinator.refresh(requests, cancel=cancel, expected_state=expected_state, replace_requests=replace_requests,priority=priority,reclaim=reclaim)
+        return coordinator.refresh(requests, cancel=cancel, expected_state=expected_state, replace_requests=replace_requests,priority=priority,reclaim=reclaim,cohort=cohort)
 
     def configure_osm_buildings(self, config, *, transport=None):
         """Explicit runtime configuration only; endpoint/credentials are never source defaults."""

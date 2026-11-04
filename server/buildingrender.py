@@ -144,9 +144,11 @@ class BuildingView:
     def relevant(self, key):
         return tuple(e for e in self.snapshot.entries if _intersects(e.bounds, key.bounds())) if self.active else ()
 
-    def dependency(self, keys):
+    def dependency(self, keys, *, render_bounds=None):
         keys = tuple(sorted(set(keys), key=str))
         entries = {e.feature.feature_id: e for k in keys for e in self.relevant(k)}
+        if render_bounds is not None:
+            entries={fid:e for fid,e in entries.items() if _intersects(e.bounds,render_bounds)}
         if not entries:
             return Dependency()
         full, geo = [], []

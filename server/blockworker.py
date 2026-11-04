@@ -532,7 +532,7 @@ def _md_versions():
     return _s.md.versions() if _s.md is not None else None
 
 
-def building_versions(md, frame, box, enabled=True):
+def building_versions(md, frame, box, enabled=True, kind=None):
     """Offline cache identity for building-bearing output; baseline versions never change.
 
     Include the density neighbourhood, but no unrelated world-wide overlay revision.
@@ -541,7 +541,9 @@ def building_versions(md, frame, box, enabled=True):
     versions = md.versions() if md is not None else None
     if not enabled or not getattr(md, "building_overlays_active", False):
         return versions
-    dependency = md.building_dependencies(building_cells(frame, box))
+    import buildinginfluence
+    dependency = md.building_dependencies(building_cells(frame, box),
+        render_bounds=buildinginfluence.render_bounds(frame,box,kind))
     return dict(versions, building_overlay=dependency.revision) if dependency.revision is not None else versions
 
 
@@ -926,9 +928,9 @@ def _content_hash(text, vfs_dir):
     return hashlib.sha1(text.replace(f"{vfs_dir}/", "@V@/").encode("utf-8")).hexdigest()[:16]
 
 
-def _building_content_hash(text, vfs_dir, out_dir, names, frame, box):
+def _building_content_hash(text, vfs_dir, out_dir, names, frame, box, kind=None):
     """Overlay content identity includes mesh bytes, even if all JSON bounds/counts stay the same."""
-    if not (building_versions(getattr(_s, "md", None), frame, box) or {}).get("building_overlay"):
+    if not (building_versions(getattr(_s, "md", None), frame, box,kind=kind) or {}).get("building_overlay"):
         return _content_hash(text, vfs_dir)
     import hashlib
     h = hashlib.sha1(text.replace(f"{vfs_dir}/", "@V@/").encode("utf-8"))
@@ -1527,7 +1529,7 @@ def skyline_tile(aid, lat, lon, zoom, ux, uy, out_dir, vfs_dir, lamp_region=None
     sx0, sy0, _, _ = roadsmod_tile_bbox(ux * u, uy * u)
     _, _, sx1, sy1 = roadsmod_tile_bbox(ux * u + u - 1, uy * u + u - 1)
     k = revisit.key("bldsky", round(float(lat), 7), round(float(lon), 7), zoom, ux, uy,
-                    building_versions(_s.md, frame, (sx0, sy0, sx1, sy1)), lamp_region)
+                    building_versions(_s.md, frame, (sx0, sy0, sx1, sy1),kind="skyline"), lamp_region)
     return _revisit_tile("bldsky", k, aid, ux, uy, out_dir, vfs_dir, f"bldsky_{aid}_{ux}_{uy}.json",
                          lambda: buildingsmod.skyline_tile(frame, ux, uy, _s.md,
                                                            lambda la, lo: ground(frame, la, lo, _s.dem.sample(la, lo, zoom)),
@@ -1695,7 +1697,7 @@ def far_geo(kind, gx, gy, gzoom, out_dir, vfs_dir, lamp_region=None):
     tile = geotiles.geobox(gx, gy, z)
     names = far_geo_names(kind, tile.key)
     k = revisit.key(kind, "g", tile.key, int(gzoom),
-                    building_versions(_s.md, tile.frame, tile.box, kind != "brfar"), lamp_region)
+                    building_versions(_s.md, tile.frame, tile.box, kind != "brfar",kind=kind), lamp_region)
     frame_ll = (float(tile.frame.lat0), float(tile.frame.lon0))
     got = revisit.load(_s.cache_dir, kind, k)
     if got is not None:
@@ -1713,7 +1715,7 @@ def far_geo(kind, gx, gy, gzoom, out_dir, vfs_dir, lamp_region=None):
         return None
     data, shapes, n = res
     text = json.dumps(data, separators=(",", ":"), sort_keys=True)
-    data["h"] = _building_content_hash(text, vfs_dir, out_dir, shapes.values(), tile.frame, tile.box) \
+    data["h"] = _building_content_hash(text, vfs_dir, out_dir, shapes.values(), tile.frame, tile.box,kind=kind) \
         if kind != "brfar" else _content_hash(text, vfs_dir)
     text = json.dumps(data, separators=(",", ":"), sort_keys=True)
     _write_bytes(os.path.join(out_dir, names["json"]), text.encode("utf-8"))

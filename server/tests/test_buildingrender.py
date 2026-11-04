@@ -358,7 +358,10 @@ class RenderTest(unittest.TestCase):
         self.assertEqual(blockworker.building_versions(md, farframe, (0, 0, 256, 256)), base.versions())
         rendered, context = buildings.road_context_items(farframe, 0, 0, md, ground)
         self.assertIs(rendered, context)
-        key = geotiles.key(*geotiles.tile_of(LAT, LON))
+        # Cell centre is a geotile boundary. Query the building's actual owner,
+        # rather than a neighbouring geotile sharing the same cache cell.
+        la,lo,_=FRAME.enu_to_geodetic(65,65,0)
+        key = geotiles.key(*geotiles.tile_of(float(la), float(lo)))
         args = (key, 15, True, False, True, False, 0.0, None, None)
         off = blockworker._geo_content_key(*args, md=base)
         self.assertEqual(off, blockworker._geo_content_key(*args, md=base.versions()))

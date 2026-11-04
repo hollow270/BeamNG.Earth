@@ -466,3 +466,14 @@ or push as part of this stage. After separate authorization:
    manual-intervention diagnostics without deleting uncertain live files.
 
 Only actual Stage 6 engine observations can establish game-engine success.
+
+Production-distance compatibility now uses the shared influence and coherent
+cohort contract in [PRODUCTION_BUILDING_INFLUENCE.md](PRODUCTION_BUILDING_INFLUENCE.md).
+The former 191/312 target discovery and 194/332 activation expansions are covered
+by offline regression fixtures. Catalogs remain bounded at 128 targets and packets
+at 32; UI acknowledgement counts describe the entire current influence plan.
+Use a fresh isolated profile/cache for the next real-data engine test. Large legacy
+cell-only fences remain conservative and can block an indivisible cohort; uncertain
+resources must not be deleted to make that test proceed. Existing Stage 6A--6E kits
+and their real-engine results remain historical evidence, not validation of this
+new cohort path.

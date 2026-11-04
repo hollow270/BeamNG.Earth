@@ -106,22 +106,38 @@ def _journal(io,path):
     if not isinstance(guards,list) or len(guards)>512 or any(not isinstance(k,str) or not re.fullmatch(r'14/\d+/\d+',k) or
             any(not 0<=int(v)<2**14 for v in k.split('/')[1:]) for k in guards):
         raise CorruptStorage("invalid activation coverage references")
+    if 'influence' in value:
+        import buildinginfluence
+        coverage=buildinginfluence.Coverage.read(value['influence'])
+        if coverage.cells()!=set(guards): raise CorruptStorage('activation coverage and guards disagree')
     return value
 
 
 def retained_guards(directory):
     """Read startup fences before any ordinary building message can leave the socket."""
+    return retained_influence(directory).cells()
+
+
+def retained_influence(directory):
+    """Legacy fences cannot be narrowed without durable source-coverage proof."""
+    import buildinginfluence
+    coverage=buildinginfluence.Coverage()
     directory=Path(directory)
-    if not (directory/'catalog.json').exists(): return set()
+    if not (directory/'catalog.json').exists():
+        OverlayStore._no_link(directory)
+        if directory.exists() and next(directory.glob('activation-*.json'),None) is not None:
+            raise CorruptStorage('preparation catalog missing while activation ownership journals remain')
+        return coverage
     from buildingrefresh import _CatalogFiles
     io=_CatalogFiles(directory,create=False)
-    guards=set()
     with io._locked():
         paths=list(islice(directory.glob('activation-*.json'),17))
         if len(paths)>16: raise ResourceLimit('activation journal inspection exceeds quota')
-        for path in paths: guards.update(_journal(io,path).get('guards',()))
-    if len(guards)>512: raise ResourceLimit('retained activation coverage exceeds budget')
-    return guards
+        for path in paths:
+            value=_journal(io,path)
+            coverage=coverage.union(buildinginfluence.Coverage.read(value['influence']) if 'influence' in value else
+                buildinginfluence.Coverage(legacy_cells=tuple(value.get('guards',()))))
+    return coverage
 
 
 def collect(server,manager=None,*,proof=None,limit=32):

@@ -133,7 +133,7 @@ class TileRequest:
         import blockworker
         import revisit
         frame, box = self.geometry()
-        versions = blockworker.building_versions(md, frame, box)
+        versions = blockworker.building_versions(md, frame, box,kind=self.kind)
         return revisit.key("building-generation", self.wire(), versions), (versions or {}).get("building_overlay")
 
     def execute(self, out_dir, vfs_dir):
@@ -324,9 +324,12 @@ class Coordinator:
     def _load(self):
         state = self.io._read(self.path)
         try:
-            if set(state) != {"sequence", "publication", "snapshot", "overlay", "requests", "entries"} or \
+            if set(state)-{'cohort'} != {"sequence", "publication", "snapshot", "overlay", "requests", "entries"} or \
                     type(state["sequence"]) is not int or not 0 <= state["sequence"] < 2**63:
                 raise ValueError("invalid catalog fields/sequence")
+            if 'cohort' in state:
+                import buildinginfluence
+                buildinginfluence.read_cohort(state['cohort'])
             if any(not isinstance(state[k], dict) for k in ("overlay", "requests", "entries")):
                 raise ValueError("invalid catalog tables")
             for name, width in (("publication", 32), ("snapshot", 64)):
@@ -498,11 +501,15 @@ class Coordinator:
             # A running cancelled/timed-out job owns its private directory until it exits.
             raise
 
-    def refresh(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=(), reclaim=None):
+    def refresh(self, requests=(), *, cancel=None, expected_state=None, replace_requests=False, priority=(), reclaim=None, cohort=None):
         if not self._requests.acquire(blocking=False):
             raise ResourceLimit("too many simultaneous building refreshes")
         work = []
         try:
+            if cohort is not None:
+                import buildinginfluence
+                buildinginfluence.read_cohort(cohort)
+                if not replace_requests: raise ValueError('cohort publication must replace its bounded catalog')
             bounded = []
             for request in requests:
                 if len(bounded) >= self.limits.requests or not isinstance(request, TileRequest):
@@ -534,7 +541,9 @@ class Coordinator:
                         identity, dependency = req.inputs(self.md)
                         desired[key] = (req, identity, dependency)
                         import blockworker
-                        feature_ids.update(self.md.building_dependencies(blockworker.building_cells(*req.geometry())).feature_ids)
+                        import buildinginfluence
+                        feature_ids.update(self.md.building_dependencies(blockworker.building_cells(*req.geometry()),
+                            render_bounds=buildinginfluence.render_bounds(*req.geometry(),req.kind)).feature_ids)
                 overlay = _index(snapshot, feature_ids)
                 cells = changed_cells(state["overlay"], overlay, self.limits.changed_cells)
                 state.update(sequence=state["sequence"]+1)
@@ -615,6 +624,8 @@ class Coordinator:
                 # They are either referenced by the new atomic catalog or harmless bounded orphans.
                 current.update(entries=entries, requests=target_registry, publication=uuid.uuid4().hex,
                                snapshot=snapshot.revision, overlay=overlay)
+                current.pop('cohort',None)
+                if cohort is not None: current['cohort']=deepcopy(cohort)
                 self._cancel(cancel)
                 self._save(current)
             return dict(snapshot=snapshot.revision, rebuilt=tuple(rebuilt), reused=tuple(reused),

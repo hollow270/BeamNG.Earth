@@ -72,6 +72,7 @@ VALIDATION_CODES = {
     "selected activation targets are no longer current":"targets_changed",
     "no prepared target corresponds to this connection's current world":"targets_changed",
     "prepared targets/settings do not match the current world":"targets_changed",
+    "prepared influence no longer covers accepted and retained source geometry":"targets_changed",
     "near target must finish normal world streaming before activation":"near_streaming",
     "finish/cancel the outstanding activation before scheduling a new one":"transaction_pending",
     "invalid activation target selection":"target_selection_invalid",
@@ -174,6 +175,9 @@ class Manager:
                 self.guards.update(guard)
         if len(self.guards)>512:
             raise ResourceLimit("retained activation coverage exceeds budget")
+        import buildingretention
+        self.influence=buildingretention.retained_influence(directory)
+        self.guards=self.influence.cells()
 
     def _thread(self):
         if threading.get_ident()!=self.thread:
@@ -185,7 +189,13 @@ class Manager:
         rows = []
         for t in self.transactions.values():
             rows.append({k:deepcopy(t[k]) for k in ("transaction","seq","state","publication","revision","overlay_enabled","acknowledged","anchor","epoch","state_token","generations")})
+        import buildinginfluence
+        coverage=getattr(self,'influence',buildinginfluence.Coverage())
+        # Compatibility with conservative callers that still add cell fences.
+        coverage=coverage.union(buildinginfluence.Coverage(legacy_cells=tuple(self.guards-coverage.cells())))
+        self.influence=coverage
         body = self.c.io._document(dict(session=self.s.sid,client=getattr(self,"client_id",None),transactions=rows,guards=sorted(self.guards),
+            influence=coverage.wire(),
             holds={str(n):dict(serial=h[0],transaction=h[1]) for n,h in self.holds.items()}))
         if len(body)>MAX_MESSAGE:
             raise ResourceLimit("activation ownership journal exceeds budget")
@@ -218,7 +228,7 @@ class Manager:
         self.s.matslots.unheld(n)
         for t in self.transactions.values():
             if t["state"] in ("failed","superseded","retiring","orphaned","activated") and \
-                    not any(b["transaction"]==t["transaction"] for b in self.bindings.values()) and \
+                    not any(b["slots"] and b["transaction"]==t["transaction"] for b in self.bindings.values()) and \
                     not any(v[1]==t["transaction"] for v in self.holds.values()):
                 t["state"]="retired"
                 for owner in t["owners"]: self.s.matslots.release(owner)
@@ -227,8 +237,14 @@ class Manager:
         return True
 
     def compact(self):
-        """Forget only terminal, fully released history. Active bindings remain roots."""
-        referenced={b["transaction"] for b in self.bindings.values()}|{v[1] for v in self.holds.values()}
+        """Forget terminal, released history; slot-bearing bindings remain roots."""
+        referenced={b["transaction"] for b in self.bindings.values() if b['slots']}|{v[1] for v in self.holds.values()}
+        # Acknowledged transactions with no binding or slot ownership no longer
+        # root files. This also handles empty/reused cohorts after a re-anchor;
+        # no slot is released or inferred absent by this metadata compaction.
+        for key,t in self.transactions.items():
+            if key not in referenced and t['acknowledged'] and t['state'] in ('activated','superseded','orphaned'):
+                t['state']='retired'
         removed=[k for k,t in self.transactions.items() if k not in referenced and t["state"] in ("retired","failed")]
         for k in removed: del self.transactions[k]
         if removed: self._save()
@@ -293,10 +309,22 @@ class Manager:
             self.store.compose(replace(snapshot,enabled=bool(snapshot.entries)),context.buildings,baseline_parts=context.parts,
                 baseline_release=self.s.mapdata.release,bounds=context.bounds)
         import buildingtargets
-        discovered = buildingtargets.discover(_OneConnection(self.s,conn),_union(boxes))
+        if 'cohort' in catalog:
+            import buildinginfluence as influence
+            coverage=influence.read_cohort(catalog['cohort'])
+            expected=self.influence.with_snapshot(snapshot)
+            if coverage.union(expected)!=coverage:
+                raise Rejected('prepared influence no longer covers accepted and retained source geometry')
+            discovered=influence.discover(_OneConnection(self.s,conn),coverage)
+            plan=influence.Plan(discovered.requests,coverage)
+            if not plan.validate(selected):
+                raise Rejected('prepared targets/settings do not match the current world')
+        else:
+            discovered = buildingtargets.discover(_OneConnection(self.s,conn),_union(boxes))
         current = {r.slot:r.wire() for r in discovered.requests}
         if any(current.get(k)!=catalog["requests"][k] for k in selected) or any(
-                k not in catalog["entries"] and _live(conn,br.TileRequest(**current[k])) for k in discovered.relevant):
+                k not in catalog["entries"] and _live(conn,br.TileRequest(**current[k])) for k in discovered.relevant
+                if 'cohort' not in catalog):
             raise Rejected("prepared targets/settings do not match the current world")
         for k in selected:
             req=br.TileRequest(**catalog["requests"][k]); tracker=_tracker(conn,req.kind)
@@ -346,6 +374,56 @@ class Manager:
         t["bytes"]+=size
         return [f"{self.s.vfs_dir}/{destination.name}",serial]
 
+    def _reuse(self,conn,row,force=False):
+        req=br.TileRequest(**row['request'])
+        old=self.bindings.get((id(conn),req.kind,_key(req)))
+        if force or not old or old['content']!=row['content_digest'] or old['identity']!=row['identity']:
+            return False
+        for w,sl in old['slots'].items():
+            what=w.removeprefix('x:')
+            name=old['exact'].get(what) if w.startswith('x:') else old['data'].get(what)
+            name=name.get('shape') if isinstance(name,dict) else name
+            name=str(name).rsplit('/',1)[-1]
+            if name not in row['files'] or not _matches(Path(self.s.out_dir)/sl[0].rsplit('/',1)[-1],row['files'][name]):
+                return False
+        return True
+
+    def _admit(self,conn,catalog,selected,force):
+        """Choose only whole prepared components within the *existing* budgets.
+
+        Exact receipts/reuse proofs avoid a packed distant admission starving when
+        a smaller independent component fits. _shape still checks every allocation.
+        """
+        import buildinginfluence
+        coverage=buildinginfluence.read_cohort(catalog['cohort'])
+        plan=buildinginfluence.Plan([br.TileRequest(**catalog['requests'][k]) for k in selected],coverage)
+        slots=MAX_SLOTS-len(self.holds); copying=0
+        retained=sum(v.get('bytes',0) for v in self.transactions.values() if
+            any(o in self.s.matslots.slot for o in v['owners']) or any(h[1]==v['transaction'] for h in self.holds.values()))
+        admitted=set()
+        for component in sorted(plan.components,key=lambda c:min(buildinginfluence.priority(r,conn) for r in c)):
+            cost=0; size=0
+            for req in component:
+                row=catalog['entries'][req.slot]
+                if self._reuse(conn,row,force): continue
+                _,data=self._payload(row)
+                names=[]
+                for what in WHATS if req.kind.startswith('near') else ('shape',):
+                    value=data.get(what)
+                    name=value.get('shape') if isinstance(value,dict) else value if what=='shape' else None
+                    if name: names.append(name)
+                if req.kind=='near_geo': names.extend(p for w,p in (row['result'].get('exact') or {}).items() if w in WHATS)
+                for name in names:
+                    basename=str(name).rsplit('/',1)[-1]
+                    if basename not in row['files'] or not basename.endswith('.cdae'):
+                        raise Rejected('mesh is not in the checked generation manifest')
+                    cost+=1; size+=row['files'][basename]['size']
+            if cost<=slots and copying+size<=MAX_COPY_BYTES and retained+copying+size<=MAX_RETAINED_BYTES:
+                admitted.update(r.slot for r in component); slots-=cost; copying+=size
+        if not admitted:
+            raise ResourceLimit('No complete building component fits the current slot/byte admission budgets; retained ownership is unchanged')
+        return admitted
+
     def activate(self,conn,publication,*,manual=False,slots=None):
         self._thread()
         if manual is not True:
@@ -365,15 +443,26 @@ class Manager:
             raise ResourceLimit("activation transaction history is full; explicit retirement is required")
         with self.c.io._locked(),self.store._locked():
             catalog,snapshot,state,selected = self._validate(conn,publication,slots)
+            coverage=None
             guard=set(self.guards)
-            for k in selected:
-                req=br.TileRequest(**catalog["requests"][k])
-                import blockworker
-                guard.update(map(str,blockworker.building_cells(*req.geometry())))
+            if 'cohort' in catalog:
+                import buildinginfluence
+                coverage=self.influence.union(buildinginfluence.read_cohort(catalog['cohort']))
+                guard=coverage.cells()
+            else:
+                for k in selected:
+                    req=br.TileRequest(**catalog["requests"][k])
+                    import blockworker
+                    guard.update(map(str,blockworker.building_cells(*req.geometry())))
             if len(guard)>512:
                 raise ResourceLimit("activation coverage budget exceeded")
             previous = max((r for r in self.transactions.values() if r["conn"] is conn),key=lambda r:r["seq"],default=None)
             force = previous is not None and previous["state"]=="failed"
+            deferred_admission=0
+            if 'cohort' in catalog:
+                admitted=self._admit(conn,catalog,selected,force)
+                deferred_admission=len(selected)-len(admitted)
+                selected=admitted
             self.sequence += 1
             tx = uuid.uuid4().hex
             t = dict(transaction=tx,seq=self.sequence,state="scheduled",publication=publication,revision=snapshot.revision,
@@ -381,22 +470,16 @@ class Manager:
                 state_token=state,anchor=conn.active,epoch=conn.building_epoch,conn=conn,owners=[],targets=[],bytes=0,
                 generations=sorted({r["generation"] for k,r in catalog["entries"].items() if k in selected}),
                 requests={k:deepcopy(v) for k,v in catalog["requests"].items() if k in selected},guard=guard)
+            t['deferred_admission']=deferred_admission
             self.transactions[tx] = t
             try:
-                for slot,row in sorted(catalog["entries"].items()):
+                import buildinginfluence
+                for slot,row in sorted(catalog["entries"].items(),key=lambda kv:buildinginfluence.priority(br.TileRequest(**kv[1]['request']),conn)):
                     if slot not in selected:
                         continue
                     req,data = self._payload(row)
                     old = self.bindings.get((id(conn),req.kind,_key(req)))
-                    reuse = bool(not force and old and old["content"]==row["content_digest"] and old["identity"]==row["identity"])
-                    if reuse:
-                        for w,sl in old["slots"].items():
-                            what=w.removeprefix("x:")
-                            name = old["exact"].get(what) if w.startswith("x:") else old["data"].get(what)
-                            name = name.get("shape") if isinstance(name,dict) else name
-                            name = str(name).rsplit("/",1)[-1]
-                            if name not in row["files"] or not _matches(Path(self.s.out_dir)/sl[0].rsplit("/",1)[-1],row["files"][name]):
-                                reuse=False; break
+                    reuse = self._reuse(conn,row,force)
                     target = dict(slot=slot,kind=req.kind,key=_key(req),generation=row["generation"],content=row["content_digest"],
                         identity=row["identity"],reuse=reuse,data={},slots={},exact={},allowEmpty=False)
                     target["frame"] = list(geotiles.centre(req.x,req.y,
@@ -433,6 +516,7 @@ class Manager:
                     parts=(len(t["targets"])+MAX_TARGETS-1)//MAX_TARGETS,total=len(t["targets"]),
                     targets=t["targets"][i:i+MAX_TARGETS]) for i in range(0,len(t["targets"]),MAX_TARGETS)]
                 self.guards.update(t["guard"])  # a lost ack cannot prove nothing was installed
+                if coverage is not None: self.influence=coverage
                 from earthd import BUILDING_SESSION_HOLD
                 try:
                     with (Path(self.s.out_dir)/BUILDING_SESSION_HOLD).open("xb") as pin:
@@ -471,6 +555,7 @@ class Manager:
             seq=t["seq"],game_activated=t["state"]=="activated",detail=t.get("detail"),
             game_acknowledged=t["acknowledged"],overlay_enabled=t["overlay_enabled"],
             pending_targets=list(self.pending_targets.values()),
+            deferred_admission=t.get('deferred_admission',0),
             held_slots=sum(v[1]==transaction for v in self.holds.values()))
 
     def cancel_if_stale(self,conn):
@@ -515,13 +600,17 @@ class Manager:
                 old = self.bindings.get(route)
                 if not target["reuse"]:
                     self.bindings[route] = dict(deepcopy(target),transaction=t["transaction"],anchor=t["anchor"])
+                binding=self.bindings.get(route)
+                if binding is not None and t['state']=='activated':
+                    binding.update(validated_state=t['state_token'],validated_enabled=t['overlay_enabled'],
+                                   validated_frame=(t['anchor'],t['epoch']))
                 self.pending_targets.pop(target["kind"]+":"+target["key"],None)
                 tracker = _tracker(conn,target["kind"])
                 if tracker is not None:
                     req = br.TileRequest(**t["requests"][target["slot"]])
                     tracker.sent.add((req.x,req.y))
                     getattr(tracker,"empty",set()).discard((req.x,req.y))
-            referenced = {b["transaction"] for b in self.bindings.values()}
+            referenced = {b["transaction"] for b in self.bindings.values() if b['slots']}
             for previous in self.transactions.values():
                 if previous is not t and previous["state"] in ("activated","superseded") and previous["transaction"] not in referenced:
                     previous["state"]="retiring" if any(h[1]==previous["transaction"] for h in self.holds.values()) else "retired"
@@ -531,6 +620,10 @@ class Manager:
             t["state"] = msg["status"]
             if t["state"] in ("failed","rejected"):
                 t["state"]="failed"
+                for target in t['targets']:
+                    # Failed reuse is not evidence that the old engine objects
+                    # still exist. Drop validation, never its slot holds/proofs.
+                    self.bindings.pop((id(conn),target['kind'],target['key']),None)
                 for owner in t["owners"]:
                     self.s.matslots.release(owner)
         t["detail"] = msg["detail"]
@@ -559,6 +652,18 @@ class Manager:
         geo = isinstance(msg.get("key"),str) and bool(re.fullmatch(r"g\d+_\d+_\d+",msg["key"]))
         route = (id(conn),kind+("_geo" if geo else ""),msg.get("key"))
         binding = self.bindings.get(route)
+        fence=getattr(self,'binding_fence',None)
+        if binding is not None and fence is not None and (
+                binding.get('validated_state'),binding.get('validated_enabled'),binding.get('validated_frame'),
+                binding.get('validated_render'))!=fence:
+            # A newly streamed callback must not replay a previously acknowledged
+            # but now stale revision/renderer while its component awaits refresh.
+            name=route[1]+':'+str(route[2])
+            if name in self.pending_targets or len(self.pending_targets)<128:
+                self.pending_targets[name]=dict(kind=route[1],key=route[2],status='deferred',
+                    reason='Waiting for the current revision, frame and renderer to be acknowledged')
+            else: self.pending_overflow=True
+            return defer_message(self.s,conn,msg)
         pending = any(t["conn"] is conn and t["state"] in ("scheduled","deferred","installing") and
             any(r["kind"]==route[1] and r["key"]==route[2] for r in t["targets"]) for t in self.transactions.values())
         if binding is None and not pending:
@@ -574,11 +679,17 @@ class Manager:
                 a=self.s.anchors[conn.active]
                 req=br.TileRequest(route[1],x,y,aid=a.id,lat=a.lat,lon=a.lon,zoom=a.zooms[0])
                 import blockworker
-                if self.guards.intersection(map(str,blockworker.building_cells(*req.geometry()))):
+                import buildinginfluence
+                coverage=getattr(self,'influence',None)
+                affected=coverage.affects(req) if coverage is not None else self.guards.intersection(map(str,blockworker.building_cells(*req.geometry())))
+                if affected:
                     name=route[1]+":"+key
                     if name not in self.pending_targets and len(self.pending_targets)>=128:
-                        raise ResourceLimit("unprepared activation target budget exceeded")
-                    self.pending_targets[name]=dict(kind=route[1],key=key,status="deferred",reason="Waiting for local preparation and revision-safe activation of accepted data")
+                        # This is a bounded UI hint cache, never the authoritative
+                        # work queue. Full influence discovery schedules every target.
+                        self.pending_overflow=True
+                    else:
+                        self.pending_targets[name]=dict(kind=route[1],key=key,status="deferred",reason="Waiting for local preparation and revision-safe activation of accepted data")
                     return defer_message(self.s,conn,msg)
             return msg
         # Drop allocations that have never reached the game; the retained activation

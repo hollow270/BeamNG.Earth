@@ -318,11 +318,11 @@ class MapData:
         view = self._building_context.get() or self._building_view
         return view.cell(self, base, kind) if view is not None and view.active else base
 
-    def building_dependencies(self, keys):
+    def building_dependencies(self, keys, *, render_bounds=None):
         """Local effective-building tokens; not a global pipeline version or invalidation operation."""
         from buildingrender import Dependency
         view = self._building_context.get() or self._building_view
-        return view.dependency(keys) if view is not None and view.active else Dependency()
+        return view.dependency(keys,render_bounds=render_bounds) if view is not None and view.active else Dependency()
 
     def _rails(self, key, layer, feats):
         """The roads layer's rail segments with OSM's railway tags (railtags.py), once per build of them."""

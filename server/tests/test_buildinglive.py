@@ -286,6 +286,8 @@ class LiveTest(unittest.TestCase):
                 public=self.service.public(self.conn)
                 public['resources']=dict(held=0,removed_generations=[],reclaimed_slots=[],released_sessions=[],uncertain=[])
                 cases=[]
+                public['progress']=dict(required=312,acknowledged=96,pending=216,blocked=0,
+                                        components=22,remaining_components=15,oversized=0)
                 for patch in ({},{'preview':dict(report,changes=[],issues=[],decisions=[],overture_only=[])},
                               {'preview':dict(report,changes=[dict(feature_id='bad',attributes={'bad':1})],issues=[None])}):
                     wire=protocol.encode(dict(type='building_status',**dict(public,**patch)))
@@ -304,6 +306,7 @@ class LiveTest(unittest.TestCase):
                     self.assertEqual(row['errors'],[]); self.assertEqual(row['commands'],0)
                 self.assertIn('attributes: unchanged',rendered[0]['text'])
                 self.assertIn('Unchanged records1',rendered[0]['text'])
+                self.assertIn('96 / 312 current targets acknowledged; 216 pending',rendered[0]['text'])
                 self.assertFalse(rendered[0]['accept_disabled']); self.assertFalse(rendered[1]['accept_disabled'])
                 self.assertTrue(rendered[2]['accept_disabled']); self.assertIn('malformed',rendered[2]['text'])
             finally: await self.service.close()
